@@ -243,12 +243,7 @@ class JVPTrace(Trace):
   def process_primitive(self, primitive, tracers, params):
     primals_in = [t.primal for t in tracers]
     tangents_in = [t.tangent for t in tracers]
-    try:
-      jvp = primitive_jvps[primitive]
-    except KeyError:
-      raise NotImplementedError(
-          "Forward-mode differentiation rule for '{}' not implemented"
-          .format(primitive))
+    jvp = primitive_jvps[primitive]
     primal_out, tangent_out = jvp(primals_in, tangents_in, **params)
     return JVPTracer(self, primal_out, tangent_out)
 

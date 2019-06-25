@@ -57,6 +57,7 @@ from .interpreters import pxla
 from .interpreters import ad
 from .interpreters import batching
 from .interpreters import parallel
+from .interpreters import taylor2
 from .config import flags, config
 
 map = safe_map
@@ -1558,3 +1559,11 @@ def eval_shape(fun, *args, **kwargs):
   abstract_args = map(abstractify, (jax_kwargs,) + tuple(jax_args))
   out = pe.abstract_eval_fun(f.call_wrapped, *abstract_args)
   return tree_map(onp.shape, build_tree(out_tree(), out))
+
+
+
+
+def taylor(f, primal, terms):
+  f = lu.wrap_init(f)
+  out_primal, out_terms = taylor2.taylor2(f).call_wrapped(primal, *terms)
+  return out_primal, out_terms

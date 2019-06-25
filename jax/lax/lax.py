@@ -44,6 +44,7 @@ from ..interpreters import xla
 from ..interpreters import ad
 from ..interpreters import batching
 from ..interpreters import parallel
+from ..interpreters import taylor
 from ..util import curry, memoize, safe_zip, unzip2, prod
 from ..tree_util import build_tree, tree_unflatten, tree_map
 from ..lib import xla_bridge
@@ -1552,6 +1553,10 @@ ad.defjvp2(tanh_p, lambda g, ans, x: mul(g, sub(_one(x), mul(ans, ans))))
 
 sin_p = standard_unop(_float | _complex, 'sin')
 ad.defjvp(sin_p, lambda g, x: mul(g, cos(x)))
+def _sin_taylor_rule(primals, series_in):
+  primals, series_in
+  import ipdb; ipdb.set_trace()
+taylor.taylor_rules[sin_p] = _sin_taylor_rule
 
 cos_p = standard_unop(_float | _complex, 'cos')
 ad.defjvp(cos_p, lambda g, x: neg(mul(g, sin(x))))
