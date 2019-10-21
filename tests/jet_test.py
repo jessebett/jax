@@ -46,7 +46,9 @@ def test_exp():
   N = 4
   x = npr.randn()
   terms_in = list(npr.randn(N))
-  jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-2)
+  # x = 1.
+  # terms_in = [2.,3.,4.]
+  jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-4)
 
 
 def test_log():
@@ -81,11 +83,11 @@ def test_sqrt():
   print jvp_taylor(np.sqrt, (x, ), (terms_in, ))
   jvp_test_jet(np.sqrt, (x, ), (terms_in, ), atol=1e-1)
 
-def test_exp():
-  N = 5
-  x = npr.randn()**2
-  terms_in = list(npr.randn(N))
-  jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-1)
+# def test_exp():
+#   N = 5
+#   x = npr.randn()**2
+#   terms_in = list(npr.randn(N))
+#   jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-1)
 
 def test_neg():
   N = 4

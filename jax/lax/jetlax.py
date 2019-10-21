@@ -3,6 +3,9 @@ from lax import *
 import jax.numpy as np
 from ..interpreters import fdb
 from ..interpreters import xla
+from custom_props import prop_exp
+from copy import copy
+from scipy.special import factorial as fact
 
 
 def deflinear(prim):
@@ -69,15 +72,32 @@ def make_derivs_sqrt(primals,order,**params):
   return out, [fst,snd,thd,fth,fith]
 fdb.jet_rules[sqrt_p] = make_derivs_sqrt
 
-def make_derivs_exp(primals,order,**params):
-  x, = primals
-  out = np.exp(x)
-  #TODO: make generator dependent on order...
-  def nth(vs):
-    return fdb.product(map(operator.itemgetter(0), vs)) * out
-  derivs = itertools.chain(itertools.repeat(nth))
-  return out, list(itertools.islice(derivs,order))
-fdb.jet_rules[exp_p] = make_derivs_exp
+# def make_derivs_exp(primals,order,**params):
+#   x, = primals
+#   out = np.exp(x)
+#   #TODO: make generator dependent on order...
+#   def nth(vs):
+#     return fdb.product(map(operator.itemgetter(0), vs)) * out
+#   derivs = itertools.chain(itertools.repeat(nth))
+#   return out, list(itertools.islice(derivs,order))
+# fdb.jet_rules[exp_p] = make_derivs_exp
+def prop_exp(primals_in, series_in):
+  x, = primals_in
+  primals_out = np.exp(x)
+  u = [primals_in] + series_in
+  v = copy(u) 
+  v[0] = primals_out
+  
+  for k in range(1,len(v)):
+    def scale(j):
+      return 1./(fact(k-j)*fact(j-1))
+    v[k] = fact(k-1)*sum([scale(j)* v[k-j]*u[j][0] for j in range(1,k+1)])
+
+  terms_out = v[1:]
+    
+  return primals_out, terms_out
+fdb.prop_rules[exp_p] = prop_exp
+
 
 def make_derivs_mul(primals, order):
   a, b = primals

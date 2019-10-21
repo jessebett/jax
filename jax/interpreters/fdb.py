@@ -54,11 +54,14 @@ class JetTrace(core.Trace):
   def process_primitive(self, primitive, tracers, params):
     primals_in, series_in = unzip2((t.primal, t.terms) for t in tracers)
     order, = {len(terms) for terms in series_in if terms is not zero_series}
-    primal_out, derivs = jet_rules[primitive](primals_in, order, **params)
     series_in = [[zero_term] * order if s is zero_series else s
                  for s in series_in]
     series_in = [[onp.zeros_like(x) if t is zero_term else t for t in series]
                  for x, series in zip(primals_in, series_in)]
+    if primitive.name=="exp":
+      primal_out, terms_out = prop_rules[primitive](primals_in, zip(*series_in))
+      return JetTracer(self, primal_out, terms_out)
+    primal_out, derivs = jet_rules[primitive](primals_in, order, **params)
     terms_out = prop(derivs, zip(*series_in))
     return JetTracer(self, primal_out, terms_out)
 
@@ -86,6 +89,7 @@ zero_series = ZeroSeries()
 
 
 jet_rules = {}
+prop_rules = {}
 
 
 ### utilities
@@ -140,3 +144,4 @@ def prop(derivs, terms):
   return [sum(derivs[len(sigma)-1]([terms[i-1] for i in sigma]) * sym(sigma)
               for sigma in partitions(k))
           for k in range(1, len(terms) + 1)]
+
