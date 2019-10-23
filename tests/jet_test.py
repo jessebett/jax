@@ -37,7 +37,6 @@ def jvp_taylor(f, primals, series):
 def jvp_test_jet(f, primals, series, atol=1e-5):
   y, terms = jet(f, primals, series)
   y_jvp, terms_jvp = jvp_taylor(f, primals, series)
-  import ipdb; ipdb.set_trace()
   assert np.allclose(y, y_jvp)
   assert np.allclose(terms, terms_jvp, atol=atol)
 
@@ -111,7 +110,7 @@ def test_dot():
 
 
 def test_mul():
-  D = 2
+  D = 3
   N = 4
   x1 = npr.randn(D)
   x2 = npr.randn(D)

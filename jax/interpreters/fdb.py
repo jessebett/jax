@@ -145,3 +145,11 @@ def prop(derivs, terms):
               for sigma in partitions(k))
           for k in range(1, len(terms) + 1)]
 
+def tay_to_deriv_coeff(u_tay):
+  u_deriv = [ui*fact(i) for (i,ui) in enumerate(u_tay)]
+  return u_deriv
+
+def deriv_to_tay_coeff(u_deriv):
+  u_tay = [ui/fact(i) for (i,ui) in enumerate(u_deriv)]
+  return u_tay
+

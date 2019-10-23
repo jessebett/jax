@@ -129,23 +129,31 @@ def manual_mul_conv(u,w):
   return v
 
 def mul_conv(u,w):
+  N = len(u)
+  # scale to Taylor Coeffs
+  u = fdb.deriv_to_tay_coeff(u)
+  w = fdb.deriv_to_tay_coeff(w)
   # prepare for expected convolution dimensions
   u = np.array(u).T
   u = u[:,np.newaxis,:]
   w = np.array(w).T
   w = w[:,np.newaxis,:]
   w = np.flip(w,2)
+
   def batchwise_conv(ui,wi):
     # seems silly to produce new axes here
     ui = ui[np.newaxis,:]
     wi = wi[np.newaxis,:]
-    return conv_general_dilated(ui,wi,(1,),[(4,0)])
+    return conv_general_dilated(ui,wi,(1,),[(N-1,0)])
   v = vmap(batchwise_conv)(u,w)
   # remove extra dimensions
   # is this robust?
   v = v[:,0,0,:]
+  v = v.T
+  # Back to Derivative coefficients
+  v = fdb.tay_to_deriv_coeff(v)
   # Do we really want list?
-  return list(v.T)
+  return list(v)
 
 def prop_mul(primals_in, series_in):
   #TODO: refactor so no distinction between primals and terms
@@ -153,11 +161,9 @@ def prop_mul(primals_in, series_in):
   vu, vw = zip(*series_in)
   u = [u0,] + list(vu)
   w = [w0,] + list(vw)
-  import ipdb; ipdb.set_trace()
-  v = manual_mul_conv(u,w)
-  # v_conv = mul_conv(u,w)
-  print v
-  return v[0], v[1:]
+  # v = manual_mul_conv(u,w)
+  v_conv = mul_conv(u,w)
+  return v_conv[0], v_conv[1:]
 fdb.prop_rules[mul_p] = prop_mul
 
 def make_derivs_dot(primals, order, **params):
