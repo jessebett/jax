@@ -1,4 +1,5 @@
 from functools import partial
+from jax import vmap
 from lax import *
 import jax.numpy as np
 from ..interpreters import fdb
@@ -72,6 +73,7 @@ def make_derivs_sqrt(primals,order,**params):
   return out, [fst,snd,thd,fth,fith]
 fdb.jet_rules[sqrt_p] = make_derivs_sqrt
 
+# Generic Prop, deprecated
 # def make_derivs_exp(primals,order,**params):
 #   x, = primals
 #   out = np.exp(x)
@@ -82,22 +84,25 @@ fdb.jet_rules[sqrt_p] = make_derivs_sqrt
 #   return out, list(itertools.islice(derivs,order))
 # fdb.jet_rules[exp_p] = make_derivs_exp
 def prop_exp(primals_in, series_in):
+  #TODO: refactor so no distinction between primals and terms
+  #TODO: use numpy convolve
+  #TODO: use scipy fft?
   x, = primals_in
-  primals_out = np.exp(x)
   u = [primals_in] + series_in
-  v = copy(u) 
-  v[0] = primals_out
   
+  v = copy(u) 
+  primals_out = np.exp(x)
+  v[0] = primals_out
   for k in range(1,len(v)):
     def scale(j):
       return 1./(fact(k-j)*fact(j-1))
     v[k] = fact(k-1)*sum([scale(j)* v[k-j]*u[j][0] for j in range(1,k+1)])
 
+  import ipdb; ipdb.set_trace()
   terms_out = v[1:]
     
   return primals_out, terms_out
 fdb.prop_rules[exp_p] = prop_exp
-
 
 def make_derivs_mul(primals, order):
   a, b = primals
@@ -112,6 +117,48 @@ def make_derivs_mul(primals, order):
   derivs = itertools.chain([fst,snd], itertools.repeat(nth))
   return mul(a, b), list(itertools.islice(derivs, order))
 fdb.jet_rules[mul_p] = make_derivs_mul
+
+def manual_mul_conv(u,w):
+  v = copy(u)
+  for k in range(0,len(v)):
+    def scale(j):
+      # return 1.
+      return 1./(fact(k-j)*fact(j))
+    # v[k] = sum([scale(j)* u[j] * w[k-j] for j in range(0,k+1)])
+    v[k] = fact(k)*sum([scale(j)* u[j] * w[k-j] for j in range(0,k+1)])
+  return v
+
+def mul_conv(u,w):
+  # prepare for expected convolution dimensions
+  u = np.array(u).T
+  u = u[:,np.newaxis,:]
+  w = np.array(w).T
+  w = w[:,np.newaxis,:]
+  w = np.flip(w,2)
+  def batchwise_conv(ui,wi):
+    # seems silly to produce new axes here
+    ui = ui[np.newaxis,:]
+    wi = wi[np.newaxis,:]
+    return conv_general_dilated(ui,wi,(1,),[(4,0)])
+  v = vmap(batchwise_conv)(u,w)
+  # remove extra dimensions
+  # is this robust?
+  v = v[:,0,0,:]
+  # Do we really want list?
+  return list(v.T)
+
+def prop_mul(primals_in, series_in):
+  #TODO: refactor so no distinction between primals and terms
+  u0, w0 = primals_in
+  vu, vw = zip(*series_in)
+  u = [u0,] + list(vu)
+  w = [w0,] + list(vw)
+  import ipdb; ipdb.set_trace()
+  v = manual_mul_conv(u,w)
+  # v_conv = mul_conv(u,w)
+  print v
+  return v[0], v[1:]
+fdb.prop_rules[mul_p] = prop_mul
 
 def make_derivs_dot(primals, order, **params):
   a, b = primals

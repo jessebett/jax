@@ -37,15 +37,17 @@ def jvp_taylor(f, primals, series):
 def jvp_test_jet(f, primals, series, atol=1e-5):
   y, terms = jet(f, primals, series)
   y_jvp, terms_jvp = jvp_taylor(f, primals, series)
+  import ipdb; ipdb.set_trace()
   assert np.allclose(y, y_jvp)
   assert np.allclose(terms, terms_jvp, atol=atol)
 
 
-#XXX
 def test_exp():
-  N = 4
-  x = npr.randn()
-  terms_in = list(npr.randn(N))
+  npr.seed(0)
+  D = 3
+  N = 6
+  x = npr.randn(D)
+  terms_in = list(npr.randn(N,D))
   # x = 1.
   # terms_in = [2.,3.,4.]
   jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-4)
@@ -109,13 +111,15 @@ def test_dot():
 
 
 def test_mul():
+  D = 2
   N = 4
-  x1 = npr.randn()
-  x2 = npr.randn()
+  x1 = npr.randn(D)
+  x2 = npr.randn(D)
   f = lambda a, b: a * b
   primals = (x1, x2)
-  terms_in = list(npr.randn(N))
-  series_in = (terms_in, terms_in)
+  terms_in1 = list(npr.randn(N,D))
+  terms_in2 = list(npr.randn(N,D))
+  series_in = (terms_in1, terms_in2)
   jvp_test_jet(f, primals, series_in)
 
 
