@@ -48,7 +48,9 @@ def test_exp():
   x = npr.randn(D)
   terms_in = list(npr.randn(N,D))
   # x = 1.
-  # terms_in = [2.,3.,4.]
+  # terms_in = [2., 3., 4.]
+  # x = np.array([1.,5.])
+  # terms_in =[np.array([2.,6.]),np.array([3.,7.]),np.array([4.,8])]
   jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-4)
 
 

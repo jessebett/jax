@@ -1,6 +1,7 @@
 from functools import partial
 from jax import vmap
 from lax import *
+from jax import ops
 import jax.numpy as np
 from ..interpreters import fdb
 from ..interpreters import xla
@@ -83,24 +84,73 @@ fdb.jet_rules[sqrt_p] = make_derivs_sqrt
 #   derivs = itertools.chain(itertools.repeat(nth))
 #   return out, list(itertools.islice(derivs,order))
 # fdb.jet_rules[exp_p] = make_derivs_exp
+
+def manual_exp_conv(u):
+  x, = u[0]
+  v = copy(u) 
+  v[0] = np.exp(x)
+  for k in range(1,len(v)):
+    def scale(j):
+      return 1./(fact(k-j)*fact(j-1))
+    v[k] = fact(k-1)*sum([scale(j)* v[k-j]*u[j][0] for j in range(1,k+1)])
+  terms_out = v[1:]
+  return v
+
+
+def exp_conv(u):
+  # # scale to Taylor Coeffs
+  u = fdb.deriv_to_tay_coeff(u)
+  u_tilde = fdb.taylor_tilde(u)
+  u = np.array(u).T
+  u_tilde = np.array(u_tilde).T
+  # bad special case for scalar
+  if len(u.shape) == 2:
+    u = u[:,np.newaxis,:]
+    u_tilde = u_tilde[:,np.newaxis,:]
+  x = u[:,0,0:1] # TODO:better indexing for x
+  v = np.zeros_like(u)
+  v = ops.index_update(v,ops.index[:,:,0],np.exp(x))
+      # v[...,0] = np.exp(x)
+
+
+  def batchwise_conv(ui,vi):
+    N = vi.shape[0]
+    # seems silly to produce neneed to unpack all the parameters of the neural netw axes here
+    ui = ui[np.newaxis,:]
+    vi = vi[np.newaxis,:]
+    return conv_general_dilated(ui,vi,(1,),[(N-1,0)])
+
+  def reccurence_exp(u,v):
+    bcnv = vmap(batchwise_conv)
+    for j in range(1,u.shape[-1]):
+      u_tilde_lhs = u_tilde[...,1:j+1]
+      v_rhs = np.flip(v[...,0:(j)],-1)
+      next_v = bcnv(u_tilde_lhs, v_rhs)[:,0,0,:]/j
+      v = ops.index_update(v,ops.index[:,:,j],next_v)
+
+    return v
+
+
+  v = reccurence_exp(u,v)
+  v = v[:,0,:]
+  taylor_scale = np.array([fact(i) for i in range(u.shape[-1])])
+  v = (taylor_scale * v).T
+  return v
+
+
+
 def prop_exp(primals_in, series_in):
   #TODO: refactor so no distinction between primals and terms
   #TODO: use numpy convolve
   #TODO: use scipy fft?
   x, = primals_in
   u = [primals_in] + series_in
-  
-  v = copy(u) 
-  primals_out = np.exp(x)
-  v[0] = primals_out
-  for k in range(1,len(v)):
-    def scale(j):
-      return 1./(fact(k-j)*fact(j-1))
-    v[k] = fact(k-1)*sum([scale(j)* v[k-j]*u[j][0] for j in range(1,k+1)])
 
-  import ipdb; ipdb.set_trace()
-  terms_out = v[1:]
-    
+  # v = manual_exp_conv(u)
+  v = exp_conv(u)
+  v = list(v) # TODO: drops to host ndarray :\
+  primals_out,terms_out = v[0],v[1:]
+
   return primals_out, terms_out
 fdb.prop_rules[exp_p] = prop_exp
 

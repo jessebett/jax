@@ -153,3 +153,10 @@ def deriv_to_tay_coeff(u_deriv):
   u_tay = [ui/fact(i) for (i,ui) in enumerate(u_deriv)]
   return u_tay
 
+def taylor_tilde(u_tay):
+  u_tilde = [i * ui for (i,ui) in enumerate(u_tay)]
+  return u_tilde
+
+def taylor_untilde(u_tilde):
+  u_tay = [i * ui for (i,ui) in enumerate(u_tilde)]
+  return u_tay
