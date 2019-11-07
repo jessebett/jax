@@ -58,7 +58,7 @@ class JetTrace(core.Trace):
                  for s in series_in]
     series_in = [[onp.zeros_like(x) if t is zero_term else t for t in series]
                  for x, series in zip(primals_in, series_in)]
-    primal_out, terms_out = prop_rules[primitive](primals_in, zip(*series_in))
+    primal_out, terms_out = prop_rules[primitive](primals_in, zip(*series_in), **params)
     return JetTracer(self, primal_out, terms_out)
     #TODO: Unify previous fdb with fallback to generic prop
     # primal_out, derivs = jet_rules[primitive](primals_in, order, **params)

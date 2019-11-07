@@ -11,7 +11,12 @@ from scipy.special import factorial as fact
 
 
 def deflinear(prim):
+  fdb.prop_rules[prim] = partial(linear_prop, prim)
   fdb.jet_rules[prim] = partial(linear_jet, prim)
+
+def linear_prop(prim,primals_in, series_in,**params):
+  return prim.bind(*primals_in,**params), [prim.bind(*terms_in,**params) for terms_in in series_in]
+
 
 def linear_jet(prim, primals, order, **params):
   ans = prim.bind(*primals, **params)
@@ -28,6 +33,8 @@ deflinear(slice_p)
 deflinear(xla.device_put_p)
 deflinear(reshape_p)
 deflinear(concatenate_p)  # TODO
+deflinear(reduce_sum_p) #TODO: correct?
+deflinear(add_p)
 
 
 def make_derivs_sin(primals, order):
@@ -215,6 +222,13 @@ def prop_mul(primals_in, series_in):
   v_conv = mul_conv(u,w)
   return v_conv[0], v_conv[1:]
 fdb.prop_rules[mul_p] = prop_mul
+
+def prop_dot(primals_in, series_in):
+  import ipdb; ipdb.set_trace()
+  m_primals, m_terms = prop_mul(primals_in,series_in)
+  out_primals, out_terms =  np.sum(m_primals), np.sum(m_terms,axis=1)
+  return out_primals,zip(out_terms)
+fdb.prop_rules[dot_p] = prop_dot
 
 def make_derivs_dot(primals, order, **params):
   a, b = primals

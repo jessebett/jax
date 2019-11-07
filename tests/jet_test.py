@@ -37,9 +37,18 @@ def jvp_taylor(f, primals, series):
 def jvp_test_jet(f, primals, series, atol=1e-5):
   y, terms = jet(f, primals, series)
   y_jvp, terms_jvp = jvp_taylor(f, primals, series)
+  import ipdb; ipdb.set_trace()
   assert np.allclose(y, y_jvp)
   assert np.allclose(terms, terms_jvp, atol=atol)
 
+def test_reshape():
+  npr.seed(0)
+  D = 10
+  N = 6
+  x = np.arange(D)
+  terms_in = list(npr.randn(N,D))
+  f = lambda x: np.reshape(x,(2,5))
+  jvp_test_jet(f, (x, ), (terms_in, ), atol=1e-4)
 
 def test_exp():
   npr.seed(0)
@@ -53,6 +62,29 @@ def test_exp():
   # terms_in =[np.array([2.,6.]),np.array([3.,7.]),np.array([4.,8])]
   jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-4)
 
+def test_mlp():
+  def mlp(M1,M2,x):
+    return np.dot(M2,np.exp(np.dot(M1,x)))
+  f_mlp = lambda x: mlp(M1,M2,x)
+  M1,M2 = (npr.randn(10,10), npr.randn(10,10))
+  x= npr.randn(10)
+  terms_in = ((np.ones_like(x),),(np.zeros_like(x),))
+  y,terms = jet(f_mlp,(x,),(terms_in,))
+  import ipdb; ipdb.set_trace()
+
+def test_mlp_t():
+  def mlp(M1,M2,x,t):
+    x = np.append(x,t)
+    return np.dot(M2,np.exp(np.dot(M1,x)))
+  f_mlp = lambda t: mlp(M1,M2,x,t)
+  M1,M2 = (npr.randn(10,11), npr.randn(10,10))
+  x= npr.randn(10)
+  t = npr.randn()
+  primals = (t,)
+  t_series = [np.ones_like(t)] + [np.zeros_like(t)]*3
+  series= [t_series]
+  y,terms = jet(f_mlp,primals,series)
+  import ipdb; ipdb.set_trace()
 
 def test_log():
   raise NotImplementedError
@@ -99,6 +131,17 @@ def test_neg():
   f = lambda x: -x
   jvp_test_jet(f, (x, ), (terms_in,), atol=1e-2)
 
+def test_sum():
+  D = 3
+  N = 4
+  x1 = npr.randn(D)
+  x2 = npr.randn(D)
+  f = lambda a, b: a + b
+  primals = (x1, x2)
+  terms_in1 = list(npr.randn(N,D))
+  terms_in2 = list(npr.randn(N,D))
+  series_in = (terms_in1, terms_in2)
+  jvp_test_jet(f, primals, series_in)
 
 def test_dot():
   D = 2
@@ -106,20 +149,21 @@ def test_dot():
   x1 = npr.randn(D)
   x2 = npr.randn(D)
   primals = (x1, x2)
-  terms_in = list(npr.randn(N, D))
-  series_in = (terms_in, terms_in)
+  terms_in1 = list(npr.randn(N,D))
+  terms_in2 = list(npr.randn(N,D))
+  series_in = (terms_in1, terms_in2)
   jvp_test_jet(np.dot, primals, series_in)
 
 
 def test_mul():
-  D = 3
-  N = 4
-  x1 = npr.randn(D)
-  x2 = npr.randn(D)
+  d = 3
+  n = 4
+  x1 = npr.randn(d)
+  x2 = npr.randn(d)
   f = lambda a, b: a * b
   primals = (x1, x2)
-  terms_in1 = list(npr.randn(N,D))
-  terms_in2 = list(npr.randn(N,D))
+  terms_in1 = list(npr.randn(n,d))
+  terms_in2 = list(npr.randn(n,d))
   series_in = (terms_in1, terms_in2)
   jvp_test_jet(f, primals, series_in)
 
