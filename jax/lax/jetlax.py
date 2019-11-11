@@ -223,11 +223,10 @@ def prop_mul(primals_in, series_in):
   return v_conv[0], v_conv[1:]
 fdb.prop_rules[mul_p] = prop_mul
 
-def prop_dot(primals_in, series_in):
-  import ipdb; ipdb.set_trace()
+def prop_dot(primals_in, series_in,**params):
   m_primals, m_terms = prop_mul(primals_in,series_in)
-  out_primals, out_terms =  np.sum(m_primals), np.sum(m_terms,axis=1)
-  return out_primals,zip(out_terms)
+  out_primals, out_terms =  np.sum(m_primals), np.sum(m_terms,axis=1,keepdims=False)
+  return out_primals,list(out_terms)
 fdb.prop_rules[dot_p] = prop_dot
 
 def make_derivs_dot(primals, order, **params):

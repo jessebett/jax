@@ -84,7 +84,6 @@ def test_mlp_t():
   t_series = [np.ones_like(t)] + [np.zeros_like(t)]*3
   series= [t_series]
   y,terms = jet(f_mlp,primals,series)
-  import ipdb; ipdb.set_trace()
 
 def test_log():
   raise NotImplementedError
@@ -144,7 +143,7 @@ def test_sum():
   jvp_test_jet(f, primals, series_in)
 
 def test_dot():
-  D = 2
+  D = 6
   N = 4
   x1 = npr.randn(D)
   x2 = npr.randn(D)
