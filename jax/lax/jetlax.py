@@ -153,9 +153,9 @@ def prop_exp(primals_in, series_in):
   x, = primals_in
   u = [primals_in] + series_in
 
-  # v = manual_exp_conv(u)
-  v = exp_conv(u)
-  v = list(v) # TODO: drops to host ndarray :\
+  v = manual_exp_conv(u)
+  # v = exp_conv(u) #TODO: LAX conv for general shape :\ 
+  # v = list(v) # TODO: drops to host ndarray :\
   primals_out,terms_out = v[0],v[1:]
 
   return primals_out, terms_out
@@ -179,9 +179,7 @@ def manual_mul_conv(u,w):
   v = copy(u)
   for k in range(0,len(v)):
     def scale(j):
-      # return 1.
       return 1./(fact(k-j)*fact(j))
-    # v[k] = sum([scale(j)* u[j] * w[k-j] for j in range(0,k+1)])
     v[k] = fact(k)*sum([scale(j)* u[j] * w[k-j] for j in range(0,k+1)])
   return v
 
@@ -218,15 +216,60 @@ def prop_mul(primals_in, series_in):
   vu, vw = zip(*series_in)
   u = [u0,] + list(vu)
   w = [w0,] + list(vw)
+  import ipdb; ipdb.set_trace()
   # v = manual_mul_conv(u,w)
   v_conv = mul_conv(u,w)
   return v_conv[0], v_conv[1:]
 fdb.prop_rules[mul_p] = prop_mul
 
+def manual_dot_conv(u,w):
+  v = copy(u)
+  for k in range(0,len(v)):
+    def scale(j):
+      return 1./(fact(k-j)*fact(j))
+    v[k] = fact(k)*sum([scale(j)* np.dot(u[j],w[k-j]) for j in range(0,k+1)])
+  return v
+
+# TODO: LAX backed conv for dot?
+def dot_conv(u,w):
+  N = len(u)
+  # scale to Taylor Coeffs
+  u = fdb.deriv_to_tay_coeff(u)
+  w = fdb.deriv_to_tay_coeff(w)
+  # prepare for expected convolution dimensions
+  u = np.array(u).T
+  u = u[:,np.newaxis,:]
+  w = np.array(w).T
+  w = w[:,np.newaxis,:]
+  w = np.flip(w,2)
+  #TODO: what should the padding be for generalized dot conv?
+  v0 = conv_general_dilated(u[0:(0+1)],w[0:(0+1)],(1,1),[(10,0),(N-1,0)])
+  return [conv_general_dilated(u[i:(i+1)],w[i:(i+1)],(1,1),[(10,0),(N-1,0)]) for i in range(N)]
+  def batchwise_conv(ui,wi):
+    # seems silly to produce new axes here
+    ui = ui[np.newaxis,:]
+    wi = wi[np.newaxis,:]
+    return conv_general_dilated(ui,wi,(1,),[(N-1,0)])
+  v = vmap(batchwise_conv)(u,w)
+  # remove extra dimensions
+  # is this robust?
+  v = v[:,0,0,:]
+  v = v.T
+  # Back to Derivative coefficients
+  v = fdb.tay_to_deriv_coeff(v)
+  # Do we really want list?
+  return list(v)
+
 def prop_dot(primals_in, series_in,**params):
-  m_primals, m_terms = prop_mul(primals_in,series_in)
-  out_primals, out_terms =  np.sum(m_primals), np.sum(m_terms,axis=1,keepdims=False)
-  return out_primals,list(out_terms)
+  u0, w0 = primals_in
+  vu, vw = zip(*series_in)
+  u = [u0,] + list(vu)
+  w = [w0,] + list(vw)
+  v = manual_dot_conv(u,w)
+  # v_conv = dot_conv(u,w)
+  out_primals = v[0]
+  out_terms= v[1:]
+  return out_primals,out_terms
 fdb.prop_rules[dot_p] = prop_dot
 
 def make_derivs_dot(primals, order, **params):
@@ -244,7 +287,37 @@ def make_derivs_dot(primals, order, **params):
   return out, list(itertools.islice(derivs, order))
 fdb.jet_rules[dot_p] = make_derivs_dot
 
+def manual_f_conv(f,u,w):
+  for k in range(0,len(v)):
+    def scale(j):
+      return 1./(fact(k-j)*fact(j))
+    v[k] = fact(k)*sum([scale(j)* f(u[j],w[k-j]) for j in range(0,k+1)])
+  return v
 
+
+
+def prop_div(primals_in, series_in):
+  #TODO: use external conv
+  def internal_mul_conv(v,w,k):
+    def scale(j):
+      return 1./(fact(k-j)*fact(j))
+    return sum([scale(j)* v[j] * w[k-j] for j in range(0,k)])
+  def div_conv(u,w):
+    v = copy(u)
+    v[0] = u[0]/w[0]
+    for k in range(1,len(v)):
+      v[k] = 1./w[0]*(u[k] - fact(k)*internal_mul_conv(v,w,k))
+    return v
+  #TODO: refactor so no distinction between primals and terms
+  u0, w0 = primals_in
+  vu, vw = zip(*series_in)
+  u = [u0,] + list(vu)
+  w = [w0,] + list(vw)
+  u = np.asarray(u) #TODO: term array refactor?
+  w = np.asarray(w)
+  v = div_conv(u,w)
+  return v[0], list(v[1:])
+fdb.prop_rules[div_p] = prop_div
 
 # from scipy.integrate import odeint as odeint_impl
 #

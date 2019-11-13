@@ -2,6 +2,7 @@ import numpy.random as npr
 from scipy.special import factorial as fact
 
 import jax
+import jax.nn
 from jax.util import safe_map
 from jax import vjp,jvp, jet, grad
 import jax.numpy as np
@@ -60,30 +61,32 @@ def test_exp():
   # terms_in = [2., 3., 4.]
   # x = np.array([1.,5.])
   # terms_in =[np.array([2.,6.]),np.array([3.,7.]),np.array([4.,8])]
+  import ipdb; ipdb.set_trace()
   jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-4)
 
 def test_mlp():
   def mlp(M1,M2,x):
-    return np.dot(M2,np.exp(np.dot(M1,x)))
+    return np.dot(np.exp(np.dot(x,M1),M2))
   f_mlp = lambda x: mlp(M1,M2,x)
-  M1,M2 = (npr.randn(10,10), npr.randn(10,10))
-  x= npr.randn(10)
-  terms_in = ((np.ones_like(x),),(np.zeros_like(x),))
-  y,terms = jet(f_mlp,(x,),(terms_in,))
+  M1,M2 = (npr.randn(10,10), npr.randn(10,5))
+  x= npr.randn(2,10)
+  terms_in = [np.ones_like(x),np.zeros_like(x), np.zeros_like(x),np.zeros_like(x)]
   import ipdb; ipdb.set_trace()
+  # y,terms = jet(f_mlp,(x,),[terms_in])
+  jvp_test_jet(f_mlp,(x,),[terms_in])
 
-def test_mlp_t():
-  def mlp(M1,M2,x,t):
-    x = np.append(x,t)
-    return np.dot(M2,np.exp(np.dot(M1,x)))
-  f_mlp = lambda t: mlp(M1,M2,x,t)
-  M1,M2 = (npr.randn(10,11), npr.randn(10,10))
-  x= npr.randn(10)
-  t = npr.randn()
-  primals = (t,)
-  t_series = [np.ones_like(t)] + [np.zeros_like(t)]*3
-  series= [t_series]
-  y,terms = jet(f_mlp,primals,series)
+# def test_mlp_t():
+#   def mlp(M1,M2,x,t):
+#     x = np.append(x,t)
+#     return M2*np.exp(M1*x)
+#   f_mlp = lambda t: mlp(M1,M2,x,t)
+#   M1,M2 = (npr.randn(10,11), npr.randn(10,10))
+#   x= npr.randn(10)
+#   t = npr.randn()
+#   primals = (t,)
+#   t_series = [np.ones_like(t)] + [np.zeros_like(t)]*3
+#   series= [t_series]
+#   y,terms = jet(f_mlp,primals,series)
 
 def test_log():
   raise NotImplementedError
@@ -155,17 +158,57 @@ def test_dot():
 
 
 def test_mul():
-  d = 3
-  n = 4
-  x1 = npr.randn(d)
-  x2 = npr.randn(d)
+  D = 3
+  N = 4
+  x1 = npr.randn(D)
+  x2 = npr.randn(D)
   f = lambda a, b: a * b
   primals = (x1, x2)
-  terms_in1 = list(npr.randn(n,d))
-  terms_in2 = list(npr.randn(n,d))
+  terms_in1 = list(npr.randn(N,D))
+  terms_in2 = list(npr.randn(N,D))
   series_in = (terms_in1, terms_in2)
   jvp_test_jet(f, primals, series_in)
 
+def test_div():
+  D = 3
+  N = 4
+  # x1 = npr.randn(D)
+  # x2 = npr.randn(D)
+  x = 1.
+  y = 5.
+  primals = (x,y)
+  # terms_in1 = list(npr.randn(N,D))
+  # terms_in2 = list(npr.randn(N,D))
+  terms_x = [1.,2.,3.,4.]
+  terms_y = [6.,7.,8.,9.]
+  series_in = (terms_x, terms_y)
+  f = lambda a, b: a / b
+  jvp_test_jet(f, primals, series_in)
+
+def test_sigmoid():
+  D1,D2 = 10,3
+  N = 4
+  x = npr.randn(D1,D2)
+  # f = jax.nn.sigmoid #TODO: jax special expit
+  f = lambda x: 1. / (1. + np.exp(-x))
+  primals = (x,)
+  terms_in = [npr.randn(D1,D2)]*N
+  series_in = (terms_in,)
+  jvp_test_jet(f, primals, series_in)
+
+# TODO: matmul correctly handle other dims, or is this all dot?
+# def test_mul2():
+#   d1 = 2
+#   d2 = 10
+#   n = 4
+#   x1 = npr.randn(d1,d2)
+#   x2 = npr.randn(d2,d2)
+#   f = lambda a, b: a * b
+#   primals = (x1, x2)
+#   terms_in1 = list(npr.randn(n,d1,d2))
+#   terms_in2 = list(npr.randn(n,d2,d2))
+#   series_in = (terms_in1, terms_in2)
+#   jvp_test_jet(f, primals, series_in)
 
 ## Test Combinations?
 def test_sin_sin():
