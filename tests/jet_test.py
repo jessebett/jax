@@ -65,14 +65,13 @@ def test_exp():
   jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-4)
 
 def test_mlp():
+  sigm = lambda x: 1. / (1. + np.exp(-x))
   def mlp(M1,M2,x):
-    return np.dot(np.exp(np.dot(x,M1),M2))
+    return np.dot(sigm(np.dot(x,M1)),M2)
   f_mlp = lambda x: mlp(M1,M2,x)
   M1,M2 = (npr.randn(10,10), npr.randn(10,5))
   x= npr.randn(2,10)
   terms_in = [np.ones_like(x),np.zeros_like(x), np.zeros_like(x),np.zeros_like(x)]
-  import ipdb; ipdb.set_trace()
-  # y,terms = jet(f_mlp,(x,),[terms_in])
   jvp_test_jet(f_mlp,(x,),[terms_in])
 
 # def test_mlp_t():
