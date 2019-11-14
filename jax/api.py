@@ -61,6 +61,7 @@ from .interpreters import pxla
 from .interpreters import ad
 from .interpreters import batching
 from .interpreters import parallel
+from .interpreters import fdb
 from .interpreters import masking
 from .interpreters.masking import shapecheck, ensure_poly
 from .config import flags, config
@@ -1012,6 +1013,11 @@ def _parallelize(fun):
 
   return pfun
 
+
+def jet(fun, primals, series):
+  f = lu.wrap_init(fun)
+  out_primal, out_terms = fdb.jet(f).call_wrapped(primals, series)
+  return out_primal, out_terms
 
 def mask(fun, in_shapes, out_shape):
   in_specs, in_shapes_tree = tree_flatten(in_shapes)
