@@ -20,4 +20,4 @@ from jax.api import *
 from jax import nn
 from jax import random
 import jax.numpy as np  # side-effecting import sets up operator overloads
-import jax.lax.jetlax
+from jax.lax import jetlax

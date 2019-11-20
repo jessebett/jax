@@ -1,11 +1,11 @@
 from functools import partial
 from jax import vmap
-from lax import *
+from jax.lax import *
+from jax.lax import dot_general_p as dot_p
 from jax import ops
 import jax.numpy as np
 from ..interpreters import fdb
 from ..interpreters import xla
-from custom_props import prop_exp
 from copy import copy
 from scipy.special import factorial as fact
 
@@ -151,7 +151,7 @@ def prop_exp(primals_in, series_in):
   #TODO: use numpy convolve
   #TODO: use scipy fft?
   x, = primals_in
-  u = [primals_in] + series_in
+  u = [primals_in] + list(series_in)
 
   v = manual_exp_conv(u)
   # v = exp_conv(u) #TODO: LAX conv for general shape :\ 
@@ -301,12 +301,9 @@ def prop_div(primals_in, series_in):
   def internal_mul_conv(v,w,k):
     def scale(j):
       return 1./(fact(k-j)*fact(j))
-    import ipdb;ipdb.set_trace()
     return sum([scale(j)* v[j] * w[k-j] for j in range(0,k)])
   def div_conv(u,w):
-    v = [u[0]/w[0]]*len(u)
-    import ipdb;ipdb.set_trace()
-    # v[0] = u[0]/w[0]
+    v = [u[0]/w[0]]*len(u) # TODO: Hack for creating return of correct type
     for k in range(1,len(v)):
       v[k] = 1./w[0]*(u[k] - fact(k)*internal_mul_conv(v,w,k))
     return v
