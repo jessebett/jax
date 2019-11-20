@@ -14,6 +14,9 @@
 
 from setuptools import setup, find_packages
 
+global __version__
+__version__ = None
+
 with open('jax/version.py') as f:
   exec(f.read(), globals())
 
@@ -25,7 +28,8 @@ setup(
     author_email='jax-dev@google.com',
     packages=find_packages(exclude=["examples"]),
     install_requires=[
-        'numpy>=1.12', 'six', 'protobuf>=3.6.0', 'absl-py', 'opt_einsum'
+        'numpy>=1.12', 'six', 'protobuf>=3.6.0', 'absl-py', 'opt_einsum',
+        'fastcache'
     ],
     url='https://github.com/google/jax',
     license='Apache-2.0',

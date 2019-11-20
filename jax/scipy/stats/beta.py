@@ -25,7 +25,7 @@ from ...numpy.lax_numpy import (_promote_args_like, _constant_like, _wraps,
 from ..special import gammaln
 
 
-@_wraps(osp_stats.beta.logpdf)
+@_wraps(osp_stats.beta.logpdf, update_doc=False)
 def logpdf(x, a, b, loc=0, scale=1):
   x, a, b, loc, scale = _promote_args_like(osp_stats.beta.logpdf, x, a, b, loc, scale)
   one = _constant_like(x, 1)
@@ -33,12 +33,12 @@ def logpdf(x, a, b, loc=0, scale=1):
   shape_term = lax.sub(gammaln(lax.add(a, b)), shape_term_tmp)
   y = lax.div(lax.sub(x, loc), scale)
   log_linear_term = lax.add(lax.mul(lax.sub(a, one), lax.log(y)),
-                            lax.mul(lax.sub(b, one), lax.log(lax.sub(one, y))))
+                            lax.mul(lax.sub(b, one), lax.log1p(lax.neg(y))))
   log_probs = lax.sub(lax.add(shape_term, log_linear_term), lax.log(scale))
   return where(logical_or(lax.gt(x, lax.add(loc, scale)),
                           lax.lt(x, loc)), -inf, log_probs)
 
-@_wraps(osp_stats.beta.pdf)
+@_wraps(osp_stats.beta.pdf, update_doc=False)
 def pdf(x, a, b, loc=0, scale=1):
   return lax.exp(logpdf(x, a, b, loc, scale))
 

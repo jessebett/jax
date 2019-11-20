@@ -27,42 +27,16 @@ import os
 import warnings
 from distutils.util import strtobool
 
+from absl import logging
+
 from ..config import flags
+from .. import util
 import numpy as onp  # 'onp' rather than 'np' to distinguish from autograd.numpy
 import six
+import threading
 
-import jaxlib
-
-_minimum_jaxlib_version = (0, 1, 14)
-try:
-  from jaxlib import version as jaxlib_version
-except:
-  # jaxlib is too old to have version number.
-  msg = 'This version of jax requires jaxlib version >= {}.'
-  raise ImportError(msg.format('.'.join(map(str, _minimum_jaxlib_version))))
-
-
-# Check the jaxlib version before importing anything else from jaxlib.
-def _check_jaxlib_version():
-  version = tuple(int(x) for x in jaxlib_version.__version__.split('.'))
-  if version < _minimum_jaxlib_version:
-    msg = 'jaxlib is version {}, but this version of jax requires version {}.'
-    raise ValueError(msg.format('.'.join(map(str, version)),
-                                '.'.join(map(str, _minimum_jaxlib_version))))
-
-_check_jaxlib_version()
-
-
-from jaxlib import xla_client
-from jaxlib import xla_data_pb2
-
-# TODO(phawkins): This is a workaround for older jaxlib versions. Remove after a
-# jaxlib release.
-try:
-  from jaxlib import xrt
-except ImportError:
-  xrt = None
-
+from . import version
+from . import xla_client
 
 FLAGS = flags.FLAGS
 flags.DEFINE_bool('jax_enable_x64',
@@ -70,7 +44,7 @@ flags.DEFINE_bool('jax_enable_x64',
                   'Enable 64-bit types to be used.')
 flags.DEFINE_string(
     'jax_xla_backend', 'xla',
-    'Either "xla" for the XLA service directly, or "xrt" for an XRT backend.')
+    'Default is "xla" for the XLA service directly.')
 flags.DEFINE_string(
     'jax_backend_target', 'local',
     'Either "local" or "rpc:address" to connect to a remote service target.')
@@ -82,35 +56,45 @@ flags.DEFINE_string(
     'pass "cpu" for CPU or "gpu" for GPU.')
 
 
-def get_compile_options(num_replicas=None):
-  """Returns the compile options to use, as derived from flag values."""
+def get_compile_options(num_replicas=None, device_assignment=None):
+  """Returns the compile options to use, as derived from flag values.
+
+  Args:
+    num_replicas: Optional int indicating the number of replicas for which to
+      compile (default inherited from xla_client.CompileOptions).
+    device_assignment: Optional tuple of integers indicating the assignment of
+      logical replicas to physical devices (default inherited from
+      xla_client.CompileOptions). Must be consistent with `num_replicas`.
+  """
   compile_options = None
   if num_replicas is not None:
     compile_options = compile_options or xla_client.CompileOptions()
     compile_options.num_replicas = num_replicas
+  if device_assignment is not None:
+    logging.vlog(2, "get_compile_options: num_replicas=%s device_assignment=%s",
+                 num_replicas, device_assignment)
+    # NOTE(mattjj): xla_client.DeviceAssignment.create expects a 2D ndarray
+    # indexed by replica number and computation per replica, respectively, while
+    # here we currently assume only one computation per replica, hence the
+    # second axis is always trivial.
+    if num_replicas is not None and num_replicas != len(device_assignment):
+      msg = "device_assignment does not match num_replicas: {} vs {}."
+      raise ValueError(msg.format(device_assignment, num_replicas))
+    compile_options = compile_options or xla_client.CompileOptions()
+    device_assignment = onp.array(device_assignment)[:, None]
+    device_assignment = xla_client.DeviceAssignment.create(device_assignment)
+    assert num_replicas is None or device_assignment.replica_count() == num_replicas
+    compile_options.device_assignment = device_assignment
   return compile_options
-
-
-def memoize(func):
-  class memodict(dict):
-    def __missing__(self, key):
-      val = self[key] = func(key)
-      return val
-  return memodict().__getitem__
-
-
-def memoize_thunk(func):
-  cached = []
-  return lambda: cached[0] if cached else (cached.append(func()) or cached[0])
-
 
 _backends = {}
 
 def register_backend(name, factory):
   _backends[name] = factory
 
-def _get_local_backend():
-  platform = FLAGS.jax_platform_name
+def _get_local_backend(platform=None):
+  if not platform:
+    platform = FLAGS.jax_platform_name
 
   # Canonicalize platform names.
   cpu = 'cpu'
@@ -131,93 +115,124 @@ def _get_local_backend():
 
   return backend
 
-def _get_xrt_backend():
-  # TODO(phawkins): support non-TPU devices.
-  tf_device_name = "TPU"
-  worker = "tpu_worker"
-  tf_context = xrt.get_tf_context(FLAGS.jax_backend_target, worker)
-  backend = xrt.XrtBackend(tf_context, tf_device_name)
-  #  TODO(phawkins) fix XrtBackend to set the following and remove this line.
-  backend.platform = "TPU"
-  return backend
-
 
 register_backend('xla', _get_local_backend)
-register_backend('xrt', _get_xrt_backend)
+
+_backend_lock = threading.Lock()
+
+@util.memoize
+def get_backend(platform=None):
+  with _backend_lock:
+    backend = _backends.get(FLAGS.jax_xla_backend)
+    if backend is None:
+      msg = 'Unknown jax_xla_backend value "{}".'
+      raise ValueError(msg.format(FLAGS.jax_xla_backend))
+    return backend(platform)
 
 
-@memoize_thunk
-def get_backend():
-  backend = _backends.get(FLAGS.jax_xla_backend)
-  if backend is None:
-    msg = 'Unknown jax_xla_backend value "{}".'
-    raise ValueError(msg.format(FLAGS.jax_xla_backend))
-  return backend()
+def device_count(backend=None):
+  """Returns the total number of devices.
+
+  On most platforms, this is the same as `local_device_count()`. However, on
+  multi-host platforms, this will return the total number of devices across all
+  hosts.
+
+  Args:
+    backend: This is an experimental feature and the API is likely to change.
+      Optional, a string representing the xla backend. 'cpu','gpu', or 'tpu'.
+
+  Returns:
+    Number of devices.
+  """
+  return int(get_backend(backend).device_count())
 
 
-def device_count():
-  return get_backend().device_count()
+def local_device_count(backend=None):
+  """Returns the number of devices on this host."""
+  return int(get_backend(backend).local_device_count())
 
 
-def device_put(pyval, device_num=0):
-  return xla_client.LocalBuffer.from_pyval(pyval, device_num,
-                                           backend=get_backend())
+def devices(backend=None):
+  """Returns a list of all devices.
 
-def make_tuple(bufs, device_num=0):
-  return xla_client.Buffer.make_tuple(bufs, device=device_num,
-                                      backend=get_backend())
+  Each device is represented by a subclass of Device (e.g. CpuDevice,
+  GpuDevice). The length of the returned list is equal to
+  `device_count()`. Local devices can be identified by comparing
+  `Device.host_id` to `host_id()`.
+
+  Args:
+    backend: This is an experimental feature and the API is likely to change.
+      Optional, a string representing the xla backend. 'cpu','gpu', or 'tpu'.
+
+  Returns:
+    List of Device subclasses.
+  """
+  return get_backend(backend).devices()
 
 
-Shape = xla_client.Shape        # pylint: disable=invalid-name
+def local_devices(host_id=None, backend=None):
+  """Returns a list of devices local to a given host (this host by default)."""
+  if host_id is None:
+    host_id = get_backend(backend).host_id()
+  return [d for d in devices(backend) if d.host_id == host_id]
+
+
+def host_id(backend=None):
+  """Returns the integer host ID of this host.
+
+  On most platforms, this will always be 0. This will vary on multi-host
+  platforms though.
+
+  Args:
+    backend: This is an experimental feature and the API is likely to change.
+      Optional, a string representing the xla backend. 'cpu','gpu', or 'tpu'.
+
+  Returns:
+    Integer host ID.
+  """
+  return get_backend(backend).host_id()
+
+
+def host_ids(backend=None):
+  """Returns a list of all host IDs."""
+  return list(set(d.host_id for d in devices(backend)))
+
+
+def host_count(backend=None):
+  return len(host_ids(backend))
 
 
 ### utility functions
 
-@memoize
+@util.memoize
 def dtype_to_etype(dtype):
   """Convert from dtype to canonical etype (reading FLAGS.jax_enable_x64)."""
-  return xla_client.DTYPE_TO_XLA_ELEMENT_TYPE[canonicalize_dtype(dtype)]
-
-@memoize
-def dtype_to_etype_exact(dtype):
-  """Convert from dtype to exact etype (ignoring FLAGS.jax_enable_x64)."""
-  return xla_client.dtype_to_etype(dtype)
+  return xla_client.dtype_to_etype(canonicalize_dtype(dtype))
 
 
 _dtype_to_32bit_dtype = {
-    str(onp.dtype('int64')): onp.dtype('int32'),
-    str(onp.dtype('uint64')): onp.dtype('uint32'),
-    str(onp.dtype('float64')): onp.dtype('float32'),
-    str(onp.dtype('complex128')): onp.dtype('complex64'),
+    onp.dtype('int64'): onp.dtype('int32'),
+    onp.dtype('uint64'): onp.dtype('uint32'),
+    onp.dtype('float64'): onp.dtype('float32'),
+    onp.dtype('complex128'): onp.dtype('complex64'),
 }
 
 
-@memoize
+@util.memoize
 def canonicalize_dtype(dtype):
   """Convert from a dtype to a canonical dtype based on FLAGS.jax_enable_x64."""
   dtype = onp.dtype(dtype)
 
   if FLAGS.jax_enable_x64:
-    return str(dtype)
+    return dtype
   else:
-    return str(_dtype_to_32bit_dtype.get(str(dtype), dtype))
+    return _dtype_to_32bit_dtype.get(dtype, dtype)
 
 
-@memoize_thunk
+@util.memoize
 def supported_numpy_dtypes():
   return {canonicalize_dtype(dtype)
           for dtype in xla_client.XLA_ELEMENT_TYPE_TO_DTYPE.values()}
-
-
-def canonicalize_shape(shape):
-  """Given an xla_client.Shape, return a new instance with canonical dtypes."""
-  if shape.is_tuple():
-    return Shape.tuple_shape(tuple(
-        canonicalize_shape(s) for s in shape.tuple_shapes()))
-  else:
-    return Shape.array_shape(
-        canonicalize_dtype(shape.element_type()),
-        shape.dimensions(), shape.minor_to_major())
 
 
 # TODO(mattjj,frostig): try to remove this function
@@ -228,25 +243,6 @@ def normalize_to_xla_dtypes(val):
   elif isinstance(val, (tuple, list)):
     return tuple(normalize_to_xla_dtypes(x) for x in val)
   raise TypeError('Can\'t convert to XLA: {}'.format(val))
-
-
-# TODO(mattjj,frostig): try to remove this function
-def shape_of(value):
-  """Given a Python or XLA value, return its canonicalized XLA Shape."""
-  if hasattr(value, 'shape') and hasattr(value, 'dtype'):
-    return Shape.array_shape(canonicalize_dtype(value.dtype), value.shape)
-  elif onp.isscalar(value):
-    return shape_of(onp.asarray(value))
-  elif isinstance(value, (tuple, list)):
-    return Shape.tuple_shape(tuple(shape_of(elt) for elt in value))
-  else:
-    raise TypeError('Unexpected type: {}'.format(type(value)))
-
-
-def infeed_put(replica_id, pyval):
-  pyval = normalize_to_xla_dtypes(pyval)
-  return xla_client.transfer_to_infeed(
-      pyval, replica_number=replica_id)
 
 
 class _JaxComputationBuilder(xla_client.ComputationBuilder):
@@ -262,10 +258,6 @@ class _JaxComputationBuilder(xla_client.ComputationBuilder):
   def Build(self, *args, **kwargs):
     return super(_JaxComputationBuilder, self).Build(
         *args, **kwargs)
-
-  def Parameter(self, value, name=None, parameter_num=None):
-    return super(_JaxComputationBuilder, self).ParameterWithShape(
-        shape_of(value), name=name, parameter_num=parameter_num)
 
   def NumpyArrayConstant(self, value, canonicalize_types=True):
     if canonicalize_types:
@@ -291,14 +283,23 @@ class _JaxComputationBuilder(xla_client.ComputationBuilder):
     else:
       raise TypeError("No constant handler for type: {}".format(py_type))
 
-  # TODO(mattjj): remove when CRS is added to XLA:CPU
+  # TODO(mattjj): remove when CrossReplicaSum is added to XLA:CPU
   def CrossReplicaSum(self, operand, replica_groups):
     """Workaround for CrossReplicaSum not being implemented on some backends."""
     if len(replica_groups[0]) == 1:
       return operand
     else:
-      return super(_JaxComputationBuilder, self).CrossReplicaSum(operand,
-                                                                 replica_groups)
+      return super(_JaxComputationBuilder, self).CrossReplicaSum(
+          operand, replica_groups)
+
+  # TODO(mattjj): remove when AllToAll is added to XLA:CPU
+  def AllToAll(self, operand, split_axis, concat_axis, replica_groups):
+    """Workaround for AllToAll not being implemented on some backends."""
+    if len(replica_groups[0]) == 1:
+      return operand
+    else:
+      return super(_JaxComputationBuilder, self).AllToAll(
+          operand, split_axis, concat_axis, replica_groups)
 
 
 def make_computation_builder(name):
@@ -354,4 +355,4 @@ for scalar_type in [onp.int8, onp.int16, onp.int32, onp.int64,
   register_constant_handler(scalar_type, _scalar_constant_handler)
 
 if six.PY2:
-  register_constant_handler(long, _scalar_constant_handler)
+  register_constant_handler(long, _scalar_constant_handler) # noqa: F821

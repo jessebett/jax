@@ -19,13 +19,10 @@ from __future__ import print_function
 import collections
 import functools
 import itertools as it
-from operator import mul
 import types
+
+import fastcache
 import numpy as onp
-
-import six
-
-allow_memoize_hash_failures = False
 
 
 def safe_zip(*args):
@@ -34,14 +31,12 @@ def safe_zip(*args):
     assert len(arg) == n, 'length mismatch: {}'.format(list(map(len, args)))
   return list(zip(*args))
 
-
 def safe_map(f, *args):
   args = list(map(list, args))
   n = len(args[0])
   for arg in args[1:]:
     assert len(arg) == n, 'length mismatch: {}'.format(list(map(len, args)))
   return list(map(f, *args))
-
 
 def unzip2(xys):
   xs = []
@@ -50,7 +45,6 @@ def unzip2(xys):
     xs.append(x)
     ys.append(y)
   return tuple(xs), tuple(ys)
-
 
 def unzip3(xyzs):
   xs = []
@@ -62,10 +56,24 @@ def unzip3(xyzs):
     zs.append(z)
   return tuple(xs), tuple(ys), tuple(zs)
 
+def split_list(args, ns):
+  assert type(ns) is list
+  args = list(args)
+  lists = []
+  for n in ns:
+    lists.append(args[:n])
+    args = args[n:]
+  lists.append(args)
+  return lists
+
+def split_dict(dct, names):
+  dct = dict(dct)
+  lst = [dct.pop(name) for name in names]
+  assert not dct
+  return lst
 
 def concatenate(xs):
   return list(it.chain.from_iterable(xs))
-
 
 def partial(fun, *args, **kwargs):
   wrapped = functools.partial(fun, *args, **kwargs)
@@ -97,9 +105,12 @@ def curry(f):
   """
   return partial(partial, f)
 
-def toposort(end_node):
+def toposort(end_nodes):
+  if not end_nodes: return []
+  end_nodes = _remove_duplicates(end_nodes)
+
   child_counts = {}
-  stack = [end_node]
+  stack = list(end_nodes)
   while stack:
     node = stack.pop()
     if id(node) in child_counts:
@@ -107,9 +118,12 @@ def toposort(end_node):
     else:
       child_counts[id(node)] = 1
       stack.extend(node.parents)
+  for node in end_nodes:
+    child_counts[id(node)] -= 1
 
   sorted_nodes = []
-  childless_nodes = [end_node]
+  childless_nodes = [node for node in end_nodes if child_counts[id(node)] == 0]
+  assert childless_nodes
   while childless_nodes:
     node = childless_nodes.pop()
     sorted_nodes.append(node)
@@ -119,8 +133,23 @@ def toposort(end_node):
       else:
         child_counts[id(parent)] -= 1
 
+  check_toposort(sorted_nodes[::-1])
   return sorted_nodes[::-1]
 
+def check_toposort(nodes):
+  visited = set()
+  for node in nodes:
+    assert all(id(parent) in visited for parent in node.parents)
+    visited.add(id(node))
+
+def _remove_duplicates(node_list):
+  seen = set()
+  out = []
+  for n in node_list:
+    if id(n) not in seen:
+      seen.add(id(n))
+      out.append(n)
+  return out
 
 def split_merge(predicate, xs):
   sides = list(map(predicate, xs))
@@ -141,52 +170,16 @@ def split_merge(predicate, xs):
 
   return lhs, rhs, merge
 
+def cache(max_size=4096):
+  return fastcache.clru_cache(maxsize=max_size)
 
-if six.PY3:
-  OrderedDict = collections.OrderedDict
-else:
-  # Retrofits a move_to_end method to OrderedDict in Python 2 mode.
-  class OrderedDict(collections.OrderedDict):
-    def move_to_end(self, key):
-      value = self[key]
-      del self[key]
-      self[key] = value
-
-
-_NO_MEMO_ENTRY = object()
-
-def memoize(fun, max_size=4096):
-  cache = OrderedDict()
-  def memoized_fun(*args, **kwargs):
-    key = (args, tuple(kwargs and sorted(kwargs.items())))
-    try:
-      ans = cache.get(key, _NO_MEMO_ENTRY)
-      if ans != _NO_MEMO_ENTRY:
-        cache.move_to_end(key)
-        return ans
-    except TypeError:
-      if not allow_memoize_hash_failures:
-        raise
-
-    if len(cache) > max_size:
-      cache.popitem(last=False)
-
-    ans = cache[key] = fun(*args, **kwargs)
-    return ans
-  return memoized_fun
-
-
-def memoize_unary(func):
-  class memodict(dict):
-    def __missing__(self, key):
-      val = self[key] = func(key)
-      return val
-  return memodict().__getitem__
-
+memoize = fastcache.clru_cache(maxsize=None)
 
 def prod(xs):
-  return functools.reduce(mul, xs, 1)
-
+  out = 1
+  for x in xs:
+    out *= x
+  return out
 
 class WrapHashably(object):
   __slots__ = ["val"]
@@ -212,7 +205,6 @@ class Hashable(object):
   def __eq__(self, other):
     return self.val == other.val
 
-
 def get_module_functions(module):
   """Finds functions in module.
   Args:
@@ -220,7 +212,6 @@ def get_module_functions(module):
   Returns:
     module_fns: A set of functions, builtins or ufuncs in `module`.
   """
-
   module_fns = set()
   for key in dir(module):
     attr = getattr(module, key)

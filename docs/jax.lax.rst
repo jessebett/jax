@@ -3,13 +3,19 @@ jax.lax package
 
 .. automodule:: jax.lax
 
-`lax` is a library of primitives that underpins libraries such as `jax.numpy`.
+:mod:`jax.lax` is a library of primitives operations that underpins libraries
+such as :mod:`jax.numpy`. Transformation rules, such as JVP and batching rules,
+are typically defined as transformations on :mod:`jax.lax` primitives.
 
 Many of the primitives are thin wrappers around equivalent XLA operations,
 described by the `XLA operation semantics
-<https://www.tensorflow.org/xla/operation_semantics>`_ documentation.
+<https://www.tensorflow.org/xla/operation_semantics>`_ documentation. In a few
+cases JAX diverges from XLA, usually to ensure that the set of operations is
+closed under the operation of JVP and transpose rules.
 
-Where possible, prefer to use libraries such as `jax.numpy` instead of using `jax.lax` directly.
+Where possible, prefer to use libraries such as :mod:`jax.numpy` instead of
+using :mod:`jax.lax` directly. The :mod:`jax.numpy` API follows NumPy, and is
+therefore more stable and less likely to change than the :mod:`jax.lax` API.
 
 Operators
 ---------
@@ -20,13 +26,12 @@ Operators
     abs
     add
     acos
-    acosh
     asin
-    asinh
     atan
-    atanh
     atan2
     batch_matmul
+    bessel_i0e
+    bessel_i1e
     bitcast_convert_type
     bitwise_not
     bitwise_and
@@ -112,7 +117,6 @@ Operators
     sort_key_val
     sqrt
     square
-    stop_gradient
     sub
     tan
     tie_in
@@ -127,9 +131,19 @@ Control flow operators
 
     cond
     fori_loop
+    map
     scan
     while_loop
 
+Custom gradient operators
+-------------------------
+
+.. autosummary::
+  :toctree: _autosummary
+
+    stop_gradient
+    custom_linear_solve
+    custom_root
 
 Parallel operators
 ------------------
@@ -139,7 +153,9 @@ Parallelism support is experimental.
 .. autosummary::
   :toctree: _autosummary
 
+    all_to_all
     psum
     pmax
     pmin
     ppermute
+    pswapaxes

@@ -14,6 +14,11 @@
 
 # JAX is Autograd and XLA
 
+load(
+    "@org_tensorflow//tensorflow/core/platform:default/cuda_build_defs.bzl",
+    "if_cuda_is_configured",
+)
+
 licenses(["notice"])  # Apache 2
 
 package(default_visibility = ["//visibility:public"])
@@ -23,9 +28,14 @@ sh_binary(
     srcs = ["install_xla_in_source_tree.sh"],
     data = [
         "@org_tensorflow//tensorflow/compiler/xla/python:xla_client",
+        "@org_tensorflow//tensorflow/compiler/xla/python/tpu_driver/client:py_tpu_client",
         "//jaxlib",
         "//jaxlib:lapack.so",
-    ],
+        "//jaxlib:pytree",
+    ] + if_cuda_is_configured([
+        "//jaxlib:cublas_kernels",
+        "//jaxlib:cusolver_kernels",
+    ]),
     deps = ["@bazel_tools//tools/bash/runfiles"],
 )
 

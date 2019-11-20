@@ -60,19 +60,19 @@ def get_python_bin_path(python_bin_path_flag):
 
 # Bazel
 
-BAZEL_BASE_URI = "https://github.com/bazelbuild/bazel/releases/download/0.24.1/"
+BAZEL_BASE_URI = "https://github.com/bazelbuild/bazel/releases/download/0.29.1/"
 BazelPackage = collections.namedtuple("BazelPackage", ["file", "sha256"])
 bazel_packages = {
     "Linux":
         BazelPackage(
-            file="bazel-0.24.1-linux-x86_64",
+            file="bazel-0.29.1-linux-x86_64",
             sha256=
-            "e18e2877e18a447eb5d94f5efbec375366d82af6443c6a83a93c62657a7b1c32"),
+            "da3031d811f42f6208d24a87984b5b07e1c75afede184cad86eb02bef6c3b9b0"),
     "Darwin":
         BazelPackage(
-            file="bazel-0.24.1-darwin-x86_64",
+            file="bazel-0.29.1-darwin-x86_64",
             sha256=
-            "cf763752550050d117e03659aaa6ccd6f97da1f983a6029300a497fdaeaaec46"),
+            "34daae4caafbdb0952415ed6f97f47f03df84df9af146e9eb910ba65c073efdd"),
 }
 
 
@@ -164,9 +164,9 @@ def check_bazel_version(bazel_path, min_version, max_version):
 
 
 BAZELRC_TEMPLATE = """
-build --action_env PYTHON_BIN_PATH="{python_bin_path}"
+build --repo_env PYTHON_BIN_PATH="{python_bin_path}"
 build --python_path="{python_bin_path}"
-build --action_env TF_NEED_CUDA="{tf_need_cuda}"
+build --repo_env TF_NEED_CUDA="{tf_need_cuda}"
 build --distinct_host_configuration=false
 build --copt=-Wno-sign-compare
 build -c opt
@@ -187,6 +187,12 @@ build --define=grpc_no_ares=true
 
 build:cuda --crosstool_top=@local_config_cuda//crosstool:toolchain
 build:cuda --define=using_cuda=true --define=using_cuda_nvcc=true
+
+build --spawn_strategy=standalone
+build --strategy=Genrule=standalone
+
+build --cxxopt=-std=c++14
+build --host_cxxopt=-std=c++14
 """
 
 
@@ -282,6 +288,14 @@ def main():
       "--cudnn_path",
       default=None,
       help="Path to CUDNN libraries.")
+  parser.add_argument(
+      "--bazel_startup_options",
+      action="append", default=[],
+      help="Additional startup options to pass to bazel.")
+  parser.add_argument(
+      "--bazel_options",
+      action="append", default=[],
+      help="Additional options to pass to bazel.")
   args = parser.parse_args()
 
   print(BANNER)
@@ -313,7 +327,7 @@ def main():
       cudnn_install_path=cudnn_install_path)
 
   print("\nBuilding XLA and installing it in the jaxlib source tree...")
-  config_args = []
+  config_args = args.bazel_options
   if args.enable_march_native:
     config_args += ["--config=opt"]
   if args.enable_mkl_dnn:
@@ -321,8 +335,8 @@ def main():
   if args.enable_cuda:
     config_args += ["--config=cuda"]
   shell(
-    [bazel_path, "run", "--verbose_failures=true"] +
-    config_args +
+    [bazel_path] + args.bazel_startup_options +
+    ["run", "--verbose_failures=true"] + config_args +
     [":install_xla_in_source_tree", os.getcwd()])
   shell([bazel_path, "shutdown"])
 

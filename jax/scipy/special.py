@@ -32,7 +32,7 @@ def gammaln(x):
   return lax.lgamma(x)
 
 
-@_wraps(osp_special.digamma)
+@_wraps(osp_special.digamma, update_doc=False)
 def digamma(x):
   x, = _promote_args_like(osp_special.digamma, x)
   return lax.digamma(x)
@@ -44,7 +44,7 @@ def erf(x):
   return lax.erf(x)
 
 
-@_wraps(osp_special.erfc)
+@_wraps(osp_special.erfc, update_doc=False)
 def erfc(x):
   x, = _promote_args_like(osp_special.erfc, x)
   return lax.erfc(x)
@@ -56,7 +56,7 @@ def erfinv(x):
   return lax.erf_inv(x)
 
 
-@_wraps(osp_special.logit)
+@_wraps(osp_special.logit, update_doc=False)
 @custom_transforms
 def logit(x):
   x = asarray(x)
@@ -64,7 +64,7 @@ def logit(x):
 defjvp(logit, lambda g, ans, x: g / (x * (1 - x)))
 
 
-@_wraps(osp_special.expit)
+@_wraps(osp_special.expit, update_doc=False)
 @custom_transforms
 def expit(x):
   x = asarray(x)
@@ -81,6 +81,7 @@ def logsumexp(a, axis=None, b=None, keepdims=False, return_sign=False):
   shape = lax.subvals(onp.shape(a), zip(dims, (1,) * len(dims)))
   dimadd = lambda x: lax.reshape(x, shape)
   amax = lax.reduce(a, _constant_like(a, -onp.inf), lax.max, dims)
+  amax = lax.select(lax.is_finite(amax), amax, lax.full_like(amax, 0))
   amax_singletons = dimadd(amax)
   out = lax.add(lax.log(lax.reduce(lax.exp(lax.sub(a, amax_singletons)),
                                    _constant_like(a, 0), lax.add, dims)), amax)
@@ -93,10 +94,31 @@ def xlogy(x, y):
   return lax._safe_mul(x, lax.log(y))
 
 
-@_wraps(osp_special.xlog1py)
+@_wraps(osp_special.xlog1py, update_doc=False)
 def xlog1py(x, y):
   x, y = _promote_args_like(osp_special.xlog1py, x, y)
   return lax._safe_mul(x, lax.log1p(y))
+
+
+@_wraps(osp_special.entr)
+def entr(x):
+  x, = _promote_args_like(osp_special.entr, x)
+  return lax.select(lax.lt(x, _constant_like(x, 0)),
+                    lax.full_like(x, -onp.inf),
+                    lax.neg(xlogy(x, x)))
+
+
+@_wraps(osp_special.multigammaln, update_doc=False)
+def multigammaln(a, d):
+  a, = _promote_args_like(lambda a: osp_special.multigammaln(a, 1), a)
+  d = lax.convert_element_type(d, lax.dtype(a))
+  constant = lax.mul(lax.mul(lax.mul(_constant_like(a, 0.25), d),
+                             lax.sub(d, _constant_like(a, 1))),
+                     lax.log(_constant_like(a, onp.pi)))
+  res = np.sum(gammaln(np.expand_dims(a, axis=-1) -
+                       lax.div(np.arange(d), _constant_like(a, 2))),
+               axis=-1)
+  return res + constant
 
 
 # Normal distributions
@@ -216,7 +238,7 @@ def _ndtr(x):
                       lax.select(lax.gt(w, dtype(0.)),
                                       dtype(2.) - lax.erfc(z),
                                       lax.erfc(z)))
-  return 0.5 * y
+  return dtype(0.5) * y
 
 
 def ndtri(p):
@@ -355,6 +377,7 @@ def _ndtri(p):
   return x_nan_replaced
 
 
+@custom_transforms
 def log_ndtr(x, series_order=3):
   r"""Log Normal distribution function.
 
@@ -488,3 +511,22 @@ def _log_ndtr_asymptotic_series(x, series_order):
 def _double_factorial(n):
   """The double factorial function for small Python integer `n`."""
   return onp.prod(onp.arange(n, 1, -2))
+
+
+_norm_logpdf_constant = onp.log(onp.sqrt(2 * onp.pi))
+
+def _norm_logpdf(x):
+  neg_half = _constant_like(x, -0.5)
+  log_normalizer = _constant_like(x, _norm_logpdf_constant)
+  return lax.sub(lax.mul(neg_half, lax.square(x)), log_normalizer)
+
+defjvp(log_ndtr,
+       lambda g, ans, x: lax.mul(g, lax.exp(lax.sub(_norm_logpdf(x), ans))))
+
+@_wraps(osp_special.i0e)
+def i0e(x):
+  return lax.bessel_i0e(x)
+
+@_wraps(osp_special.i1e)
+def i1e(x):
+  return lax.bessel_i1e(x)
