@@ -14,7 +14,7 @@ map = safe_map
 
 def repeated(f, n):
   def rfun(p):
-    return reduce(lambda x, _: f(x), xrange(n), p)
+    return jax.reduce(lambda x, _: f(x), np.xrange(n), p)
 
   return rfun
 
@@ -38,7 +38,7 @@ def jvp_taylor(f, primals, series):
 def jvp_test_jet(f, primals, series, atol=1e-5):
   y, terms = jet(f, primals, series)
   y_jvp, terms_jvp = jvp_taylor(f, primals, series)
-  import ipdb; ipdb.set_trace()
+  # import ipdb; ipdb.set_trace()
   assert np.allclose(y, y_jvp)
   assert np.allclose(terms, terms_jvp, atol=atol)
 
@@ -61,7 +61,6 @@ def test_exp():
   # terms_in = [2., 3., 4.]
   # x = np.array([1.,5.])
   # terms_in =[np.array([2.,6.]),np.array([3.,7.]),np.array([4.,8])]
-  import ipdb; ipdb.set_trace()
   jvp_test_jet(np.exp, (x, ), (terms_in, ), atol=1e-4)
 
 def test_mlp():
@@ -114,9 +113,9 @@ def test_sqrt():
   N = 5
   x = npr.randn()**2
   terms_in = list(npr.randn(N))
-  print terms_in
-  print jet(np.sqrt, (x, ), (terms_in, ))
-  print jvp_taylor(np.sqrt, (x, ), (terms_in, ))
+  # print terms_in
+  # print jet(np.sqrt, (x, ), (terms_in, ))
+  # print jvp_taylor(np.sqrt, (x, ), (terms_in, ))
   jvp_test_jet(np.sqrt, (x, ), (terms_in, ), atol=1e-1)
 
 # def test_exp():
@@ -223,7 +222,7 @@ def test_expansion():
   x = npr.randn()
   terms_in = [1., 0., 0., 0.]
   f = np.sin
-  print jet(f, (x, ), (terms_in, ))
+  # print jet(f, (x, ), (terms_in, ))
   return expand(f, (x, ), (terms_in, ))
   # return jet(f,(x,),(terms_in,))
 
@@ -287,8 +286,8 @@ def test_sol_recursive():
   (y0, [y1, y2, y3, y4h]) = jet(g, (z_eval_true, ), ((y0, y1, y2, y3h), ))
   (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z_eval_true, ),
                                     ((y0, y1, y2, y3, y4h), ))
-  print (y0, [y1, y2, y3, y4, y5h])
-  print true_ds
+  # print (y0, [y1, y2, y3, y4, y5h])
+  # print true_ds
 
 
 def test_sol_newtondouble_explicit():
@@ -348,8 +347,8 @@ def test_sol_newtondouble_explicit():
   x5 = 1./5 * (y4h/fact(4) + A1(x3) + A0(x4))
   x6 = 1./6 * (y5h/fact(5) + A2(x3) + A1(x4) + A0(x5))
 
-  print x1,x2,x3,x4,x5,x6
-  print true_ds[1]
+  # print x1,x2,x3,x4,x5,x6
+  # print true_ds[1]
 
 def test_sol_newtondouble_onevjp():
   from scipy.integrate import odeint
