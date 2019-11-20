@@ -16,8 +16,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from functools import partial
 from unittest import SkipTest
+import re
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -28,7 +28,6 @@ import scipy.stats
 
 from jax import api
 from jax import lax
-from jax import numpy as np
 from jax import random
 from jax import test_util as jtu
 from jax.interpreters import xla
@@ -51,7 +50,8 @@ class LaxRandomTest(jtu.JaxTestCase):
 
   def _CheckKolmogorovSmirnovCDF(self, samples, cdf):
     fail_prob = 0.01  # conservative bound on statistical fail prob by Kolmo CDF
-    self.assertGreater(scipy.stats.kstest(samples, cdf).pvalue, fail_prob)
+    statistic = scipy.stats.kstest(samples, cdf).statistic
+    self.assertLess(1. - scipy.special.kolmogorov(statistic), fail_prob)
 
   def _CheckChiSquared(self, samples, pmf):
     alpha = 0.01  # significance level, threshold for p-value
@@ -64,7 +64,7 @@ class LaxRandomTest(jtu.JaxTestCase):
       {"testcase_name": "_{}".format(dtype), "dtype": onp.dtype(dtype).name}
       for dtype in [onp.float32, onp.float64]))
   def testNumpyAndXLAAgreeOnFloatEndianness(self, dtype):
-    if not FLAGS.jax_enable_x64 and np.issubdtype(dtype, onp.float64):
+    if not FLAGS.jax_enable_x64 and onp.issubdtype(dtype, onp.float64):
       raise SkipTest("can't test float64 agreement")
 
     bits_dtype = onp.uint32 if onp.finfo(dtype).bits == 32 else onp.uint64
@@ -127,6 +127,7 @@ class LaxRandomTest(jtu.JaxTestCase):
     for samples in [uncompiled_samples, compiled_samples]:
       self.assertTrue(onp.all(lo <= samples))
       self.assertTrue(onp.all(samples < hi))
+      self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.randint(lo, hi).cdf)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}".format(dtype), "dtype": onp.dtype(dtype).name}
@@ -187,9 +188,7 @@ class LaxRandomTest(jtu.JaxTestCase):
       for a in [0.2, 5.]
       for b in [0.2, 5.]
       for dtype in [onp.float32, onp.float64]))
-  # TODO(phawkins): slow compilation times on cpu and tpu.
-  # TODO(mattjj): test fails after https://github.com/google/jax/pull/1123
-  @jtu.skip_on_devices("cpu", "gpu", "tpu")
+  @jtu.skip_on_devices("cpu", "tpu")  # TODO(phawkins): slow compilation times
   def testBeta(self, a, b, dtype):
     key = random.PRNGKey(0)
     rand = lambda key, a, b: random.beta(key, a, b, (10000,), dtype)
@@ -218,9 +217,7 @@ class LaxRandomTest(jtu.JaxTestCase):
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_alpha={}_{}".format(alpha, dtype),
        "alpha": alpha, "dtype": onp.dtype(dtype).name}
-      for alpha in [
-          onp.array([0.2, 1., 5.]),
-      ]
+      for alpha in [[0.2, 1., 5.]]
       for dtype in [onp.float32, onp.float64]))
   def testDirichlet(self, alpha, dtype):
     key = random.PRNGKey(0)
@@ -255,6 +252,7 @@ class LaxRandomTest(jtu.JaxTestCase):
        "a": a, "dtype": onp.dtype(dtype).name}
       for a in [0.1, 1., 10.]
       for dtype in [onp.float32, onp.float64]))
+  @jtu.skip_on_devices("tpu")  # TODO(b/130544008): re-enable when XLA fixed
   def testGamma(self, a, dtype):
     key = random.PRNGKey(0)
     rand = lambda key, a: random.gamma(key, a, (10000,), dtype)
@@ -266,27 +264,11 @@ class LaxRandomTest(jtu.JaxTestCase):
     for samples in [uncompiled_samples, compiled_samples]:
       self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.gamma(a).cdf)
 
+  @jtu.skip_on_devices("tpu")  # TODO(b/130544008): re-enable when XLA fixed
   def testGammaShape(self):
     key = random.PRNGKey(0)
     x = random.gamma(key, onp.array([0.2, 0.3]), shape=(3, 2))
     assert x.shape == (3, 2)
-
-  @parameterized.named_parameters(jtu.cases_from_list(
-      {"testcase_name": "_a={}".format(alpha), "alpha": alpha}
-      for alpha in [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]))
-  def testGammaGrad(self, alpha):
-    rng = random.PRNGKey(0)
-    alphas = onp.full((100,), alpha)
-    z = random.gamma(rng, alphas)
-    actual_grad = api.grad(lambda x: random.gamma(rng, x).sum())(alphas)
-
-    eps = 0.01 * alpha / (1.0 + onp.sqrt(alpha))
-    cdf_dot = (scipy.stats.gamma.cdf(z, alpha + eps)
-               - scipy.stats.gamma.cdf(z, alpha - eps)) / (2 * eps)
-    pdf = scipy.stats.gamma.pdf(z, alpha)
-    expected_grad = -cdf_dot / pdf
-
-    self.assertAllClose(actual_grad, expected_grad, check_dtypes=True, rtol=0.0005)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_{}".format(dtype), "dtype": onp.dtype(dtype).name}
@@ -315,20 +297,6 @@ class LaxRandomTest(jtu.JaxTestCase):
 
     for samples in [uncompiled_samples, compiled_samples]:
       self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.laplace().cdf)
-
-  @parameterized.named_parameters(jtu.cases_from_list(
-      {"testcase_name": "_{}".format(dtype), "dtype": onp.dtype(dtype).name}
-      for dtype in [onp.float32, onp.float64]))
-  def testLogistic(self, dtype):
-    key = random.PRNGKey(0)
-    rand = lambda key: random.logistic(key, (10000,), dtype)
-    crand = api.jit(rand)
-
-    uncompiled_samples = rand(key)
-    compiled_samples = crand(key)
-
-    for samples in [uncompiled_samples, compiled_samples]:
-      self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.logistic().cdf)
 
   @parameterized.named_parameters(jtu.cases_from_list(
       {"testcase_name": "_b={}_{}".format(b, dtype),
@@ -368,35 +336,6 @@ class LaxRandomTest(jtu.JaxTestCase):
     for samples in [uncompiled_samples, compiled_samples]:
       self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.t(df).cdf)
 
-  @parameterized.named_parameters(jtu.cases_from_list(
-      {"testcase_name": "_{}D_{}".format(dim, onp.dtype(dtype).name),
-       "dim": dim, "dtype": dtype}
-      for dim in [1, 3, 5]
-      for dtype in [onp.float32, onp.float64]))
-  def testMultivariateNormal(self, dim, dtype):
-    r = onp.random.RandomState(dim)
-    mean = r.randn(dim)
-    cov_factor = r.randn(dim, dim)
-    cov = onp.dot(cov_factor, cov_factor.T) + dim * onp.eye(dim)
-
-    key = random.PRNGKey(0)
-    rand = partial(random.multivariate_normal, mean=mean, cov=cov,
-                   shape=(10000,))
-    crand = api.jit(rand)
-
-    uncompiled_samples = onp.asarray(rand(key), onp.float64)
-    compiled_samples = onp.asarray(crand(key), onp.float64)
-
-    inv_scale = scipy.linalg.lapack.dtrtri(onp.linalg.cholesky(cov), lower=True)[0]
-    for samples in [uncompiled_samples, compiled_samples]:
-      centered = samples - mean
-      whitened = onp.einsum('nj,ij->ni', centered, inv_scale)
-
-      # This is a quick-and-dirty multivariate normality check that tests that a
-      # uniform mixture of the marginals along the covariance matrix's
-      # eigenvectors follow a standard normal distribution.
-      self._CheckKolmogorovSmirnovCDF(whitened.ravel(), scipy.stats.norm().cdf)
-
   def testIssue222(self):
     x = random.randint(random.PRNGKey(10003), (), 0, 0)
     assert x == 0
@@ -417,7 +356,7 @@ class LaxRandomTest(jtu.JaxTestCase):
       phi = lambda x, t: np.sqrt(2.0 / d) * np.cos(np.matmul(W, x) + w*t + b)
       return phi
 
-    self.assertRaisesRegex(ValueError, '.*requires a concrete.*',
+    self.assertRaisesRegex(ValueError, re.compile(r'.*requires a concrete.*'),
                            lambda: feature_map(5, 3))
 
   def testIssue756(self):
@@ -429,12 +368,10 @@ class LaxRandomTest(jtu.JaxTestCase):
       self.assertEqual(onp.result_type(w), onp.float32)
 
   def testNoOpByOpUnderHash(self):
-    def fail(*args, **kwargs): assert False
+    def fail(): assert False
     apply_primitive, xla.apply_primitive = xla.apply_primitive, fail
-    try:
-      out = random.threefry_2x32(onp.zeros(2, onp.uint32), onp.arange(10, dtype=onp.uint32))
-    finally:
-      xla.apply_primitive = apply_primitive
+    out = random.threefry_2x32(onp.zeros(2, onp.uint32), onp.arange(10, dtype=onp.uint32))
+    xla.apply_primitive = apply_primitive
 
 
 if __name__ == "__main__":

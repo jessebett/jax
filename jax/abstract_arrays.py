@@ -164,11 +164,6 @@ class ConcreteArray(ShapedArray):
     return str(self.val)
 
 
-class AbstractToken(core.AbstractValue): pass
-
-abstract_token = AbstractToken()
-
-
 def make_shaped_array(x):
   dtype = xla_bridge.canonicalize_dtype(onp.result_type(x))
   return ShapedArray(onp.shape(x), dtype)
@@ -177,14 +172,14 @@ def zeros_like_array(x):
   dtype = xla_bridge.canonicalize_dtype(onp.result_type(x))
   return onp.broadcast_to(onp.array(0, dtype), onp.shape(x))
 
-array_types = {onp.ndarray, onp.float64, onp.float32, onp.float16,
+array_types = [onp.ndarray, onp.float64, onp.float32, onp.float16,
                onp.complex64, onp.complex128,
                onp.int64, onp.int32, onp.int16, onp.int8,
                onp.bool_, onp.uint64, onp.uint32, onp.uint16, onp.uint8,
-               onp.longlong, complex, float, int, bool}
+               onp.longlong, complex, float, int, bool]
 
 if six.PY2:
-  array_types.add(long)  # noqa: F821
+  array_types.append(long)
 
 for t in array_types:
   core.pytype_aval_mappings[t] = ConcreteArray
@@ -198,12 +193,10 @@ def zeros_like_shaped_array(aval):
 ad_util.aval_zeros_likers[ShapedArray] = zeros_like_shaped_array
 
 def raise_to_shaped(aval):
-  if isinstance(aval, ShapedArray):
+  if type(aval) is core.AbstractTuple:
+    return core.AbstractTuple(map(raise_to_shaped, aval))
+  elif isinstance(aval, ShapedArray):
     return ShapedArray(aval.shape, aval.dtype)
-  elif aval is core.abstract_unit:
-    return core.abstract_unit
-  elif aval is abstract_token:
-    return abstract_token
   else:
     raise TypeError(type(aval))
 

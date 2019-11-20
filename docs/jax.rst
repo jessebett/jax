@@ -1,5 +1,3 @@
-.. currentmodule:: jax
-
 jax package
 ===========
 
@@ -13,46 +11,14 @@ Subpackages
     jax.scipy
     jax.experimental
     jax.lax
-    jax.nn
     jax.ops
     jax.random
     jax.tree_util
 
-Just-in-time compilation (:code:`jit`)
---------------------------------------
+Module contents
+---------------
 
-.. autofunction:: jit
-.. autofunction:: disable_jit
-.. autofunction:: xla_computation
-.. autofunction:: make_jaxpr
-.. autofunction:: eval_shape
-
-Automatic differentiation
--------------------------
-
-.. autofunction:: grad
-.. autofunction:: value_and_grad
-.. autofunction:: jacfwd
-.. autofunction:: jacrev
-.. autofunction:: hessian
-.. autofunction:: jvp
-.. autofunction:: linearize
-.. autofunction:: vjp
-.. autofunction:: custom_transforms
-.. autofunction:: defjvp
-.. autofunction:: defjvp_all
-.. autofunction:: defvjp
-.. autofunction:: defvjp_all
-.. autofunction:: custom_gradient
-
-
-Vectorization (:code:`vmap`)
-----------------------------
-
-.. autofunction:: vmap
-
-
-Parallelization (:code:`pmap`)
-------------------------------
-
-.. autofunction:: pmap
+.. automodule:: jax
+    :members: jit, disable_jit, grad, value_and_grad, vmap, pmap, jacfwd, jacrev, hessian, jvp, linearize, vjp, make_jaxpr, eval_shape, custom_transforms, defjvp, defjvp_all, defvjp, defvjp_all, custom_gradient
+    :undoc-members:
+    :show-inheritance:

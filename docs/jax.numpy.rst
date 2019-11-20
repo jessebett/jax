@@ -6,29 +6,6 @@ jax.numpy package
 
 .. automodule:: jax.numpy
 
-Implements the NumPy API, using the primitives in :mod:`jax.lax`.
-
-While JAX tries to follow the NumPy API as closely as possible, sometimes JAX
-cannot follow NumPy exactly.
-
-* Notably, since JAX arrays are immutable, NumPy APIs that mutate arrays
-  in-place cannot be implemented in JAX. However, often JAX is able to provide a
-  alternative API that is purely functional. For example, instead of in-place
-  array updates (:code:`x[i] = y`), JAX provides an alternative pure indexed
-  update function :func:`jax.ops.index_update`.
-
-* NumPy is very aggressive at promoting values to :code:`float64` type. JAX
-  sometimes is less aggressive about type promotion.
-
-A small number of NumPy operations that have data-dependent output shapes are
-incompatible with :func:`jax.jit` compilation. The XLA compiler requires that
-shapes of arrays be known at compile time. While it would be possible to provide
-a JAX implementation of an API such as :func:`numpy.nonzero`, we would be unable
-to JIT-compile it because the shape of its output depends on the contents of the
-input data.
-
-Not every function in NumPy is implemented; contributions are welcome!
-
 .. autosummary::
   :toctree: _autosummary
 
@@ -70,18 +47,15 @@ Not every function in NumPy is implemented; contributions are welcome!
     blackman
     broadcast_arrays
     broadcast_to
-    can_cast
     ceil
     clip
     column_stack
     concatenate
     conj
     conjugate
-    corrcoef
     cos
     cosh
     count_nonzero
-    cov
     cross
     cumsum
     cumprod
@@ -106,6 +80,7 @@ Not every function in NumPy is implemented; contributions are welcome!
     expm1
     eye
     fabs
+    fftn
     fix
     flip
     fliplr
@@ -137,7 +112,6 @@ Not every function in NumPy is implemented; contributions are welcome!
     isneginf
     isposinf
     isreal
-    isscalar
     issubdtype
     issubsctype
     ix_
@@ -163,7 +137,6 @@ Not every function in NumPy is implemented; contributions are welcome!
     max
     maximum
     mean
-    median
     meshgrid
     min
     minimum
@@ -183,15 +156,12 @@ Not every function in NumPy is implemented; contributions are welcome!
     ones_like
     outer
     pad
-    percentile
     polyval
     power
     positive
     prod
     product
-    promote_types
     ptp
-    quantile
     rad2deg
     radians
     ravel
@@ -200,7 +170,6 @@ Not every function in NumPy is implemented; contributions are welcome!
     remainder
     repeat
     reshape
-    result_type
     right_shift
     roll
     rot90
@@ -232,9 +201,7 @@ Not every function in NumPy is implemented; contributions are welcome!
     transpose
     tri
     tril
-    tril_indices
     triu
-    triu_indices
     true_divide
     vander
     var
@@ -244,17 +211,6 @@ Not every function in NumPy is implemented; contributions are welcome!
     where
     zeros
     zeros_like
-
-jax.numpy.fft
--------------
-
-.. automodule:: jax.numpy.fft
-
-.. autosummary::
-  :toctree: _autosummary
-
-  fftn
-  ifftn
 
 jax.numpy.linalg
 ----------------

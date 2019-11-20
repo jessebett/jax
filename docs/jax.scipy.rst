@@ -15,9 +15,8 @@ jax.scipy.linalg
    det
    eigh
    inv
-   lu
    lu_factor
-   lu_solve
+   lu
    qr
    solve
    solve_triangular
@@ -35,18 +34,14 @@ jax.scipy.special
   :toctree: _autosummary
 
    digamma
-   entr
    erf
    erfc
    erfinv
    expit
    gammaln
-   i0e
-   i1e
    log_ndtr
    logit
    logsumexp
-   multigammaln
    ndtr
    ndtri
    xlog1py
@@ -90,7 +85,6 @@ jax.scipy.stats.laplace
 .. autosummary::
   :toctree: _autosummary
 
-   cdf
    logpdf
    pdf
 

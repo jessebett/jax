@@ -201,39 +201,11 @@ def sgd(step_size):
 
 @optimizer
 def momentum(step_size, mass):
-  """Construct optimizer triple for SGD with momentum.
-
-  Args:
-    step_size: positive scalar, or a callable representing a step size schedule
-      that maps the iteration index to positive scalar.
-    mass: positive scalar representing the momentum coefficient.
-
-  Returns:
-    An (init_fun, update_fun, get_params) triple.
-  """
-  step_size = make_schedule(step_size)
-  def init(x0):
-    v0 = np.zeros_like(x0)
-    return x0, v0
-  def update(i, g, state):
-    x, velocity = state
-    velocity = mass * velocity + g
-    x = x - step_size(i) * velocity
-    return x, velocity
-  def get_params(state):
-    x, _ = state
-    return x
-  return init, update, get_params
-
-
-@optimizer
-def nesterov(step_size, mass):
   """Construct optimizer triple for SGD with Nesterov momentum.
 
   Args:
     step_size: positive scalar, or a callable representing a step size schedule
       that maps the iteration index to positive scalar.
-    mass: positive scalar representing the momentum coefficient.
 
   Returns:
     An (init_fun, update_fun, get_params) triple.
@@ -244,8 +216,8 @@ def nesterov(step_size, mass):
     return x0, v0
   def update(i, g, state):
     x, velocity = state
-    velocity = mass * velocity + g
-    x = x - step_size(i) * (mass * velocity + g)
+    velocity = mass * velocity - (1. - mass) * g
+    x = x + step_size(i) * velocity
     return x, velocity
   def get_params(state):
     x, _ = state
@@ -297,60 +269,23 @@ def rmsprop(step_size, gamma=0.9, eps=1e-8):
   Args:
     step_size: positive scalar, or a callable representing a step size schedule
       that maps the iteration index to positive scalar.
-      gamma: Decay parameter.
-      eps: Epsilon parameter.
 
   Returns:
     An (init_fun, update_fun, get_params) triple.
   """
   step_size = make_schedule(step_size)
   def init(x0):
-    avg_sq_grad = np.zeros_like(x0)
+    avg_sq_grad = np.ones_like(x0)
     return x0, avg_sq_grad
   def update(i, g, state):
     x, avg_sq_grad = state
     avg_sq_grad = avg_sq_grad * gamma + g**2 * (1. - gamma)
-    x = x - step_size(i) * g / np.sqrt(avg_sq_grad + eps)
+    x = x - step_size(i) * g / (np.sqrt(avg_sq_grad) + eps)
     return x, avg_sq_grad
   def get_params(state):
     x, _ = state
     return x
   return init, update, get_params
-
-
-@optimizer
-def rmsprop_momentum(step_size, gamma=0.9, eps=1e-8, momentum=0.9):
-  """Construct optimizer triple for RMSProp with momentum.
-
-  This optimizer is separate from the rmsprop optimizer because it needs to
-  keep track of additional parameters.
-
-  Args:
-    step_size: positive scalar, or a callable representing a step size schedule
-      that maps the iteration index to positive scalar.
-    gamma: Decay parameter.
-    eps: Epsilon parameter.
-    momentum: Momentum parameter.
-
-  Returns:
-    An (init_fun, update_fun, get_params) triple.
-  """
-  step_size = make_schedule(step_size)
-  def init(x0):
-    avg_sq_grad = np.zeros_like(x0)
-    mom = np.zeros_like(x0)
-    return x0, avg_sq_grad, mom
-  def update(i, g, state):
-    x, avg_sq_grad, mom = state
-    avg_sq_grad = avg_sq_grad * gamma + g**2 * (1. - gamma)
-    mom = momentum * mom + step_size(i) * g / np.sqrt(avg_sq_grad + eps)
-    x = x - mom
-    return x, avg_sq_grad, mom
-  def get_params(state):
-    x, _, _ = state
-    return x
-  return init, update, get_params
-
 
 @optimizer
 def adam(step_size, b1=0.9, b2=0.999, eps=1e-8):
@@ -455,14 +390,6 @@ def inverse_time_decay(step_size, decay_steps, decay_rate, staircase=False):
       return step_size / (1 + decay_rate * i / decay_steps)
   return schedule
 
-def polynomial_decay(step_size, decay_steps, final_step_size, power=1.0):
-  def schedule(step_num):
-    step_num = np.minimum(step_num, decay_steps)
-    step_mult = (1 - step_num / decay_steps) ** power
-    return step_mult * (step_size - final_step_size) + final_step_size
-
-  return schedule
-
 def piecewise_constant(boundaries, values):
   boundaries = np.array(boundaries)
   values = np.array(values)
@@ -542,6 +469,5 @@ def pack_optimizer_state(marked_pytree):
   sentinels, tree_def = tree_flatten(marked_pytree)
   assert all(isinstance(s, JoinPoint) for s in sentinels)
   subtrees = [s.subtree for s in sentinels]
-  states_flat, subtree_defs = unzip2(map(tree_flatten, subtrees))
-  packed_state = pack(map(pack, states_flat))
+  packed_state, subtree_defs = unzip2(map(tree_flatten, subtrees))
   return OptimizerState(packed_state, tree_def, subtree_defs)

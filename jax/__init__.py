@@ -17,7 +17,4 @@ os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '1')
 
 from jax.version import __version__
 from jax.api import *
-from jax import nn
-from jax import random
 import jax.numpy as np  # side-effecting import sets up operator overloads
-from jax.lax import jetlax

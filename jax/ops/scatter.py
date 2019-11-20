@@ -18,15 +18,26 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import collections
-from functools import partial
-
 import numpy as onp
 
+from ..abstract_arrays import ShapedArray, ConcreteArray
+from .. import core
 from .. import lax
-from ..api import jit
 from ..numpy import lax_numpy as np
 
+
+# TODO(mattjj): clean up this logic
+def _is_advanced_int_indexer(idx):
+  _int = lambda aval: not aval.shape and onp.issubdtype(aval.dtype, onp.integer)
+  try:
+    abstract_idx = core.get_aval(idx)
+  except TypeError:
+    abstract_idx = None
+  out = not (isinstance(abstract_idx, ConcreteArray) and _int(abstract_idx) or
+             isinstance(abstract_idx, ShapedArray) and _int(abstract_idx) or
+             isinstance(idx, slice) or
+             isinstance(idx, tuple) and all(onp.ndim(elt) == 0 for elt in idx))
+  return out and np._is_advanced_int_indexer(idx)
 
 def _scatter_update(x, idx, y, scatter_op):
   """Helper for indexed updates.
@@ -47,40 +58,153 @@ def _scatter_update(x, idx, y, scatter_op):
   Returns:
     An ndarray representing an updated `x` after performing the scatter-update.
   """
+  # For more clues on the logic of this implementation, see the code for
+  # jax.numpy._rewriting_take (which has links to NumPy docs).
 
   x = np.asarray(x)
   y = np.asarray(y)
-
-  # XLA gathers and scatters are very similar in structure; the scatter logic
-  # is more or less a transpose of the gather equivalent.
-  treedef, static_idx, dynamic_idx = np._split_index_for_jit(idx)
-  return _scatter_impl(x, y, scatter_op, treedef, static_idx, dynamic_idx)
-
-
-# TODO(phawkins): re-enable jit after fixing excessive recompilation for
-# slice indexes (e.g., slice(0, 5, None), slice(10, 15, None), etc.).
-# @partial(jit, static_argnums=(2, 3, 4))
-def _scatter_impl(x, y, scatter_op, treedef, static_idx, dynamic_idx):
+  x_shape = np.shape(x)
+  y_shape = np.shape(y)
   y = lax.convert_element_type(y, lax.dtype(x))
 
-  idx = np._merge_static_and_dynamic_indices(treedef, static_idx, dynamic_idx)
-  indexer = np._index_to_gather(np.shape(x), idx)
+  # Check if there's advanced indexing going on, and handle differently based on
+  # whether it is or isn't mixed with basic indexing.
+  if _is_advanced_int_indexer(idx):
+    if np._is_advanced_int_indexer_without_slices(idx):
+      if isinstance(idx, (tuple, list)):
+        if any(onp.shape(e) for e in idx):
+          # At least one sequence element in the index list means broadcasting.
+          idx = np.broadcast_arrays(*idx)
+        else:
+          # The index list is a flat list of integers.
+          idx = [lax.concatenate([lax.reshape(e, (1,)) for e in idx], 0)]
+      else:
+        # The indexer is just a single integer array.
+        idx = [idx]
 
-  # Broadcast `y` to the slice output shape.
-  y = np.broadcast_to(y, tuple(indexer.slice_shape))
-  # Collapse any `None`/`np.newaxis` dimensions.
-  y = np.squeeze(y, axis=indexer.newaxis_dims)
-  if indexer.reversed_y_dims:
-    y = lax.rev(y, indexer.reversed_y_dims)
+      stacked_idx = np.concatenate(
+          [np.mod(np.reshape(a, (-1, 1)), np._constant_like(a, x.shape[i]))
+          for i, a in enumerate(idx)], axis=1)
 
-  # Transpose the gather dimensions into scatter dimensions (cf.
-  # lax._gather_transpose_rule)
+      y = np.broadcast_to(y, idx[0].shape + onp.shape(x)[len(idx):])
+      y = lax.reshape(y, (stacked_idx.shape[0],) + onp.shape(x)[len(idx):])
+
+      dnums = lax.ScatterDimensionNumbers(
+          update_window_dims=tuple(range(1, y.ndim)),
+          inserted_window_dims=tuple(range(len(idx))),
+          scatter_dims_to_operand_dims=tuple(range(len(idx))))
+      return scatter_op(x, stacked_idx, y, dnums)
+    elif np._is_advanced_int_indexer(idx):
+      # TODO(mattjj, phawkins): one of us is going to implement this case someday
+      msg = "Unimplemented case for indexed update. Open a feature request!"
+      raise NotImplementedError(msg)
+    else:
+      assert False  # unreachable
+
+  # At this point there's no advanced indexing going on, so we process each
+  # element of the index one at a time to build up a scatter.
+  if not isinstance(idx, tuple):
+    idx = (idx,)
+
+  # Remove ellipses and add trailing slice(None)s.
+  idx = np._canonicalize_tuple_index(x, idx)
+
+  _int = lambda aval: not aval.shape and onp.issubdtype(aval.dtype, onp.integer)
+
+  x_axis = 0
+  y_axis = 0  # Current axis in y, before collapsing. See below.
+  collapsed_y_axis = 0  # Current axis in y, after collapsing.
+
+  # Scatter dimension numbers.
+  update_window_dims = []
+  inserted_window_dims = []
+  scatter_dims_to_operand_dims = []
+
+  scatter_indices = np.zeros((0,), dtype=np.int32)
+
+  # We perform three transformations to y before the scatter op, in order:
+  # First, y is broadcast to slice_shape. In general `y` only need broadcast to
+  # the right shape.
+  slice_shape = []
+  # Next, y is reshaped to collapsed_slice_shape. This is to handle `None`
+  # indices, which the scatter cannot remove itself.
+  collapsed_slice_shape = []
+  # Finally, we reverse reversed_y_dims to handle slices with negative strides.
+  reversed_y_dims = []
+
+  for i in idx:
+    try:
+      abstract_i = core.get_aval(i)
+    except TypeError:
+      abstract_i = None
+    if (isinstance(abstract_i, ConcreteArray) or
+        isinstance(abstract_i, ShapedArray)) and _int(abstract_i):
+      i = np.mod(i, np._constant_like(i, x.shape[x_axis]))
+      i = lax.convert_element_type(i, np.int32)
+      i = np.broadcast_to(i, tuple(scatter_indices.shape[:-1]) + (1,))
+      scatter_indices = np.concatenate((scatter_indices, i), -1)
+      inserted_window_dims.append(x_axis)
+      scatter_dims_to_operand_dims.append(x_axis)
+      x_axis += 1
+    elif i is None:
+      slice_shape.append(1)
+      y_axis += 1
+    elif np._is_slice_none(i):
+      slice_shape.append(x_shape[x_axis])
+      collapsed_slice_shape.append(x_shape[x_axis])
+      update_window_dims.append(collapsed_y_axis)
+      collapsed_y_axis += 1
+      y_axis += 1
+      x_axis += 1
+    elif isinstance(i, slice):
+      start, limit, stride, needs_rev = np._static_idx(i, x.shape[x_axis])
+      if needs_rev:
+        reversed_y_dims.append(collapsed_y_axis)
+      if stride == 1:
+        i = lax.convert_element_type(start, np.int32)
+        i = np.broadcast_to(i, tuple(scatter_indices.shape[:-1]) + (1,))
+        scatter_indices = np.concatenate((scatter_indices, i), -1)
+        slice_shape.append(limit - start)
+        collapsed_slice_shape.append(limit - start)
+        update_window_dims.append(collapsed_y_axis)
+        scatter_dims_to_operand_dims.append(x_axis)
+      else:
+        i = np.arange(start, limit, stride, dtype=np.int32)
+        size = i.shape[0]
+        slice_shape.append(size)
+        collapsed_slice_shape.append(size)
+        scatter_indices_shape = tuple(scatter_indices.shape[:-1]) + (size,)
+        i = lax.broadcast_in_dim(
+            i, shape=scatter_indices_shape + (1,),
+            broadcast_dimensions=(len(scatter_indices_shape) - 1,))
+        scatter_indices = lax.broadcast_in_dim(
+            scatter_indices,
+            shape=scatter_indices_shape + (len(scatter_dims_to_operand_dims),),
+            broadcast_dimensions=(
+              tuple(range(len(scatter_indices_shape) - 1)) +
+              (len(scatter_indices_shape),)))
+        scatter_indices = np.concatenate(
+          (scatter_indices, i), len(scatter_indices_shape))
+        scatter_dims_to_operand_dims.append(x_axis)
+        inserted_window_dims.append(x_axis)
+
+      collapsed_y_axis += 1
+      y_axis += 1
+      x_axis += 1
+    else:
+      raise IndexError("Unknown index type ", i)
+
+  y = np.broadcast_to(y, tuple(slice_shape))
+  y = lax.reshape(y, collapsed_slice_shape)
+  if reversed_y_dims:
+    y = lax.rev(y, reversed_y_dims)
+
   dnums = lax.ScatterDimensionNumbers(
-    update_window_dims=indexer.dnums.offset_dims,
-    inserted_window_dims=indexer.dnums.collapsed_slice_dims,
-    scatter_dims_to_operand_dims=indexer.dnums.start_index_map
+    update_window_dims = tuple(update_window_dims),
+    inserted_window_dims = tuple(inserted_window_dims),
+    scatter_dims_to_operand_dims = tuple(scatter_dims_to_operand_dims)
   )
-  return scatter_op(x, indexer.gather_indices, y, dnums)
+  return scatter_op(x, scatter_indices, y, dnums)
 
 
 class _Indexable(object):

@@ -23,8 +23,6 @@ another perspective, this script lets you make JAX into an ahead-of-time JAX ->
 XLA compiler, although when you run the XLA program, it will still be compiled
 just-in-time.
 
-See tensorflow/compiler/xla/service/hlo_runner.h.
-
 Usage:
 
   $ cat prog.py
@@ -75,7 +73,7 @@ from absl import app
 from absl import flags
 import jax.api
 import jax.numpy as np
-from jax.lib import xla_client
+from jaxlib import xla_client
 
 FLAGS = flags.FLAGS
 

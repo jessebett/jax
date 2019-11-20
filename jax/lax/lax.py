@@ -17,8 +17,6 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import enum
-import functools
 import itertools
 import operator
 import string
@@ -38,20 +36,18 @@ from .. import linear_util as lu
 from ..config import flags
 from ..core import Primitive
 from ..abstract_arrays import (UnshapedArray, ShapedArray, ConcreteArray,
-                               AbstractToken, array_types, make_shaped_array,
-                               raise_to_shaped, abstract_token)
+                               array_types, make_shaped_array, raise_to_shaped)
+from ..api_util import (pytree_fun_to_jaxtupletree_fun, pytree_to_jaxtupletree,
+                        pytree_fun_to_flatjaxtuple_fun, pytree_to_flatjaxtuple)
 from ..interpreters import partial_eval as pe
 from ..interpreters import xla
-from ..interpreters import pxla
 from ..interpreters import ad
 from ..interpreters import batching
-from ..interpreters import masking
-from ..interpreters.masking import ShapeExpr, ShapeError
-from ..util import curry, cache, safe_zip, unzip2, prod
+from ..interpreters import parallel
+from ..util import curry, memoize, safe_zip, unzip2, prod
 from ..tree_util import build_tree, tree_unflatten, tree_map
-from ..lib import pytree
 from ..lib import xla_bridge
-from ..lib import xla_client
+from ..lib.xla_bridge import xla_client
 
 FLAGS = flags.FLAGS
 
@@ -60,7 +56,7 @@ _min = builtins.max
 _reduce = six.moves.reduce
 
 
-@cache()
+@memoize
 def broadcast_shapes(*shapes):
   """Returns the shape that results from NumPy broadcasting of `shapes`."""
   if len(shapes) == 1:
@@ -75,26 +71,6 @@ def broadcast_shapes(*shapes):
                      .format(tuple(map(tuple, shapes))))
   return tuple(result_shape)
 
-def _canonicalize_shape(shape):
-  """Canonicalizes and checks for errors in a user-provided shape value.
-
-  Args:
-    shape: a Python value that represents a shape.
-
-  Returns:
-    A tuple of integers.
-  """
-  # TODO(mattjj): this next check is a temporary workaround for masking
-  if (type(shape) is ShapeExpr
-      or type(shape) is tuple and any(type(d) is masking.Poly for d in shape)):
-    return shape
-  try:
-    return tuple(map(operator.index, shape))
-  except TypeError:
-    pass
-  msg = ("Shapes must be 1D sequences of concrete values of integer type, "
-         "got {}")
-  raise TypeError(msg.format(shape))
 
 def _identity(x): return x
 
@@ -181,18 +157,6 @@ def digamma(x):
   r"""Elementwise digamma: :math:`\psi(x)`."""
   return digamma_p.bind(x)
 
-def bessel_i0e(x):
-  r"""Exponentially scaled modified Bessel function of order 0:
-  :math:`\mathrm{i0e}(x) = e^{-\mathrm{abs}(x)} \mathrm{i0}(x)`
-  """
-  return bessel_i0e_p.bind(x)
-
-def bessel_i1e(x):
-  r"""Exponentially scaled modified Bessel function of order 1:
-  :math:`\mathrm{i1e}(x) = e^{-\mathrm{abs}(x)} \mathrm{i1}(x)`
-  """
-  return bessel_i1e_p.bind(x)
-
 def erf(x):
   r"""Elementwise error function: :math:`\mathrm{erf}(x)`."""
   return erf_p.bind(x)
@@ -238,14 +202,6 @@ def abs(x):
 def pow(x, y):
   r"""Elementwise power: :math:`x^y`."""
   return pow_p.bind(x, y)
-
-def sqrt(x):
-  r"""Elementwise square root: :math:`\sqrt{x}`."""
-  return sqrt_p.bind(x)
-
-def rsqrt(x):
-  r"""Elementwise reciprocal square root:  :math:`1 \over \sqrt{x}."""
-  return rsqrt_p.bind(x)
 
 def bitwise_not(x):
   r"""Elementwise NOT: :math:`\neg x`."""
@@ -349,12 +305,12 @@ def convert_element_type(operand, new_dtype):
     An array with the same shape as `operand`, cast elementwise to `new_dtype`.
   """
   new_dtype = xla_bridge.canonicalize_dtype(new_dtype)
-  old_dtype = xla_bridge.canonicalize_dtype(_dtype(operand))
+  old_dtype = _dtype(operand)
   if old_dtype != new_dtype:
     if (onp.issubdtype(old_dtype, onp.complexfloating) and
         not onp.issubdtype(new_dtype, onp.complexfloating)):
       msg = "Casting complex values to real discards the imaginary part"
-      warnings.warn(msg, onp.ComplexWarning, stacklevel=2)
+      warnings.warn(msg, onp.ComplexWarning)
       operand = real(operand)
       old_dtype = _dtype(operand)
     return convert_element_type_p.bind(
@@ -414,12 +370,9 @@ def concatenate(operands, dimension):
   return concatenate_p.bind(*operands, dimension=dimension,
                             operand_shapes=tuple(o.shape for o in operands))
 
-Precision = xla_client.PrecisionConfig.Precision
-Precision.__str__ = lambda precision: precision.name
-
 def conv_general_dilated(lhs, rhs, window_strides, padding, lhs_dilation=None,
                          rhs_dilation=None, dimension_numbers=None,
-                         feature_group_count=1, precision=None):
+                         feature_group_count=1):
   """General n-dimensional convolution operator, with optional dilation.
 
   Wraps XLA's `Conv
@@ -444,8 +397,6 @@ def conv_general_dilated(lhs, rhs, window_strides, padding, lhs_dilation=None,
       a 3-tuple `(lhs_spec, rhs_spec, out_spec)`, where each element is a string
       of length `n+2`.
     feature_group_count: integer, default 1. See XLA HLO docs.
-    precision: Optional. Either `None`, which means the default precision for
-      the backend, or a `Precision` enum value.
 
   Returns:
     An array containing the convolution result.
@@ -491,10 +442,9 @@ def conv_general_dilated(lhs, rhs, window_strides, padding, lhs_dilation=None,
       lhs_dilation=tuple(lhs_dilation), rhs_dilation=tuple(rhs_dilation),
       dimension_numbers=dimension_numbers,
       feature_group_count=feature_group_count,
-      lhs_shape=lhs.shape, rhs_shape=rhs.shape,
-      precision=_canonicalize_precision(precision))
+      lhs_shape=lhs.shape, rhs_shape=rhs.shape)
 
-def dot(lhs, rhs, precision=None):
+def dot(lhs, rhs):
   """Vector/vector, matrix/vector, and matrix/matrix multiplication.
 
   Wraps XLA's `Dot
@@ -506,8 +456,6 @@ def dot(lhs, rhs, precision=None):
   Args:
     lhs: an array of rank 1 or 2.
     rhs: an array of rank 1 or 2.
-    precision: Optional. Either `None`, which means the default precision for
-      the backend, or a `Precision` enum value.
 
   Returns:
     An array containing the product.
@@ -524,14 +472,9 @@ def dot(lhs, rhs, precision=None):
       rhs = broadcast(rhs, (1,))
     return reduce(mul(lhs, rhs), _zero(lhs), add, (len(lhs_shape) - 1,))
 
-  if 1 <= lhs.ndim <= 2 and 1 <= rhs.ndim <= 2 and lhs.shape[-1] == rhs.shape[0]:
-    return dot_general(lhs, rhs, (((lhs.ndim - 1,), (0,)), ((), ())),
-                       precision=precision)
-  else:
-    raise TypeError("Incompatible shapes for dot: got {} and {}.".format(
-        lhs.shape, rhs.shape))
+  return dot_p.bind(lhs, rhs)
 
-def dot_general(lhs, rhs, dimension_numbers, precision=None):
+def dot_general(lhs, rhs, dimension_numbers):
   """More general contraction operator.
 
   Wraps XLA's `DotGeneral
@@ -544,8 +487,6 @@ def dot_general(lhs, rhs, dimension_numbers, precision=None):
     dimension_numbers: a tuple of tuples of the form
       `((lhs_contracting_dims, rhs_contracting_dims),
       (lhs_batch_dims, rhs_batch_dims))`
-    precision: Optional. Either `None`, which means the default precision for
-      the backend, or a `Precision` enum value.
 
   Returns:
     An array containing the result.
@@ -579,8 +520,7 @@ def dot_general(lhs, rhs, dimension_numbers, precision=None):
                   tuple(range(out_ndim, out_ndim + len(lhs_contract_dims))))
 
   return dot_general_p.bind(lhs, rhs,
-                            dimension_numbers=(contract_dims, batch_dims),
-                            precision=_canonicalize_precision(precision))
+                            dimension_numbers=(contract_dims, batch_dims))
 
 def broadcast(operand, sizes):
   """Broadcasts an array, adding new major dimensions.
@@ -600,22 +540,18 @@ def broadcast(operand, sizes):
   return broadcast_p.bind(operand, sizes=tuple(sizes))
 
 def broadcast_in_dim(operand, shape, broadcast_dimensions):
-  if onp.ndim(operand) == len(shape) and not len(broadcast_dimensions):
+  if operand.ndim == len(shape) and not len(broadcast_dimensions):
     return operand
-  if any(x < 0 or x >= len(shape) for x in broadcast_dimensions):
-    msg = ("broadcast dimensions must be >= 0 and < ndim(shape), got {} for "
-           "shape {}")
-    raise ValueError(msg.format(broadcast_dimensions, shape))
-  return broadcast_in_dim_p.bind(
-      operand, shape=tuple(shape),
-      broadcast_dimensions=tuple(broadcast_dimensions))
+  else:
+    return broadcast_in_dim_p.bind(
+        operand, shape=tuple(shape),
+        broadcast_dimensions=tuple(broadcast_dimensions))
 
 def reshape(operand, new_sizes, dimensions=None):
   """Wraps XLA's `Reshape
   <https://www.tensorflow.org/xla/operation_semantics#reshape>`_
   operator.
   """
-  new_sizes = _canonicalize_shape(new_sizes)  # TODO
   new_sizes = tuple(new_sizes)
   same_shape = onp.shape(operand) == new_sizes
   same_dims = dimensions is None or tuple(dimensions) == tuple(range(onp.ndim(operand)))
@@ -624,7 +560,7 @@ def reshape(operand, new_sizes, dimensions=None):
   else:
     return reshape_p.bind(
         operand, new_sizes=new_sizes,
-        dimensions=None if same_dims else tuple(dimensions),
+        dimensions=None if dimensions is None else tuple(dimensions),
         old_sizes=onp.shape(operand))
 
 def pad(operand, padding_value, padding_config):
@@ -667,36 +603,19 @@ def dynamic_slice(operand, start_indices, slice_sizes):
   """Wraps XLA's `DynamicSlice
   <https://www.tensorflow.org/xla/operation_semantics#dynamicslice>`_
   operator.
-
-  Args:
-    operand: an array to slice.
-    start_indices: a list of scalar indices, one per dimension.
-    slice_sizes: the size of the slice. Must be a sequence of non-negative
-      integers with length equal to `ndim(operand)`.
-
-  Returns:
-    An array containing the slice.
   """
   start_indices = _dynamic_slice_indices(operand, start_indices)
   return dynamic_slice_p.bind(
-      operand, *start_indices, slice_sizes=tuple(slice_sizes),
+      operand, start_indices, slice_sizes=tuple(slice_sizes),
       operand_shape=operand.shape)
 
 def dynamic_update_slice(operand, update, start_indices):
   """Wraps XLA's `DynamicUpdateSlice
   <https://www.tensorflow.org/xla/operation_semantics#dynamicupdateslice>`_
   operator.
-
-  Args:
-    operand: an array to slice.
-    update: an array containing the new values to write onto `operand`.
-    start_indices: a list of scalar indices, one per dimension.
-
-  Returns:
-    An array containing the slice.
   """
   start_indices = _dynamic_slice_indices(operand, start_indices)
-  return dynamic_update_slice_p.bind(operand, update, *start_indices,
+  return dynamic_update_slice_p.bind(operand, update, start_indices,
                                      update_shape=update.shape)
 
 def gather(operand, start_indices, dimension_numbers, slice_sizes):
@@ -716,14 +635,14 @@ def gather(operand, start_indices, dimension_numbers, slice_sizes):
     dimension_numbers: a `lax.GatherDimensionNumbers` object that describes
       how dimensions of `operand`, `start_indices` and the output relate.
     slice_sizes: the size of each slice. Must be a sequence of non-negative
-      integers with length equal to `ndim(operand)`.
+      integers with size equal to `ndim(operand)`.
 
   Returns:
     An array containing the gather output.
   """
   return gather_p.bind(
       operand, start_indices, dimension_numbers=dimension_numbers,
-      slice_sizes=_canonicalize_shape(slice_sizes), operand_shape=operand.shape)
+      slice_sizes=tuple(slice_sizes), operand_shape=operand.shape)
 
 def scatter_add(operand, scatter_indices, updates, dimension_numbers):
   """Scatter-add operator.
@@ -746,7 +665,7 @@ def scatter_add(operand, scatter_indices, updates, dimension_numbers):
   Returns:
     An array containing the sum of `operand` and the scattered updates.
   """
-  jaxpr, consts = _reduction_jaxpr(add, _abstractify(_const(operand, 0)))
+  jaxpr, consts = _reduction_jaxpr(add, _const(operand, 0))
   return scatter_add_p.bind(
       operand, scatter_indices, updates, update_jaxpr=jaxpr,
       update_consts=consts, dimension_numbers=dimension_numbers,
@@ -773,7 +692,7 @@ def scatter_min(operand, scatter_indices, updates, dimension_numbers):
   Returns:
     An array containing the sum of `operand` and the scattered updates.
   """
-  jaxpr, consts = _reduction_jaxpr(min, _abstractify(_const(operand, 0)))
+  jaxpr, consts = _reduction_jaxpr(min, _const(operand, 0))
   return scatter_min_p.bind(
       operand, scatter_indices, updates, update_jaxpr=jaxpr,
       update_consts=consts, dimension_numbers=dimension_numbers,
@@ -800,14 +719,11 @@ def scatter_max(operand, scatter_indices, updates, dimension_numbers):
   Returns:
     An array containing the sum of `operand` and the scattered updates.
   """
-  jaxpr, consts = _reduction_jaxpr(max, _abstractify(_const(operand, 0)))
+  jaxpr, consts = _reduction_jaxpr(max, _const(operand, 0))
   return scatter_max_p.bind(
       operand, scatter_indices, updates, update_jaxpr=jaxpr,
       update_consts=consts, dimension_numbers=dimension_numbers,
       updates_shape=updates.shape)
-
-# Define this outside of scatter to ensure cache hits.
-_scatter_reduction_computation = lambda x, y: y
 
 def scatter(operand, scatter_indices, updates, dimension_numbers):
   """Scatter-update operator.
@@ -833,8 +749,7 @@ def scatter(operand, scatter_indices, updates, dimension_numbers):
   Returns:
     An array containing the sum of `operand` and the scattered updates.
   """
-  jaxpr, consts = _reduction_jaxpr(_scatter_reduction_computation,
-                                   _abstractify(_const(operand, 0)))
+  jaxpr, consts = _reduction_jaxpr(lambda x, y: y, _const(operand, 0))
   return scatter_p.bind(
       operand, scatter_indices, updates, update_jaxpr=jaxpr,
       update_consts=consts, dimension_numbers=dimension_numbers,
@@ -874,33 +789,30 @@ def reduce(operand, init_value, computation, dimensions):
   if monoid_reducer:
     return monoid_reducer(operand, dimensions)
   else:
-    jaxpr, consts = _reduction_jaxpr(computation, _abstractify(init_value))
+    jaxpr, consts = _reduction_jaxpr(computation, init_value)
     return reduce_p.bind(operand, init_value, computation=computation,
                          jaxpr=jaxpr, consts=consts, dimensions=tuple(dimensions))
 
-@cache()
-def _reduction_jaxpr(computation, aval):
-  pval = pe.PartialVal((aval, core.unit))
-  comp = lu.wrap_init(lambda x, y: (computation(x, y),))
-  jaxpr, _, consts = pe.trace_to_jaxpr(comp, (pval, pval), instantiate=False)
+def _reduction_jaxpr(computation, init_value):
+  pval = _abstractify(init_value)
+  jaxpr, _, consts = pe.trace_unwrapped_to_jaxpr(computation, (pval, pval))
   return jaxpr, consts
 
 def _get_monoid_reducer(monoid_op, x):
   aval = core.get_aval(x)
-  dtype = _dtype(x)
   if (type(aval) is ConcreteArray) and aval.shape == ():
     if monoid_op is add:
       return aval.val == 0 and _reduce_sum
     if monoid_op is mul:
       return aval.val == 1 and _reduce_prod
-    elif monoid_op is bitwise_or and dtype == onp.bool_:
-      return aval.val == _get_max_identity(dtype) and _reduce_or
-    elif monoid_op is bitwise_and and dtype == onp.bool_:
-      return aval.val == _get_min_identity(dtype) and _reduce_and
     elif monoid_op is max:
-      return aval.val == _get_max_identity(dtype) and _reduce_max
+      return aval.val == _get_max_identity(aval.dtype) and _reduce_max
     elif monoid_op is min:
-      return aval.val == _get_min_identity(dtype) and _reduce_min
+      return aval.val == _get_min_identity(aval.dtype) and _reduce_min
+    elif monoid_op is bitwise_or and aval.dtype == onp.bool_:
+      return aval.val == _get_max_identity(aval.dtype) and _reduce_or
+    elif monoid_op is bitwise_and and aval.dtype == onp.bool_:
+      return aval.val == _get_min_identity(aval.dtype) and _reduce_and
 
 def _get_max_identity(dtype):
   if onp.issubdtype(dtype, onp.inexact):
@@ -947,7 +859,7 @@ def reduce_window(operand, init_value, computation, window_dimensions,
   if monoid_reducer:
     return monoid_reducer(operand, window_dimensions, window_strides, padding)
   else:
-    jaxpr, consts = _reduction_jaxpr(computation, _abstractify(init_value))
+    jaxpr, consts = _reduction_jaxpr(computation, init_value)
     return reduce_window_p.bind(
         operand, init_value, jaxpr=jaxpr, consts=consts,
         window_dimensions=tuple(window_dimensions),
@@ -971,7 +883,7 @@ def _reduce_window_sum(operand, window_dimensions, window_strides, padding):
 
 def _reduce_window_prod(operand, window_dimensions, window_strides, padding):
   init_value = _const(operand, 1)
-  jaxpr, consts = _reduction_jaxpr(mul, _abstractify(init_value))
+  jaxpr, consts = _reduction_jaxpr(mul, init_value)
   return reduce_window_p.bind(
       operand, init_value, jaxpr=jaxpr, consts=consts,
       window_dimensions=tuple(window_dimensions),
@@ -989,8 +901,8 @@ def _reduce_window_min(operand, window_dimensions, window_strides, padding):
 
 def _select_and_scatter(operand, select, window_dimensions, window_strides,
                         padding, source, init_value, scatter):
-  select_jaxpr, select_consts = _reduction_jaxpr(select, _abstractify(init_value))
-  scatter_jaxpr, scatter_consts = _reduction_jaxpr(scatter, _abstractify(init_value))
+  select_jaxpr, select_consts = _reduction_jaxpr(select)
+  scatter_jaxpr, scatter_consts = _reduction_jaxpr(scatter)
   return select_and_scatter_p.bind(
       operand, source, init_value, select_jaxpr=select_jaxpr,
       select_consts=select_consts, scatter_jaxpr=scatter_jaxpr,
@@ -1042,7 +954,7 @@ def full(shape, fill_value, dtype=None):
       will be cast to `dtype`.
   """
   try:
-    shape = _canonicalize_shape(shape)
+    shape = tuple(map(int, shape))
   except TypeError:
     msg = ("`full` requires shapes to be concrete. If using `jit`, try using "
            "`static_argnums` or applying `jit` to smaller subfunctions instead.")
@@ -1077,7 +989,7 @@ def broadcasted_iota(dtype, shape, dimension):
   operator.
   """
   dtype = xla_bridge.canonicalize_dtype(dtype)
-  shape = _canonicalize_shape(shape)
+  shape = tuple(map(int, shape))
   dimension = int(dimension)
   return _IotaConstant(dtype, shape, dimension)
 
@@ -1088,7 +1000,7 @@ def broadcasted_eye(dtype, shape, axes):
   if not isinstance(axes, (list, tuple)) or not len(axes) >= 2:
     raise TypeError("make_diagonal `axes` must be a tuple with len at least 2.")
   dtype = xla_bridge.canonicalize_dtype(dtype)
-  shape = _canonicalize_shape(shape)
+  shape = tuple(map(int, shape))
   axes = tuple(map(int, axes))
   return _EyeConstant(shape, axes, dtype)
 
@@ -1122,7 +1034,7 @@ def _safe_mul(x, y): return safe_mul_p.bind(x, y)
 ### convenience wrappers around traceables
 
 
-def conv(lhs, rhs, window_strides, padding, precision=None):
+def conv(lhs, rhs, window_strides, padding):
   """Convenience wrapper around `conv_general_dilated`.
 
   Args:
@@ -1131,18 +1043,15 @@ def conv(lhs, rhs, window_strides, padding, precision=None):
     window_strides: a sequence of `n` integers, representing the inter-window
       strides.
     padding: either the string `'SAME'`, the string `'VALID'`.
-    precision: Optional. Either `None`, which means the default precision for
-      the backend, or a `Precision` enum value.
 
   Returns:
     An array containing the convolution result.
   """
   pads = padtype_to_pads(lhs.shape[2:], rhs.shape[2:], window_strides, padding)
-  return conv_general_dilated(lhs, rhs, window_strides, padding,
-                              precision=precision)
+  return conv_general_dilated(lhs, rhs, window_strides, padding)
 
 def conv_with_general_padding(lhs, rhs, window_strides, padding,
-                              lhs_dilation, rhs_dilation, precision=None):
+                              lhs_dilation, rhs_dilation):
   """Convenience wrapper around `conv_general_dilated`.
 
   Args:
@@ -1159,15 +1068,13 @@ def conv_with_general_padding(lhs, rhs, window_strides, padding,
     rhs_dilation: `None`, or a sequence of `n` integers, giving the
       dilation factor to apply in each spatial dimension of `rhs`. RHS dilation
       is also known as atrous convolution.
-    precision: Optional. Either `None`, which means the default precision for
-      the backend, or a `Precision` enum value.
 
   Returns:
     An array containing the convolution result.
   """
   return conv_general_dilated(
       lhs, rhs, window_strides, padding, lhs_dilation=lhs_dilation,
-      rhs_dilation=rhs_dilation, precision=precision)
+      rhs_dilation=rhs_dilation)
 
 
 def _conv_transpose_padding(k, s, padding):
@@ -1204,7 +1111,7 @@ def _flip_axes(x, axes):
 
 
 def conv_transpose(lhs, rhs, strides, padding, dimension_numbers=None,
-                   transpose_kernel=False, precision=None):
+                   transpose_kernel=False):
   """Convenience wrapper for calculating the N-d convolution "transpose".
 
   This function directly calculates a fractionally strided conv rather than
@@ -1224,8 +1131,6 @@ def conv_transpose(lhs, rhs, strides, padding, dimension_numbers=None,
       to the gradient-derived functions like keras.layers.Conv2DTranspose
       applied to the same kernel. For typical use in neural nets this is completely
       pointless and just makes input/output channel specification confusing.
-    precision: Optional. Either `None`, which means the default precision for
-      the backend, or a `Precision` enum value.
 
   Returns:
     Transposed N-d convolution, with output padding following the conventions of
@@ -1257,8 +1162,7 @@ def conv_transpose(lhs, rhs, strides, padding, dimension_numbers=None,
     # flip spatial dims and swap input / output channel axes
     rhs = _flip_axes(rhs, onp.array(dn.rhs_spec)[2:])
     rhs = onp.swapaxes(rhs, dn.rhs_spec[0], dn.rhs_spec[1])
-  return conv_general_dilated(lhs, rhs, one, pads, strides, one, dn,
-                              precision=precision)
+  return conv_general_dilated(lhs, rhs, one, pads, strides, one, dn)
 
 
 def full_like(x, fill_value, dtype=None, shape=None):
@@ -1274,9 +1178,9 @@ def full_like(x, fill_value, dtype=None, shape=None):
     An ndarray with the same shape as `x` with its entries set equal to
     `fill_value`, similar to the output of np.full.
   """
-  shape = onp.shape(x) if shape is None else _canonicalize_shape(shape)
-  fill_value = tie_in(x, fill_value)
-  return full(shape, fill_value, dtype or _dtype(x))
+  shape = onp.shape(x) if shape is None else shape
+  out = full(shape, fill_value, dtype or _dtype(x))
+  return tie_in(x, out)
 
 
 def collapse(operand, start_dimension, stop_dimension):
@@ -1317,12 +1221,15 @@ def index_in_dim(operand, index, axis=0, keepdims=True):
 
 def dynamic_slice_in_dim(operand, start_index, slice_size, axis=0):
   """Convenience wrapper around dynamic_slice applying to one dimension."""
-  start_indices = [0] * operand.ndim
+  start_indices = [onp.array([0], dtype=_dtype(start_index))] * operand.ndim
   slice_sizes = list(operand.shape)
 
   axis = int(axis)
-  start_indices[axis] = start_index
+  axis_size = _const(start_index, operand.shape[axis])
+  start_indices[axis] = reshape(rem(start_index, axis_size), [1])
   slice_sizes[axis] = int(slice_size)
+
+  start_indices = concatenate(start_indices, 0)
   return dynamic_slice(operand, start_indices, slice_sizes)
 
 
@@ -1338,7 +1245,7 @@ def dynamic_index_in_dim(operand, index, axis=0, keepdims=True):
 def dynamic_update_slice_in_dim(operand, update, start_index, axis):
   axis = int(axis)
   start_indices = [0] * _ndim(operand)
-  start_indices[axis] = start_index
+  start_indices[axis] = start_index % operand.shape[axis]
   return dynamic_update_slice(operand, update, start_indices)
 
 
@@ -1365,8 +1272,16 @@ def batch_matmul(lhs, rhs):
   return dot_general(lhs, rhs, [(lhs_contract, rhs_contract), (batch, batch)])
 
 
-# These functions also exist in the XLA client library, but we treat them
+# These trig functions also exist in the XLA client library, but we treat them
 # as non-primitive to maintain a smaller set of autodiff primitives.
+
+def sqrt(x):
+  r"""Elementwise square root: :math:`\sqrt{x}`."""
+  return sqrt_p.bind(x)
+
+def rsqrt(x):
+  r"""Elementwise reciprocal square root: :math:`1 \over \sqrt{x}`."""
+  return pow(x, _const(x, -0.5))
 
 def square(x):
   r"""Elementwise square: :math:`x^2`."""
@@ -1376,18 +1291,15 @@ def reciprocal(x):
   r"""Elementwise reciprocal: :math:`1 \over x`."""
   return div(_const(x, 1), x)
 
-@api.jit
 def tan(x):
   r"""Elementwise tangent: :math:`\mathrm{tan}(x)`."""
   return div(sin(x), cos(x))
 
-@api.jit
 def asin(x):
   r"""Elementwise arc sine: :math:`\mathrm{asin}(x)`."""
   return mul(_const(x, 2),
              atan2(x, add(_const(x, 1), sqrt(sub(_const(x, 1), square(x))))))
 
-@api.jit
 def acos(x):
   r"""Elementwise arc cosine: :math:`\mathrm{acos}(x)`."""
   return select(
@@ -1400,33 +1312,53 @@ def atan(x):
   r"""Elementwise arc tangent: :math:`\mathrm{atan}(x)`."""
   return atan2(x, _const(x, 1))
 
-def _upcast_fp16_for_computation(f):
-  @functools.wraps(f)
-  def f_wrapped(x):
-    dtype = _dtype(x)
-    if dtype == onp.float16:
-      return convert_element_type(
-        f(convert_element_type(x, onp.float32)), dtype)
-    return f(x)
-
-  return f_wrapped
-
-@api.jit
-@_upcast_fp16_for_computation
 def sinh(x):
   r"""Elementwise hyperbolic sine: :math:`\mathrm{sinh}(x)`."""
   log_half = _const(x, onp.log(0.5))
   # This formulation avoids overflow when e^x is inf but e^x/2 is not inf.
   return sub(exp(add(log_half, x)), exp(sub(log_half, x)))
 
-@api.jit
-@_upcast_fp16_for_computation
 def cosh(x):
   r"""Elementwise hyperbolic cosine: :math:`\mathrm{cosh}(x)`."""
   log_half = _const(x, onp.log(0.5))
   # This formulation avoids overflow when e^x is inf but e^x/2 is not inf.
   return add(exp(add(log_half, x)), exp(sub(log_half, x)))
 
+def asinh(x):
+  r"""Elementwise arc hyperbolic sine: :math:`\mathrm{asinh}(x)`."""
+  # asinh(x) = log(x + sqrt(x**2 + 1))
+  result = log(add(x, sqrt(add(mul(x, x), _const(x, 1)))))
+  if onp.issubdtype(_dtype(result), onp.complexfloating):
+    return result
+  a = abs(x)
+  sqrt_max_value = onp.sqrt(onp.finfo(_dtype(x)).max)
+  return select(lt(a, _const(a, sqrt_max_value)),
+                result,
+                mul(sign(x), add(log(a), _const(a, onp.log(2.)))))
+
+def acosh(x):
+  r"""Elementwise arc hyperbolic cosine: :math:`\mathrm{acosh}(x)`."""
+  # acosh(x) = log(x + sqrt((x + 1) * (x - 1))) if x < sqrt_max_value
+  #            log(x) + log(2) otherwise
+  sqrt_max_value = onp.sqrt(onp.finfo(_dtype(x)).max)
+  result = log(add(x, mul(sqrt(add(x, _const(x, 1))),
+                          sqrt(sub(x, _const(x, 1))))))
+  if onp.issubdtype(_dtype(result), onp.complexfloating):
+    return result
+  return select(
+    lt(x, _const(x, sqrt_max_value)),
+    result,
+    add(log(x), _const(x, onp.log(2.))))
+
+
+def atanh(x):
+  r"""Elementwise arc hyperbolic tangent: :math:`\mathrm{atanh}(x)`."""
+  # atanh(x) = 0.5 * log((1 + x) / (1 - x))
+  result = mul(_const(x, 0.5), log(div(add(_const(x, 1), x),
+                                       sub(_const(x, 1), x))))
+  if onp.issubdtype(_dtype(result), onp.complexfloating):
+    return result
+  return select(le(abs(x), _one(x)), result, full_like(x, onp.nan))
 
 # Add some methods to ShapedArray that rely on lax primitives
 
@@ -1439,8 +1371,7 @@ def _iter(tracer):
     raise TypeError("iteration over a 0-d array")  # same as numpy error
   else:
     n = tracer.shape[0]
-    # return (index_in_dim(tracer, i, keepdims=False) for i in xrange(n))
-    return iter([index_in_dim(tracer, i, keepdims=False) for i in xrange(n)])
+    return (index_in_dim(tracer, i, keepdims=False) for i in xrange(n))
 ShapedArray._iter = staticmethod(_iter)
 
 # Add some ad handlers that use (or could use) lax primitives
@@ -1466,15 +1397,6 @@ def standard_primitive(shape_rule, dtype_rule, name, translation_rule=None):
   prim.def_abstract_eval(partial(standard_abstract_eval, shape_rule, dtype_rule))
   xla.translations[prim] = translation_rule or partial(standard_translate, name)
   return prim
-
-
-def standard_reduction_primitive(shape_rule, dtype_rule, name, translation_rule=None):
-  prim = Primitive(name)
-  prim.def_impl(partial(xla.apply_primitive, prim))
-  prim.def_abstract_eval(partial(standard_abstract_eval, shape_rule, dtype_rule))
-  xla.reduction_translations[prim] = translation_rule or partial(standard_translate, name)
-  return prim
-
 
 def standard_abstract_eval(shape_rule, dtype_rule, *args, **kwargs):
   assert all(isinstance(arg, UnshapedArray) for arg in args), args
@@ -1508,7 +1430,7 @@ def unop(result_dtype, accepted_dtypes, name):
   dtype_rule = partial(unop_dtype_rule, result_dtype, accepted_dtypes, name)
   prim = standard_primitive(_attrgetter('shape'), dtype_rule, name)
   batching.defvectorized(prim)
-  masking.defvectorized(prim)
+  parallel.defvectorized(prim)
   return prim
 standard_unop = partial(unop, _identity)
 _attrgetter = lambda name: lambda x, **kwargs: getattr(x, name)
@@ -1549,7 +1471,7 @@ def binop(result_dtype, accepted_dtypes, name, translation_rule=None):
   prim = standard_primitive(shape_rule, dtype_rule, name,
                             translation_rule=translation_rule)
   batching.defbroadcasting(prim)
-  masking.defbinop(prim)
+  parallel.defbroadcasting(prim)
   return prim
 standard_binop = partial(binop, _input_dtype)
 
@@ -1584,6 +1506,7 @@ def _brcast_to(x, shape):
     return broadcast(x, shape)
 
 
+_f32 = {onp.float32}
 _float = {onp.floating}
 _complex = {onp.complexfloating}
 _complex_elem_types = {onp.float32, onp.float64}
@@ -1595,6 +1518,7 @@ _any = _int | _float | _complex | _bool
 
 neg_p = standard_unop(_num, 'neg')
 ad.deflinear(neg_p, lambda t: [neg(t)])
+batching.defvectorized(neg_p)
 
 sign_p = standard_unop(_num, 'sign')
 ad.defjvp_zero(sign_p)
@@ -1642,19 +1566,6 @@ ad.defjvp(lgamma_p, lambda g, x: mul(g, digamma(x)))
 
 digamma_p = standard_unop(_float, 'digamma')
 
-bessel_i0e_p = standard_unop(_float, 'bessel_i0e')
-ad.defjvp2(bessel_i0e_p, lambda g, y, x: g * (bessel_i1e(x) - sign(x) * y))
-
-bessel_i1e_p = standard_unop(_float, 'bessel_i1e')
-def _bessel_i1e_jvp(g, y, x):
-  eps = onp.finfo(_dtype(x)).eps
-  x_is_not_tiny = abs(x) > eps
-  safe_x = select(x_is_not_tiny, x, full_like(x, eps))
-  dy_dx = bessel_i0e(safe_x) - y * (sign(safe_x) + reciprocal(safe_x))
-  dy_dx = select(x_is_not_tiny, dy_dx, full_like(x, 0.5))
-  return g * dy_dx
-ad.defjvp2(bessel_i1e_p, _bessel_i1e_jvp)
-
 erf_p = standard_unop(_float, 'erf')
 ad.defjvp(erf_p, lambda g, x: mul(_const(x, 2. / onp.sqrt(onp.pi)),
                                   mul(g, exp(neg(square(x))))))
@@ -1671,17 +1582,17 @@ real_p = unop(_complex_basetype, _complex, 'real')
 ad.deflinear(real_p, lambda t: [complex(t, onp.zeros((), _dtype(t)))])
 
 imag_p = unop(_complex_basetype, _complex, 'imag')
-ad.defjvp(imag_p, lambda g, _: real(mul(_const(g, -1j), g)))
+ad.deflinear(imag_p, lambda t: [complex(onp.zeros((), _dtype(t)), t)])
 
 _complex_dtype = lambda dtype, *args: (onp.zeros((), dtype) + onp.zeros((), onp.complex64)).dtype
 complex_p = binop(_complex_dtype, [_complex_elem_types, _complex_elem_types],
                   'complex')
-ad.deflinear(complex_p, lambda t: [real(t), imag(neg(t))])
+ad.deflinear(complex_p, lambda t: [real(t), imag(t)])
 
-conj_p = unop(_complex_dtype, _complex_elem_types | _complex, 'conj')
+conj_p = unop(_complex_dtype, _float | _complex, 'conj')
 
 def _conj_transpose_rule(t, x, input_dtype):
-  assert x is ad.undefined_primal
+  assert x is None
   if onp.issubdtype(input_dtype, onp.complexfloating):
     return [conj(t)]
   else:
@@ -1692,38 +1603,28 @@ ad.primitive_jvps[conj_p] = partial(ad.linear_jvp, conj_p)
 ad.primitive_transposes[conj_p] = _conj_transpose_rule
 
 abs_p = unop(_complex_basetype, _num, 'abs')
-
-def _abs_jvp_rule(g, ans, x):
-  if _iscomplex(x):
-    return _maybe_real(mul(g, div(_maybe_conj(x),
-           _replace_zero(convert_element_type(ans, _dtype(x))))))
-  else:
-    return select(ge(x, _zero(x)), g, neg(g))
-ad.defjvp2(abs_p, _abs_jvp_rule)
+ad.defjvp2(abs_p,
+           lambda g, ans, x:
+           div(_maybe_real(mul(g, _maybe_conj(x))), _replace_zero(ans)))
 _maybe_conj = lambda x: conj(x) if _iscomplex(x) else x
 _maybe_real = lambda x: real(x) if _iscomplex(x) else x
 
 sqrt_p = standard_unop(_float | _complex, 'sqrt')
 ad.defjvp2(sqrt_p, lambda g, ans, x: _safe_mul(g, div(_const(x, 0.5), ans)))
 
-rsqrt_p = standard_unop(_float | _complex, 'rsqrt')
-ad.defjvp2(rsqrt_p,
-           lambda g, ans, x:
-           _safe_mul(g, mul(_const(x, -0.5), pow(x, _const(x, -1.5)))))
-
 pow_p = standard_binop([_float | _complex, _float | _complex], 'pow')
 
-def _pow_jvp_lhs(g, ans, x, y):
+def _pow_jvp_lhs(g, x, y):
   # we call _safe_mul here so that we get the behavior 0*inf = 0, since when a
   # coefficient in `g` is zero we want to keep it at zero, not produce a nan.
   # see https://github.com/google/jax/pull/383
   jac = mul(y, pow(x, select(eq(y, _zeros(y)), _ones(y), sub(y, _ones(y)))))
   return _safe_mul(_brcast(g, y), jac)
 
-def _pow_jvp_rhs(g, ans, x, y):
-  return mul(_brcast(g, x), mul(log(_replace_zero(x)), ans))
+def _pow_jvp_rhs(g, x, y):
+  return mul(_brcast(g, x), mul(log(_replace_zero(x)), pow(x, y)))
 
-ad.defjvp2(pow_p, _pow_jvp_lhs, _pow_jvp_rhs)
+ad.defjvp(pow_p, _pow_jvp_lhs, _pow_jvp_rhs)
 _replace_zero = lambda x: select(eq(x, _const(x, 0)), _ones(x), x)
 
 not_p = standard_unop(_int | _bool, 'not')
@@ -1738,7 +1639,7 @@ xor_p = standard_binop([_any, _any], 'xor')
 ad.defjvp_zero(xor_p)
 
 def _add_transpose(t, x, y):
-  # assert x is ad.undefined_primal and y is ad.undefined_primal  # not affine
+  # assert x is None and y is None  # computation must be linear, not affine
   return [t, t]
 
 add_p = standard_binop([_num, _num], 'add')
@@ -1747,7 +1648,7 @@ ad.primitive_transposes[add_p] = _add_transpose
 
 
 def _sub_transpose(t, x, y):
-  assert x is ad.undefined_primal and y is ad.undefined_primal  # not affine
+  assert x is None and y is None  # computation must be linear, not affine
   return [t, neg(t) if t is not ad_util.zero else ad_util.zero]
 
 sub_p = standard_binop([_num, _num], 'sub')
@@ -1775,19 +1676,19 @@ ad.defbilinear_broadcasting(_brcast, safe_mul_p, _safe_mul, _safe_mul)
 
 
 def _div_transpose_rule(cotangent, x, y):
-  assert x is ad.undefined_primal and y is not ad.undefined_primal
+  assert x is None and y is not None
   res = ad_util.zero if cotangent is ad_util.zero else div(cotangent, y)
   return res, None
 div_p = standard_binop([_num, _num], 'div')
 ad.defjvp(div_p,
           lambda g, x, y: div(_brcast(g, y), y),
-          lambda g, x, y: div(mul(neg(_brcast(g, x)), x), square(y)))
+          lambda g, x, y: div(mul(neg(_brcast(g, x)), x), pow(y, _two(y))))
 ad.primitive_transposes[div_p] = _div_transpose_rule
 
 rem_p = standard_binop([_num, _num], 'rem')
 ad.defjvp(rem_p,
           lambda g, x, y: _brcast(g, y),
-          lambda g, x, y: mul(_brcast(neg(g), x), floor(div(x, y))))
+          lambda g, x, y: mul(neg(g), floor(div(x, y))))
 
 
 def _broadcasting_select(c, which, x, y):
@@ -1863,8 +1764,14 @@ def _convert_element_type_dtype_rule(operand, new_dtype, old_dtype):
   return new_dtype
 
 def _convert_element_type_translation_rule(c, operand, new_dtype, old_dtype):
-  new_etype = xla_client.dtype_to_etype(new_dtype)
+  new_etype = xla_bridge.dtype_to_etype_exact(new_dtype)
   return c.ConvertElementType(operand, new_element_type=new_etype)
+
+def _convert_element_type_papply_rule(name, size, vals, dims, new_dtype,
+                                      **kwargs):
+  operand, = vals
+  dim, = dims
+  return convert_element_type(operand, new_dtype), dim
 
 convert_element_type_p = standard_primitive(
     _convert_element_type_shape_rule, _convert_element_type_dtype_rule,
@@ -1873,7 +1780,7 @@ ad.deflinear(
     convert_element_type_p,
     lambda t, new_dtype, old_dtype: [convert_element_type(t, old_dtype)])
 batching.defvectorized(convert_element_type_p)
-masking.defvectorized(convert_element_type_p)
+parallel.papply_primitive_rules[convert_element_type_p] = _convert_element_type_papply_rule
 
 
 def _bitcast_convert_type_shape_rule(operand, new_dtype):
@@ -1891,7 +1798,6 @@ bitcast_convert_type_p = standard_primitive(
     'bitcast_convert_type', _bitcast_convert_type_translation_rule)
 ad.defjvp_zero(bitcast_convert_type_p)
 batching.defvectorized(bitcast_convert_type_p)
-masking.defvectorized(bitcast_convert_type_p)
 
 
 def _conv_general_dilated_shape_rule(
@@ -1928,8 +1834,8 @@ def _conv_general_dilated_shape_rule(
 def _conv_general_dilated_dtype_rule(
     lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation,
     dimension_numbers, **unused_kwargs):
-  return binop_dtype_rule(_input_dtype, [_float, _float],
-                          'conv_general_dilated', lhs, rhs)
+  return binop_dtype_rule(_input_dtype, [_f32, _f32], 'conv_general_dilated',
+                          lhs, rhs)
 
 _conv_spec_transpose = lambda spec: (spec[1], spec[0]) + spec[2:]
 _conv_sdims = lambda spec: spec[2:]
@@ -1937,7 +1843,7 @@ _conv_sdims = lambda spec: spec[2:]
 def _conv_general_dilated_transpose_lhs(
     g, rhs, window_strides, padding, lhs_dilation, rhs_dilation,
     dimension_numbers, feature_group_count,
-    lhs_shape, rhs_shape, precision):
+    lhs_shape, rhs_shape):
   assert type(dimension_numbers) is ConvDimensionNumbers
   lhs_sdims, rhs_sdims, out_sdims = map(_conv_sdims, dimension_numbers)
   lhs_spec, rhs_spec, out_spec = dimension_numbers
@@ -1957,12 +1863,12 @@ def _conv_general_dilated_transpose_lhs(
       g, revd_weights, window_strides=lhs_dilation, padding=padding,
       lhs_dilation=window_strides, rhs_dilation=rhs_dilation,
       dimension_numbers=trans_dimension_numbers,
-      feature_group_count=feature_group_count, precision=precision)
+      feature_group_count=feature_group_count)
 
 def _conv_general_dilated_transpose_rhs(
     g, lhs, window_strides, padding, lhs_dilation, rhs_dilation,
     dimension_numbers, feature_group_count,
-    lhs_shape, rhs_shape, precision):
+    lhs_shape, rhs_shape):
   assert type(dimension_numbers) is ConvDimensionNumbers
 
   lhs_sdims, rhs_sdims, out_sdims = map(_conv_sdims, dimension_numbers)
@@ -1979,22 +1885,21 @@ def _conv_general_dilated_transpose_rhs(
       lhs, g, window_strides=rhs_dilation, padding=padding,
       lhs_dilation=lhs_dilation, rhs_dilation=window_strides,
       dimension_numbers=trans_dimension_numbers,
-      feature_group_count=feature_group_count, precision=precision)
+      feature_group_count=feature_group_count)
 
 def _conv_general_dilated_translation_rule(
     c, lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation,
-    dimension_numbers, feature_group_count, precision, **unused_kwargs):
+    dimension_numbers, feature_group_count, **unused_kwargs):
   assert type(dimension_numbers) is ConvDimensionNumbers
   dimension_numbers = _conv_general_proto(dimension_numbers)
   return c.ConvGeneralDilated(lhs, rhs, window_strides, padding, lhs_dilation,
                               rhs_dilation, dimension_numbers,
-                              feature_group_count,
-                              precision_config=_precision_config(precision))
+                              feature_group_count)
 
 def _conv_general_dilated_batch_rule(
     batched_args, batch_dims, window_strides, padding,
     lhs_dilation, rhs_dilation, dimension_numbers,
-    feature_group_count, precision, **unused_kwargs):
+    feature_group_count, **unused_kwargs):
   lhs, rhs = batched_args
   lhs_bdim, rhs_bdim = batch_dims
   lhs_spec, rhs_spec, out_spec = dimension_numbers
@@ -2003,11 +1908,9 @@ def _conv_general_dilated_batch_rule(
     assert lhs.shape[lhs_bdim] == rhs.shape[rhs_bdim]
     new_lhs = _reshape_axis_into(lhs_bdim, lhs_spec[1], lhs)
     new_rhs = _reshape_axis_into(rhs_bdim, rhs_spec[0], rhs)
-    out = conv_general_dilated(
-      new_lhs, new_rhs, window_strides, padding, lhs_dilation, rhs_dilation,
-      dimension_numbers,
-      feature_group_count=lhs.shape[lhs_bdim] * feature_group_count,
-      precision=precision)
+    out = conv_general_dilated(new_lhs, new_rhs, window_strides, padding,
+                               lhs_dilation, rhs_dilation, dimension_numbers,
+                               feature_group_count=lhs.shape[lhs_bdim] * feature_group_count)
     out = _reshape_axis_out_of(out_spec[1], lhs.shape[lhs_bdim], out)
     return out, out_spec[1]
 
@@ -2015,7 +1918,7 @@ def _conv_general_dilated_batch_rule(
     new_lhs = _reshape_axis_into(lhs_bdim, lhs_spec[0], lhs)
     out = conv_general_dilated(new_lhs, rhs, window_strides, padding,
                                lhs_dilation, rhs_dilation, dimension_numbers,
-                               feature_group_count, precision=precision)
+                               feature_group_count)
     out = _reshape_axis_out_of(out_spec[0], lhs.shape[lhs_bdim], out)
     return out, out_spec[0]
 
@@ -2024,7 +1927,7 @@ def _conv_general_dilated_batch_rule(
       new_rhs = _reshape_axis_into(rhs_bdim, rhs_spec[0], rhs)
       out = conv_general_dilated(lhs, new_rhs, window_strides, padding,
                                 lhs_dilation, rhs_dilation, dimension_numbers,
-                                feature_group_count, precision=precision)
+                                feature_group_count)
       out = _reshape_axis_out_of(out_spec[1], rhs.shape[rhs_bdim], out)
       return out, out_spec[1]
     else:
@@ -2041,11 +1944,27 @@ def _conv_general_dilated_batch_rule(
       new_rhs = _reshape_axis_into(rhs_spec[0], rhs_spec[0], new_rhs)
       out = conv_general_dilated(lhs, new_rhs, window_strides, padding,
                                 lhs_dilation, rhs_dilation, dimension_numbers,
-                                feature_group_count, precision=precision)
+                                feature_group_count)
       out = _reshape_axis_out_of(out_spec[1], feature_group_count, out)
       out = _reshape_axis_out_of(out_spec[1] + 1, rhs.shape[rhs_bdim], out)
       out = _reshape_axis_into(out_spec[1], out_spec[1] + 1, out)
       return out, out_spec[1]
+
+def _conv_general_dilated_papply_rule(
+    name, size, vals, dims, window_strides, padding, lhs_dilation, rhs_dilation,
+    dimension_numbers, **unused_kwargs):
+  lhs, rhs = vals
+  lhs_dim, rhs_dim = dims
+  lhs_spec_batch_dim = dimension_numbers.lhs_spec[0]
+  if rhs_dim is None and lhs_dim == lhs_spec_batch_dim:
+    lhs = reshape(lhs, tuple(onp.insert(lhs.shape, lhs_dim, 1)))
+    out = conv_general_dilated(
+        lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation,
+        dimension_numbers)
+    return out, lhs_dim
+  else:
+    raise NotImplementedError(
+        "splitting a convolution along anything but input batch dimension")
 
 conv_general_dilated_p = standard_primitive(
     _conv_general_dilated_shape_rule, _conv_general_dilated_dtype_rule,
@@ -2053,8 +1972,10 @@ conv_general_dilated_p = standard_primitive(
 ad.defbilinear(conv_general_dilated_p,
                _conv_general_dilated_transpose_lhs,
                _conv_general_dilated_transpose_rhs)
-batching.primitive_batchers[conv_general_dilated_p] = \
-    _conv_general_dilated_batch_rule
+batching.primitive_batchers[
+    conv_general_dilated_p] = _conv_general_dilated_batch_rule
+parallel.papply_primitive_rules[
+    conv_general_dilated_p] = _conv_general_dilated_papply_rule
 
 
 def _reshape_axis_into(src, dst, x):
@@ -2071,15 +1992,114 @@ def _reshape_axis_out_of(src, size1, x):
   shape[src:src+1] = [size1, size2]
   return reshape(x, shape)
 
-def _precision_config(precision):
-  if precision is not None:
-    config = xla_client.PrecisionConfig()
-    config.operand_precision.extend((precision, precision))
-    return config
-  return None
+
+def _dot_shape_rule(lhs, rhs):
+  if lhs.ndim == 0 or rhs.ndim == 0:
+    msg = "Dot only supports rank 1 or above, got shapes {} and {}."
+    raise TypeError(msg.format(lhs.shape, rhs.shape))
+  if lhs.ndim > 2 or rhs.ndim > 2:
+    msg = "Dot only supports rank 2 or less, got shapes {} and {}."
+    raise TypeError(msg.format(lhs.shape, rhs.shape))
+
+  def require(shape_cond):
+    if not shape_cond:
+      msg = "Incompatible shapes for dot: got {} and {}."
+      raise TypeError(msg.format(lhs.shape, rhs.shape))
+
+  if lhs.ndim == rhs.ndim == 1:
+    require(lhs.shape == rhs.shape)
+    return ()
+  elif lhs.ndim == rhs.ndim == 2:
+    require(lhs.shape[1] == rhs.shape[0])
+    return (lhs.shape[0], rhs.shape[1])
+  elif rhs.ndim == 1:
+    require(lhs.shape[-1] == rhs.shape[0])
+    return lhs.shape[:-1]
+  else:
+    require(lhs.shape[-1] == rhs.shape[-2])
+    return lhs.shape[:-1] + rhs.shape[:-2] + rhs.shape[-1:]
+
+def _dot_transpose_lhs(t, rhs):
+  if onp.ndim(t) == onp.ndim(rhs) == 2:
+    return dot(t, transpose(rhs, (1, 0)))
+  elif onp.ndim(t) == 1 and onp.ndim(rhs) == 2:
+    return dot(rhs, t)
+  elif onp.ndim(t) == onp.ndim(rhs) == 1:
+    return _outer(t, rhs)
+  elif onp.ndim(t) == 0 or onp.ndim(rhs) == 0:
+    return mul(t, rhs)
+  else:
+    raise TypeError
+
+def _dot_transpose_rhs(t, lhs):
+  if onp.ndim(lhs) == onp.ndim(t) == 2:
+    return dot(transpose(lhs, (1, 0)), t)
+  elif onp.ndim(lhs) == 2 and onp.ndim(t) == 1:
+    return dot(t, lhs)
+  elif onp.ndim(t) == onp.ndim(lhs) == 1:
+    return _outer(lhs, t)
+  elif onp.ndim(t) == 0 or onp.ndim(lhs) == 0:
+    return mul(t, lhs)
+  else:
+    raise TypeError
+
+def _outer(x, y):
+  assert onp.ndim(x) == onp.ndim(y) == 1
+  return mul(reshape(x, (x.shape[0], 1)), reshape(y, (1, y.shape[0])))
+
+def _dot_batch_rule(batched_args, batch_dims):
+  lhs, rhs = batched_args
+  lbd, rbd = batch_dims
+  T = lambda x: transpose(x, onp.arange(onp.ndim(x))[::-1])
+
+  # in some cases, we can call dot instead of dot_general
+  if max(onp.ndim(lhs), onp.ndim(rhs)) <= 2:
+    if rbd is None:
+      assert lbd in (0, 1)
+      if lbd == 0:
+        return dot(lhs, rhs), 0
+      else:
+        return dot(T(rhs), lhs), onp.ndim(rhs) - 1
+
+    if lbd is None:
+      assert rbd in (0, 1)
+      if rbd == onp.ndim(rhs) - 1:
+        return dot(lhs, rhs), onp.ndim(lhs) - 1
+      else:
+        return dot(rhs, T(lhs)), 0
+
+    assert lbd is not None and rbd is not None
+    assert lhs.ndim == rhs.ndim == 2  # dot only supports rank 1 and above
+    lhs = batching.move_dim_to_front(lhs, lbd)
+    rhs = batching.move_dim_to_front(rhs, rbd)
+    return dot_general(lhs, rhs, [((1,), (1,)), ((0,), (0,))]), 0
+
+  if lbd is None:
+    assert rbd is not None
+    lhs = broadcast(lhs, (rhs.shape[rbd],))
+  else:
+    lhs = batching.move_dim_to_front(lhs, lbd)
+  lhs_batch = (0,)
+  lhs_contracting = (onp.ndim(lhs) - 1,)
+
+  if rbd is None:
+    assert lbd is not None
+    rhs = broadcast(rhs, (lhs.shape[0],))
+  else:
+    rhs = batching.move_dim_to_front(rhs, rbd)
+  rhs_batch = (0,)
+  rhs_contracting = (onp.arange(1, onp.ndim(rhs))[-2:][0],)
+
+  dim_nums = [(lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch)]
+  return dot_general(lhs, rhs, dim_nums), 0
+
+_dot_dtype_rule = partial(binop_dtype_rule, _input_dtype, [_num, _num], 'dot')
+dot_p = standard_primitive(_dot_shape_rule, _dot_dtype_rule, 'dot')
+ad.defbilinear(dot_p, _dot_transpose_lhs, _dot_transpose_rhs)
+batching.primitive_batchers[dot_p] = _dot_batch_rule
 
 
-def _dot_general_shape_rule(lhs, rhs, dimension_numbers, precision):
+def _dot_general_shape_rule(lhs, rhs, dimension_numbers):
   (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
   if len(lhs_batch) != len(rhs_batch):
     msg = ("dot_general requires equal numbers of lhs_batch and rhs_batch "
@@ -2118,12 +2138,11 @@ def _dot_general_shape_rule(lhs, rhs, dimension_numbers, precision):
   return batch_shape + lhs_tensored_shape + rhs_tensored_shape
 
 
-def _dot_general_dtype_rule(lhs, rhs, dimension_numbers, precision):
+def _dot_general_dtype_rule(lhs, rhs, dimension_numbers):
   return binop_dtype_rule(_input_dtype, [_num, _num], 'dot_general', lhs, rhs)
 
 
-def _dot_general_transpose_lhs(g, y, dimension_numbers, precision,
-                               swap_ans=False):
+def _dot_general_transpose_lhs(g, y, dimension_numbers, swap_ans=False):
   (x_contract, y_contract), (x_batch, y_batch) = dimension_numbers
   x_ndim = g.ndim - y.ndim + len(x_batch) + 2 * len(x_contract)
   x_kept = remaining(range(x_ndim), x_contract, x_batch)
@@ -2135,122 +2154,50 @@ def _dot_general_transpose_lhs(g, y, dimension_numbers, precision,
   dims = ((ans_y, y_kept), (ans_batch, y_batch))
   x_contract_sorted_by_y = list(onp.take(x_contract, onp.argsort(y_contract)))
   out_axes = onp.argsort(list(x_batch) + x_kept + x_contract_sorted_by_y)
-  return transpose(dot_general(g, y, dims, precision=precision),
-                   tuple(out_axes))
+  return transpose(dot_general(g, y, dims), tuple(out_axes))
 
-def _dot_general_transpose_rhs(g, x, dimension_numbers, precision):
+def _dot_general_transpose_rhs(g, x, dimension_numbers):
   (x_contract, y_contract), (x_batch, y_batch) = dimension_numbers
   swapped_dimension_numbers = ((y_contract, x_contract), (y_batch, x_batch))
-  return _dot_general_transpose_lhs(g, x, swapped_dimension_numbers,
-                                    precision, swap_ans=True)
+  return _dot_general_transpose_lhs(g, x, swapped_dimension_numbers, True)
 
 
-def _dot_general_batch_rule(batched_args, batch_dims, dimension_numbers,
-                            precision):
-  # there are three kinds of dimensions in a dot_general:
-  # - contraction dimensions appear in lhs and rhs but not the result
-  # - batch dimensions appear in lhs, rhs, and result
-  # - tensor product dimensions appear in the result and one of lhs or rhs
+def _dot_general_batch_rule(batched_args, batch_dims, dimension_numbers):
   (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
   lhs, rhs = batched_args
   lbd, rbd = batch_dims
   assert lbd is not None or rbd is not None
-  if lbd is not None and rbd is not None:
-    # adding a batch dimension
+
+  if lbd is not None:
     if lbd != 0:
-      lhs = batching.moveaxis(lhs, lbd, 0)
+      lhs = batching.move_dim_to_front(lhs, lbd)
+      lbd = 0
+  else:
+    assert rbd is not None
+    lhs = broadcast(lhs, (rhs.shape[rbd],))
+  lhs_contract = tuple(onp.add(1, lhs_contract))
+  lhs_batch = (0,) + tuple(onp.add(1, lhs_batch))
+
+  if rbd is not None:
     if rbd != 0:
-      rhs = batching.moveaxis(rhs, rbd, 0)
-    lhs_batch = (0,) + tuple(onp.add(1, lhs_batch))
-    rhs_batch = (0,) + tuple(onp.add(1, rhs_batch))
-    lhs_contract = tuple(onp.add(1, lhs_contract))
-    rhs_contract = tuple(onp.add(1, rhs_contract))
-    result_batch_dim = 0
+      rhs = batching.move_dim_to_front(rhs, rbd)
+      rbd = 0
   else:
-    # adding a tensor product dimension
-    if lbd is not None:
-      if lhs_batch == () or lbd > onp.max(lhs_batch):
-        # can avoid transposes
-        bump_lhs_contract = onp.greater_equal(lhs_contract, lbd)
-        lhs_contract = tuple(onp.add(lhs_contract, bump_lhs_contract))
-        result_batch_dim = lbd - len(lhs_contract) + sum(bump_lhs_contract)
-      else:
-        # move the new dimension to the end of lhs to avoid changing batch dims
-        lhs = batching.moveaxis(lhs, lbd, lhs.ndim - 1)
-        # lhs tensor product dims in result come after batch dims
-        result_batch_dim = lhs.ndim - len(lhs_contract) - 1
-    else:
-      if rhs_batch == () or rbd > onp.max(rhs_batch):
-        # can avoid transposes
-        bump_rhs_contract = onp.greater_equal(rhs_contract, rbd)
-        rhs_contract = tuple(onp.add(rhs_contract, bump_rhs_contract))
-        result_batch_dim = (rbd + (lhs.ndim - len(lhs_contract) - len(lhs_batch))
-                                - (len(rhs_contract) - sum(bump_rhs_contract)))
-      else:
-        # move the new dimension to the end of rhs to avoid changing batch dims
-        rhs = batching.moveaxis(rhs, rbd, rhs.ndim - 1)
-        # rhs tensor product dims in result come after batch dims + lhs tensor
-        # product dims
-        result_batch_dim = (lhs.ndim - len(lhs_contract) - len(lhs_batch) +
-                            rhs.ndim - len(rhs_contract) - 1)
+    assert lbd is not None
+    rhs = broadcast(rhs, (lhs.shape[lbd],))
+  rhs_contract = tuple(onp.add(1, rhs_contract))
+  rhs_batch = (0,) + tuple(onp.add(1, rhs_batch))
+
   new_dimension_numbers = [(lhs_contract, rhs_contract), (lhs_batch, rhs_batch)]
-  batched_out = dot_general(lhs, rhs, new_dimension_numbers,
-                            precision=precision)
-  return batched_out, int(result_batch_dim)
+  batched_out = dot_general(lhs, rhs, new_dimension_numbers)
+  return batched_out, 0
 
-def _dot_general_translation_rule(c, lhs, rhs, dimension_numbers, precision):
-  return c.DotGeneral(lhs, rhs, dimension_numbers,
-                      precision_config=_precision_config(precision))
-
-def _dot_general_polymorphic_shape_rule(shape_exprs, dimension_numbers,
-                                        precision):
-  del precision  # Unused.
-  lhs_shape, rhs_shape = shape_exprs
-  lhs_ndim, rhs_ndim = len(lhs_shape), len(rhs_shape)
-  (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
-
-  lhs_batch_shape = [lhs_shape[d] for d in lhs_batch]
-  rhs_batch_shape = [rhs_shape[d] for d in rhs_batch]
-  if lhs_batch_shape != rhs_batch_shape: raise ShapeError
-
-  lhs_contract_shape = [lhs_shape[d] for d in lhs_contract]
-  rhs_contract_shape = [rhs_shape[d] for d in rhs_contract]
-  if lhs_contract_shape != rhs_contract_shape: raise ShapeError
-
-  lhs_tensorprod_shape = [lhs_shape[d] for d in range(lhs_ndim)
-                          if d not in lhs_batch and d not in lhs_contract]
-  rhs_tensorprod_shape = [rhs_shape[d] for d in range(rhs_ndim)
-                          if d not in rhs_batch and d not in rhs_contract]
-  return ShapeExpr(
-      lhs_batch_shape + lhs_tensorprod_shape + rhs_tensorprod_shape)
-
-def _dot_general_masking_rule(padded_vals, logical_shapes, dimension_numbers,
-                              precision):
-  lhs, rhs = padded_vals
-  lhs_shape, rhs_shape = logical_shapes
-  lhs_ndim, rhs_ndim = len(lhs_shape), len(rhs_shape)
-  (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
-
-  # we need only mask the lhs contraction dimensions
-  if len(lhs_contract) == 0:
-    return dot_general(lhs, rhs, dimension_numbers, precision=precision)
-  else:
-    masks = [broadcasted_iota(onp.int32, lhs.shape, d) < lhs_shape[d]
-            for d in lhs_contract]
-    mask_intersection = masks[0]
-    for mask in masks[1:]:
-      mask_intersection &= mask
-    masked_lhs = select(mask_intersection, lhs, zeros_like_array(lhs))
-    return dot_general(masked_lhs, rhs, dimension_numbers, precision=precision)
 
 dot_general_p = standard_primitive(_dot_general_shape_rule,
-                                   _dot_general_dtype_rule, 'dot_general',
-                                   _dot_general_translation_rule)
+                                   _dot_general_dtype_rule, 'dot_general')
 ad.defbilinear(dot_general_p,
                _dot_general_transpose_lhs, _dot_general_transpose_rhs)
 batching.primitive_batchers[dot_general_p] = _dot_general_batch_rule
-masking.shape_rules[dot_general_p] = _dot_general_polymorphic_shape_rule
-masking.masking_rules[dot_general_p] = _dot_general_masking_rule
 
 
 def _broadcast_shape_rule(operand, sizes):
@@ -2291,16 +2238,31 @@ def _broadcast_in_dim_batch_rule(batched_args, batch_dims, shape,
                                  broadcast_dimensions):
   operand, = batched_args
   bdim, = batch_dims
-  new_operand = batching.moveaxis(operand, bdim, 0)
-  new_shape = (operand.shape[bdim],) + shape
-  new_broadcast_dimensions = (0,) + tuple(onp.add(1, broadcast_dimensions))
-  return broadcast_in_dim(new_operand, new_shape, new_broadcast_dimensions), 0
+  new_shape = list(shape)
+  new_shape.insert(bdim, operand.shape[bdim])
+  new_broadcast_dimensions = [d if d < bdim else d + 1 for d in broadcast_dimensions]
+  new_broadcast_dimensions.insert(bdim, bdim)
+  return broadcast_in_dim(operand, new_shape, new_broadcast_dimensions), bdim
+
+def _broadcast_in_dim_papply_rule(name, size, vals, dims, shape,
+                                  broadcast_dimensions):
+  operand, = vals
+  dim, = dims
+  out_dim = broadcast_dimensions[dim]
+  if shape[out_dim] != shape[dim]:
+    raise ValueError(
+        "broadcast_in_dim changes hidden dimension size: {} to {}".format(
+            shape[dim], shape[out_dim]))
+  sub_bdims = tuple(onp.delete(broadcast_dimensions, dim))
+  sub_shape = tuple(onp.delete(shape, out_dim))
+  return broadcast_in_dim(operand, sub_shape, sub_bdims), out_dim
 
 
 broadcast_in_dim_p = standard_primitive(
     _broadcast_in_dim_shape_rule, _input_dtype, 'broadcast_in_dim')
 ad.deflinear(broadcast_in_dim_p, _broadcast_in_dim_transpose_rule)
 batching.primitive_batchers[broadcast_in_dim_p] = _broadcast_in_dim_batch_rule
+parallel.papply_primitive_rules[broadcast_in_dim_p] = _broadcast_in_dim_papply_rule
 
 
 def _clamp_shape_rule(min, operand, max):
@@ -2365,7 +2327,7 @@ def _concatenate_transpose_rule(t, *operands, **kwargs):
   operand_shapes = kwargs.pop('operand_shapes')
 
   if t is ad_util.zero:
-    return [ad_util.zero if o is ad.undefined_primal else None for o in operands]
+    return [ad_util.zero if o is None else None for o in operands]
   else:
     limit_points = onp.cumsum([shape[dimension] for shape in operand_shapes])
     starts = onp.zeros((len(operands), t.ndim), dtype=int)
@@ -2373,24 +2335,16 @@ def _concatenate_transpose_rule(t, *operands, **kwargs):
     limits = onp.tile(t.shape, (len(operands), 1))
     limits[:, dimension] = limit_points
 
-    return [slice(t, start, limit) if o is ad.undefined_primal else None
+    return [slice(t, start, limit) if o is None else None
             for o, start, limit in zip(operands, starts, limits)]
 
 def _concatenate_batch_rule(batched_args, batch_dims, dimension, operand_shapes):
   size = next(op.shape[bdim] for op, bdim in zip(batched_args, batch_dims)
               if bdim is not None)
-  operands = [batching.moveaxis(op, bdim, 0) if bdim is not None
+  operands = [batching.move_dim_to_front(op, bdim) if bdim is not None
               else broadcast(op, (size,))
               for op, bdim in zip(batched_args, batch_dims)]
   return concatenate(operands, dimension + 1), 0
-
-def _concat_polymorphic_shape_rule(shape_exprs, dimension, operand_shapes):
-  out_shape = list(shape_exprs[0])
-  out_shape[dimension] = _reduce(operator.add, [e[dimension] for e in shape_exprs])
-  return ShapeExpr(out_shape)
-
-# The concatenate_p masking rule requires use of a while-loop construct and so
-# is defined in lax_control_flow.py
 
 concatenate_p = standard_primitive(
     _concatenate_shape_rule, _concatenate_dtype_rule, 'concatenate',
@@ -2398,7 +2352,6 @@ concatenate_p = standard_primitive(
 ad.deflinear(concatenate_p, _concatenate_transpose_rule)
 ad.primitive_transposes[concatenate_p] = _concatenate_transpose_rule
 batching.primitive_batchers[concatenate_p] = _concatenate_batch_rule
-masking.shape_rules[concatenate_p] = _concat_polymorphic_shape_rule
 
 
 def _pad_shape_rule(operand, padding_value, padding_config):
@@ -2412,11 +2365,8 @@ def _pad_shape_rule(operand, padding_value, padding_config):
   return tuple(out_shape)
 
 def _pad_transpose(t, operand, padding_value, padding_config):
-  if t is ad_util.zero:
-    return [ad_util.zero if operand is ad.undefined_primal else None,
-            ad_util.zero if padding_value is ad.undefined_primal else None]
-
   lo, hi, interior = zip(*padding_config)
+
   total = lambda x: _reduce_sum(x, list(range(t.ndim)))
 
   def t_op():
@@ -2424,8 +2374,8 @@ def _pad_transpose(t, operand, padding_value, padding_config):
     unpadded = pad(t, onp.array(0., t.dtype), unpad_config)
     return slice(unpadded, onp.zeros_like(lo), unpadded.shape, onp.add(interior, 1))
 
-  t_operand = t_op() if operand is ad.undefined_primal else None
-  t_padv = sub(total(t), total(t_operand)) if padding_value is ad.undefined_primal else None
+  t_operand = t_op() if operand is None else None
+  t_padv = sub(total(t), total(t_operand)) if padding_value is None else None
 
   return [t_operand, t_padv]
 
@@ -2440,33 +2390,28 @@ def _pad_batch_rule(batched_args, batch_dims, padding_config):
   else:
     raise NotImplementedError  # loop and stack
 
+def _pad_papply_rule(name, size, vals, dims, padding_config):
+  operand, padding_value = vals
+  operand_dim, padding_value_dim = dims
+  assert padding_value_dim is None
+  padding_config = list(padding_config)
+  if padding_config[operand_dim] == (0, 0, 0):
+    padded = pad(
+        operand,
+        padding_value,
+        padding_config[:operand_dim] + padding_config[operand_dim + 1:])
+    return padded, operand_dim
+  else:
+    raise NotImplementedError(
+        'pad changes size of hidden dimension {} with config {}'.format(
+            operand_dim, padding_config))
+
 pad_p = standard_primitive(_pad_shape_rule, _input_dtype, 'pad')
 ad.deflinear(pad_p, _pad_transpose)
 ad.primitive_transposes[pad_p] = _pad_transpose
 batching.primitive_batchers[pad_p] = _pad_batch_rule
+parallel.papply_primitive_rules[pad_p] = _pad_papply_rule
 
-
-# We have a nonstandard reshape impl so that we can be lazy about data movement
-# for specific types, particularly ShardedDeviceArrays / ChunkedDeviceArrays
-def _reshape_impl(operand, new_sizes, dimensions, old_sizes):
-  if (type(operand) is pxla.ShardedDeviceArray and dimensions is None
-      and _is_axis_merge(old_sizes, new_sizes)):
-    aval = ShapedArray(new_sizes, operand.dtype)
-    return pxla.ChunkedDeviceArray(old_sizes[0], aval, operand.device_buffers)
-  elif (type(operand) is pxla.ChunkedDeviceArray and dimensions is None
-        and _is_axis_split(old_sizes, new_sizes)
-        and operand.axis_size == new_sizes[0]):
-    aval = ShapedArray(new_sizes, operand.dtype)
-    return pxla.ShardedDeviceArray(aval, operand.device_buffers)
-  else:
-    return xla.apply_primitive(reshape_p, operand, new_sizes=new_sizes,
-                               dimensions=dimensions, old_sizes=old_sizes)
-
-def _is_axis_merge(s1, s2):
-  return s1[2:] == s2[1:] and s1[0] * s1[1] == s2[0]
-
-def _is_axis_split(s1, s2):
-  return _is_axis_merge(s2, s1)
 
 def _reshape_shape_rule(operand, new_sizes, dimensions, **unused_kwargs):
   if not onp.all(onp.greater_equal(new_sizes, 0)):
@@ -2499,23 +2444,16 @@ def _reshape_transpose_rule(t, new_sizes, dimensions, old_sizes):
 def _reshape_batch_rule(batched_args, batch_dims, new_sizes, dimensions, **unused):
   operand, = batched_args
   bdim, = batch_dims
-  operand = batching.moveaxis(operand, bdim, 0)
+  operand = batching.move_dim_to_front(operand, bdim)
   if dimensions is not None:
+    raise NotImplementedError  # TODO(mattjj): handle reshape w/ dimensions
     dimensions = (0,) + tuple(onp.add(1, dimensions))
   return reshape(operand, operand.shape[:1] + new_sizes, dimensions), 0
 
-def _reshape_polymorphic_shape_rule(shape_exprs, new_sizes, dimensions, old_sizes):
-  if dimensions is not None: raise NotImplementedError
-  shape_expr, = shape_exprs
-  if masking.prod(shape_expr) != masking.prod(new_sizes): raise ShapeError
-  return new_sizes
-
 reshape_p = standard_primitive(_reshape_shape_rule, _reshape_dtype_rule,
                                'reshape', _reshape_translation_rule)
-reshape_p.def_impl(_reshape_impl)
 ad.deflinear(reshape_p, _reshape_transpose_rule)
 batching.primitive_batchers[reshape_p] = _reshape_batch_rule
-masking.shape_rules[reshape_p] = _reshape_polymorphic_shape_rule
 
 
 def _rev_shape_rule(operand, dimensions):
@@ -2581,16 +2519,16 @@ def _select_dtype_rule(pred, on_true, on_false):
   return on_true.dtype
 
 def _select_transpose_rule(t, pred, on_true, on_false):
-  assert pred is not ad.undefined_primal
+  assert pred is not None
   if t is ad_util.zero:
     return [None,
-            ad_util.zero if on_true is ad.undefined_primal else None,
-            ad_util.zero if on_false is ad.undefined_primal else None]
+            ad_util.zero if on_true is None else None,
+            ad_util.zero if on_false is None else None]
   else:
     zeros = full_like(t, 0)
     return [None,
-            select(pred, t, zeros) if on_true is ad.undefined_primal else None,
-            select(pred, zeros, t) if on_false is ad.undefined_primal else None]
+            select(pred, t, zeros) if on_true is None else None,
+            select(pred, zeros, t) if on_false is None else None]
 
 def _select_batch_rule(batched_args, batch_dims, **unused_kwargs):
   pred, on_true, on_false, = batched_args
@@ -2610,23 +2548,19 @@ def _select_batch_rule(batched_args, batch_dims, **unused_kwargs):
   elif onp.ndim(pred) == 0 and ot_bdim is not None and of_bdim is not None:
     if ot_bdim == of_bdim:
       return select(pred, on_true, on_false), ot_bdim
-    elif onp.shape(on_true) == onp.shape(on_false):
-      on_false = batching.moveaxis(on_false, of_bdim, ot_bdim)
+    else:
+      assert onp.shape(on_true) == onp.shape(on_false)
+      on_false = batching.moveaxis(size, ot_bdim, of_bdim, on_false)
       return select(pred, on_true, on_false), ot_bdim
 
-  pred = batching.bdim_at_front(pred, pred_bdim, size) if onp.shape(pred) else pred
-  if not onp.shape(on_true) == onp.shape(on_false) == ():
-    on_true = batching.bdim_at_front(on_true, ot_bdim, size)
-    on_false = batching.bdim_at_front(on_false, of_bdim, size)
+  pred = batching.bdim_at_front(pred, pred_bdim, size, force_broadcast=True)
+  on_true = batching.bdim_at_front(on_true, ot_bdim, size, force_broadcast=True)
+  on_false = batching.bdim_at_front(on_false, of_bdim, size, force_broadcast=True)
   assert onp.shape(on_true) == onp.shape(on_false)
   if 0 < onp.ndim(pred) < onp.ndim(on_true):
     # vmapped function had a scalar pred with nonscalar args
     assert onp.ndim(pred) == 1
     pred = broadcast_in_dim(pred, on_true.shape, [0])
-  if onp.ndim(pred) > onp.ndim(on_true):
-    assert onp.ndim(on_true) == 0
-    on_true = broadcast(on_true, pred.shape)
-    on_false = broadcast(on_false, pred.shape)
   return select(pred, on_true, on_false), 0
 
 select_p = standard_primitive(_select_shape_rule, _select_dtype_rule, 'select')
@@ -2716,14 +2650,34 @@ def _slice_batching_rule(batched_args, batch_dims, start_indices, limit_indices,
   out = slice(operand, new_start_indices, new_limit_indices, new_strides)
   return out, bdim
 
+def _slice_papply_rule(name, size, vals, dims, start_indices, limit_indices,
+                       strides, **kwargs):
+  operand, = vals
+  dim, = dims
+  start_indices = list(start_indices)
+  limit_indices = list(limit_indices)
+
+  if (start_indices[dim] != 0 or
+      limit_indices[dim] != size or
+      strides is not None and strides[dim] != 1):
+    raise NotImplementedError('slice changes side of hidden dimension')
+
+  out = slice(
+      operand,
+      start_indices[:dim] + start_indices[dim + 1:],
+      limit_indices[:dim] + limit_indices[dim + 1:],
+      strides[:dim] + strides[dim + 1:] if strides is not None else None)
+  return out, dim
+
 slice_p = standard_primitive(_slice_shape_rule, _input_dtype, 'slice',
                              _slice_translation_rule)
 ad.deflinear(slice_p, _slice_transpose_rule)
 batching.primitive_batchers[slice_p] = _slice_batching_rule
+parallel.papply_primitive_rules[slice_p] = _slice_papply_rule
 
 
-def _dynamic_slice_shape_rule(operand, *start_indices, **kwargs):
-  slice_sizes = kwargs["slice_sizes"]
+def _dynamic_slice_shape_rule(operand, start_indices, slice_sizes,
+                              operand_shape):
   if operand.ndim != len(start_indices):
     msg = ("dynamic_slice start_indices must have length equal to the number "
            "of dimensions of the operand, got indices {} for operand shape {}.")
@@ -2742,42 +2696,19 @@ def _dynamic_slice_shape_rule(operand, *start_indices, **kwargs):
     raise TypeError(msg.format(slice_sizes))
   return tuple(slice_sizes)
 
-def _dynamic_slice_dtype_rule(operand, *start_indices, **kw):
-  if any(i.dtype != start_indices[0].dtype or
-         not onp.issubdtype(i.dtype, onp.integer) for i in start_indices):
-    msg = ("index arguments to dynamic_slice must be integers of the same "
-           "type, got: {}")
-    raise TypeError(msg.format(", ".join(i.dtype.name for i in start_indices)))
-  return operand.dtype
-
-def _dynamic_slice_translation_rule(c, operand, *start_indices, **kwargs):
-  slice_sizes = kwargs["slice_sizes"]
+def _dynamic_slice_translation_rule(c, operand, start_indices, slice_sizes,
+                                    operand_shape):
   return c.DynamicSlice(operand, start_indices, slice_sizes)
 
-def _dynamic_slice_jvp(primals, tangents, slice_sizes, operand_shape):
-  tangent_out = ad_util.zero
-  if tangents[0] is not ad_util.zero:
-    tangent_out = dynamic_slice(tangents[0], primals[1:], slice_sizes)
-  return dynamic_slice(primals[0], primals[1:], slice_sizes), tangent_out
+def _dynamic_slice_jvp_rule(g, operand, start_indices, slice_sizes,
+                            operand_shape):
+  return dynamic_slice(g, start_indices, slice_sizes)
 
-def _dynamic_slice_transpose_rule(t, operand, *start_indices, **kwargs):
-  operand_shape = kwargs["operand_shape"]
-  assert operand is ad.undefined_primal
-  assert all(s is not ad.undefined_primal for s in start_indices)
+def _dynamic_slice_transpose_rule(t, operand, start_indices, slice_sizes,
+                                  operand_shape):
+  assert operand is None
   zeros = full(operand_shape, tie_in(t, _zero(t)))
-  return ([dynamic_update_slice(zeros, t, start_indices)] +
-          [None] * len(start_indices))
-
-def _batch_dynamic_slice_indices(indices, bdims):
-  size = next((x.shape[i] for x, i in zip(indices, bdims) if i is not None), -1)
-  if size < 0:
-    return concatenate([reshape(i, [1]) for i in indices], 0), None
-  indices = concatenate(
-    [broadcast_in_dim(x, (size, 1),
-                      broadcast_dimensions=((0,) if i is not None else ()))
-     for x, i in zip(indices, bdims)],
-    dimension=1)
-  return indices, 0
+  return [dynamic_update_slice(zeros, t, start_indices), ad_util.zero]
 
 def _dynamic_slice_batching_rule(batched_args, batch_dims, slice_sizes,
                                  operand_shape):
@@ -2788,22 +2719,20 @@ def _dynamic_slice_batching_rule(batched_args, batch_dims, slice_sizes,
   dims = tuple(range(len(operand_shape)))
   dnums = GatherDimensionNumbers(offset_dims=dims, collapsed_slice_dims=(),
                                  start_index_map=dims)
-  index, index_bdim = _batch_dynamic_slice_indices(batched_args[1:],
-                                                   batch_dims[1:])
-  return _gather_batching_rule(
-    [batched_args[0], index], [batch_dims[0], index_bdim], dnums, slice_sizes,
-    operand_shape)
+  return _gather_batching_rule(batched_args, batch_dims, dnums, slice_sizes,
+                               operand_shape)
 
 
 dynamic_slice_p = standard_primitive(
-    _dynamic_slice_shape_rule, _dynamic_slice_dtype_rule, 'dynamic_slice',
+    _dynamic_slice_shape_rule, _input_dtype, 'dynamic_slice',
     _dynamic_slice_translation_rule)
-ad.primitive_jvps[dynamic_slice_p] = _dynamic_slice_jvp
+ad.defjvp(dynamic_slice_p, _dynamic_slice_jvp_rule, None)
 ad.primitive_transposes[dynamic_slice_p] = _dynamic_slice_transpose_rule
 batching.primitive_batchers[dynamic_slice_p] = _dynamic_slice_batching_rule
 
 
-def _dynamic_update_slice_shape_rule(operand, update, *start_indices, **kwargs):
+def _dynamic_update_slice_shape_rule(operand, update, start_indices,
+                                     update_shape):
   if operand.ndim != update.ndim:
     msg = ("dynamic_update_slice update must have the same rank as operand, "
            "got update shape {} for operand shape {}.")
@@ -2818,19 +2747,15 @@ def _dynamic_update_slice_shape_rule(operand, update, *start_indices, **kwargs):
     raise TypeError(msg.format(update.shape, operand.shape))
   return operand.shape
 
-def _dynamic_update_slice_dtype_rule(operand, update, *start_indices, **kwargs):
+def _dynamic_update_slice_dtype_rule(operand, update, start_indices,
+                                     update_shape):
   _check_same_dtypes("dynamic_update_slice", False, operand.dtype, update.dtype)
-  if any(i.dtype != start_indices[0].dtype or
-         not onp.issubdtype(i.dtype, onp.integer) for i in start_indices):
-    msg = ("index arguments to dynamic_update_slice must be integers of the "
-           "same type, got {}")
-    raise TypeError(msg.format(", ".join(i.dtype.name for i in start_indices)))
   return operand.dtype
 
 def _dynamic_update_slice_jvp(primals, tangents, update_shape):
-  operand, update = primals[:2]
-  start_indices = primals[2:]
-  g_operand, g_update = tangents[:2]
+  operand, update, start_indices = primals
+  g_operand, g_update, g_start_indices = tangents
+  assert g_start_indices is ad_util.zero
   val_out = dynamic_update_slice(operand, update, start_indices)
   if g_operand is ad_util.zero and g_update is ad_util.zero:
     tangent_out = ad_util.zero
@@ -2840,19 +2765,18 @@ def _dynamic_update_slice_jvp(primals, tangents, update_shape):
     tangent_out = dynamic_update_slice(g_operand, g_update, start_indices)
   return val_out, tangent_out
 
-def _dynamic_update_slice_transpose_rule(t, operand, update, *start_indices,
-                                         **kwargs):
-  update_shape = kwargs["update_shape"]
-  assert all(x is not ad.undefined_primal for x in start_indices)
+def _dynamic_update_slice_transpose_rule(t, operand, update, start_indices,
+                                         update_shape):
+  assert start_indices is not None
   dus = dynamic_update_slice
   ds = dynamic_slice
   zeros = _zeros(t, shape=update_shape)
-  operand_t = dus(t, zeros, start_indices) if operand is ad.undefined_primal else None
-  update_t = ds(t, start_indices, update_shape) if update is ad.undefined_primal else None
-  return [operand_t, update_t] + [None] * len(start_indices)
+  operand_t = dus(t, zeros, start_indices) if operand is None else None
+  update_t = ds(t, start_indices, update_shape) if update is None else None
+  return [operand_t, update_t, None]
 
-def _dynamic_update_slice_translation_rule(c, operand, update, *start_indices,
-                                           **kwargs):
+def _dynamic_update_slice_translation_rule(c, operand, update, start_indices,
+                                           update_shape):
   return c.DynamicUpdateSlice(operand, update, start_indices)
 
 def _dynamic_update_slice_batching_rule(batched_args, batch_dims, update_shape):
@@ -2860,17 +2784,15 @@ def _dynamic_update_slice_batching_rule(batched_args, batch_dims, update_shape):
   # scatter batching rule.
   # TODO(phawkins): consider removing dynamic_update_slice entirely and using
   # scatter always.
-  operand, update = batched_args[:2]
-  operand_bdims, update_bdims = batch_dims[:2]
+  operand, update, index = batched_args
+  operand_bdims, update_bdims, index_bdims = batch_dims
   dims = tuple(range(len(update_shape)))
   dnums = ScatterDimensionNumbers(update_window_dims=dims,
                                   inserted_window_dims=(),
                                   scatter_dims_to_operand_dims=dims)
-  index, index_bdim = _batch_dynamic_slice_indices(batched_args[2:],
-                                                   batch_dims[2:])
   return _scatter_batching_rule(
     scatter,
-    (operand, index, update), (operand_bdims, index_bdim, update_bdims),
+    (operand, index, update), (operand_bdims, index_bdims, update_bdims),
     None, None, dnums, update_shape)
 
 
@@ -2911,7 +2833,7 @@ class GatherDimensionNumbers(collections.namedtuple(
 
 def _gather_dimensions_proto(indices_shape, dimension_numbers):
   assert type(dimension_numbers) is GatherDimensionNumbers
-  proto = xla_client.GatherDimensionNumbers()
+  proto = xla_bridge.xla_data_pb2.GatherDimensionNumbers()
   proto.offset_dims.extend(dimension_numbers.offset_dims)
   proto.collapsed_slice_dims.extend(dimension_numbers.collapsed_slice_dims)
   proto.start_index_map.extend(dimension_numbers.start_index_map)
@@ -2950,7 +2872,7 @@ def _gather_jvp_rule(g, operand, start_indices, dimension_numbers, slice_sizes,
 
 def _gather_transpose_rule(t, operand, start_indices, dimension_numbers,
                           slice_sizes, operand_shape):
-  assert operand is ad.undefined_primal
+  assert operand is None
   if t is ad_util.zero:
     return [ad_util.zero, ad_util.zero]
   zeros = full(operand_shape, tie_in(t, _zero(t)))
@@ -2966,7 +2888,7 @@ def _gather_batching_rule(batched_args, batch_dims, dimension_numbers,
   operand_bdim, start_indices_bdim = batch_dims
 
   if operand_bdim is not None and start_indices_bdim is None:
-    operand = batching.moveaxis(operand, operand_bdim, 0)
+    operand = batching.move_dim_to_front(operand, operand_bdim)
     slice_sizes = (operand.shape[0],) + slice_sizes
     offset_dims = (0,) + tuple(onp.add(1, dimension_numbers.offset_dims))
     collapsed_slice_dims = tuple(onp.add(1, dimension_numbers.collapsed_slice_dims))
@@ -2979,7 +2901,7 @@ def _gather_batching_rule(batched_args, batch_dims, dimension_numbers,
                   slice_sizes=slice_sizes), 0
 
   elif operand_bdim is None and start_indices_bdim is not None:
-    start_indices = batching.moveaxis(start_indices, start_indices_bdim, 0)
+    start_indices = batching.move_dim_to_front(start_indices, start_indices_bdim)
     offset_dims = tuple(onp.add(1, dimension_numbers.offset_dims))
     dnums = GatherDimensionNumbers(
         offset_dims=offset_dims,
@@ -2990,8 +2912,8 @@ def _gather_batching_rule(batched_args, batch_dims, dimension_numbers,
 
   else:
     # move our batch dimensions to the front to preserve sanity
-    operand = batching.moveaxis(operand, operand_bdim, 0)
-    start_indices = batching.moveaxis(start_indices, start_indices_bdim, 0)
+    operand = batching.move_dim_to_front(operand, operand_bdim)
+    start_indices = batching.move_dim_to_front(start_indices, start_indices_bdim)
 
     # Example: user code had start_indices shape (3, 4, 5), and we have to deal
     # with start_indices shape (7, 3, 4, 5). We transform that to a
@@ -3014,13 +2936,35 @@ def _gather_batching_rule(batched_args, batch_dims, dimension_numbers,
     return gather(operand, start_indices, dimension_numbers=dnums,
                   slice_sizes=slice_sizes), 0
 
+def _gather_papply_rule(
+    name, size, vals, dims, dimension_numbers, slice_sizes, operand_shape):
+  operand, start_indices = vals
+  operand_dim, start_indices_dim = dims
+  if (operand_dim is None and
+      start_indices_dim is not None and
+      start_indices_dim not in dimension_numbers.offset_dims and
+      dimension_numbers.collapsed_slice_dims == (0,)):
+    offset_dims = tuple(i - 1 if i > start_indices_dim else i
+                        for i in dimension_numbers.offset_dims)
+    dnums = GatherDimensionNumbers(
+        offset_dims=offset_dims,
+        collapsed_slice_dims=dimension_numbers.collapsed_slice_dims,
+        start_index_map=dimension_numbers.start_index_map)
+    out = gather(operand, start_indices, dimension_numbers=dnums,
+                  slice_sizes=slice_sizes)
+    out_dim = start_indices_dim + onp.sum(
+        onp.less_equal(offset_dims, start_indices_dim))
+    return out, out_dim
+  else:
+    raise NotImplementedError
+
 gather_p = standard_primitive(
     _gather_shape_rule, _gather_dtype_rule, 'gather',
     _gather_translation_rule)
 ad.defjvp(gather_p, _gather_jvp_rule, None)
 ad.primitive_transposes[gather_p] = _gather_transpose_rule
 batching.primitive_batchers[gather_p] = _gather_batching_rule
-
+parallel.papply_primitive_rules[gather_p] = _gather_papply_rule
 
 class ScatterDimensionNumbers(collections.namedtuple(
     "ScatterDimensionNumbers",
@@ -3050,7 +2994,7 @@ class ScatterDimensionNumbers(collections.namedtuple(
 
 def _scatter_dimensions_proto(indices_shape, dimension_numbers):
   assert type(dimension_numbers) is ScatterDimensionNumbers
-  proto = xla_client.ScatterDimensionNumbers()
+  proto = xla_bridge.xla_data_pb2.ScatterDimensionNumbers()
   proto.update_window_dims.extend(dimension_numbers.update_window_dims)
   proto.inserted_window_dims.extend(dimension_numbers.inserted_window_dims)
   proto.scatter_dims_to_operand_dims.extend(
@@ -3070,11 +3014,11 @@ def _scatter_shape_rule(operand, scatter_indices, updates, **kwargs):
 
 def _scatter_translation_rule(c, operand, scatter_indices, updates,
                               update_jaxpr, update_consts, dimension_numbers,
-                              updates_shape, backend=None):
+                              updates_shape):
   dtype = c.GetShape(operand).numpy_dtype()
   init_value = c.Constant(onp.array(0, dtype))
   update_computation = _reduction_computation(
-      c, update_jaxpr, backend, update_consts, init_value)
+      c, update_jaxpr, update_consts, init_value)
   indices_shape = c.GetShape(scatter_indices)
   return c.Scatter(operand, scatter_indices, updates, update_computation,
                   _scatter_dimensions_proto(indices_shape, dimension_numbers))
@@ -3083,6 +3027,7 @@ def _scatter_add_jvp(primals, tangents, update_jaxpr, update_consts,
                      dimension_numbers, updates_shape):
   operand, scatter_indices, updates = primals
   g_operand, g_scatter_indices, g_updates = tangents
+  assert g_scatter_indices is ad_util.zero
   val_out = scatter_add_p.bind(
       operand, scatter_indices, updates, update_jaxpr=update_jaxpr,
       update_consts=update_consts, dimension_numbers=dimension_numbers,
@@ -3101,15 +3046,15 @@ def _scatter_add_jvp(primals, tangents, update_jaxpr, update_consts,
 def _scatter_add_transpose_rule(t, operand, scatter_indices, updates,
                                 update_jaxpr, update_consts, dimension_numbers,
                                 updates_shape):
-  assert scatter_indices is not ad.undefined_primal
+  assert scatter_indices is not None
   if t is ad_util.zero:
     return [ad_util.zero, None, ad_util.zero]
 
   operand_t = update_t = None
-  if operand is ad.undefined_primal:
+  if operand is None:
     operand_t = t
 
-  if updates is ad.undefined_primal:
+  if updates is None:
     gather_dnums = GatherDimensionNumbers(
       offset_dims=dimension_numbers.update_window_dims,
       collapsed_slice_dims=dimension_numbers.inserted_window_dims,
@@ -3137,7 +3082,8 @@ def _scatter_batching_rule(
   # it at the front (so that we can scatter into it)
   size = next(x.shape[ax] for x, ax in zip(batched_args, batch_dims)
               if ax is not None)
-  operand = batching.bdim_at_front(operand, operand_bdim, size)
+  operand = batching.bdim_at_front(operand, operand_bdim, broadcast_size=size,
+                                   force_broadcast=True)
   operand_bdim = 0
 
   if scatter_indices_bdim is not None and updates_bdim is None:
@@ -3145,7 +3091,7 @@ def _scatter_batching_rule(
     updates_bdim = 0
 
   if scatter_indices_bdim is None and updates_bdim is not None:
-    updates = batching.moveaxis(updates, updates_bdim, 0)
+    updates = batching.move_dim_to_front(updates, updates_bdim)
     inserted_window_dims = tuple(onp.add(1, dimension_numbers.inserted_window_dims))
     update_window_dims = (0,) + tuple(onp.add(1, dimension_numbers.update_window_dims))
     scatter_dims_to_operand_dims = tuple(onp.add(1, dimension_numbers.scatter_dims_to_operand_dims))
@@ -3156,8 +3102,9 @@ def _scatter_batching_rule(
     return scatter_op(operand, scatter_indices, updates, dnums), 0
   else:
     # see the third case in _gather_batching_rule for comparison and comments
-    scatter_indices = batching.moveaxis(scatter_indices, scatter_indices_bdim, 0)
-    updates = batching.moveaxis(updates, updates_bdim, 0)
+    scatter_indices = batching.move_dim_to_front(scatter_indices,
+                                                 scatter_indices_bdim)
+    updates = batching.move_dim_to_front(updates, updates_bdim)
 
     count_shape = list(scatter_indices.shape)
     count_shape[-1] = 1
@@ -3175,7 +3122,7 @@ def _scatter_batching_rule(
         scatter_dims_to_operand_dims=scatter_dims_to_operand_dims)
     return scatter_op(operand, scatter_indices, updates, dnums), 0
 
-scatter_add_p = standard_reduction_primitive(
+scatter_add_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-add',
     _scatter_translation_rule)
 ad.primitive_jvps[scatter_add_p] = _scatter_add_jvp
@@ -3184,14 +3131,14 @@ batching.primitive_batchers[scatter_add_p] = (
   partial(_scatter_batching_rule, scatter_add))
 
 # TODO(jlebar): Add derivatives.
-scatter_min_p = standard_reduction_primitive(
+scatter_min_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-min',
     _scatter_translation_rule)
 batching.primitive_batchers[scatter_min_p] = (
   partial(_scatter_batching_rule, scatter_min))
 
 # TODO(jlebar): Add derivatives.
-scatter_max_p = standard_reduction_primitive(
+scatter_max_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter-max',
     _scatter_translation_rule)
 batching.primitive_batchers[scatter_max_p] = (
@@ -3203,6 +3150,7 @@ def _scatter_jvp(primals, tangents, update_jaxpr, update_consts,
   operand, scatter_indices, updates = primals
   g_operand, g_scatter_indices, g_updates = tangents
   dnums = dimension_numbers
+  assert g_scatter_indices is ad_util.zero
 
   if g_operand is ad_util.zero and g_updates is ad_util.zero:
     val_out = scatter_p.bind(
@@ -3291,7 +3239,7 @@ def _scatter_jvp(primals, tangents, update_jaxpr, update_consts,
   return val_out, tangent_out
 
 
-scatter_p = standard_reduction_primitive(
+scatter_p = standard_primitive(
     _scatter_shape_rule, _scatter_dtype_rule, 'scatter',
     _scatter_translation_rule)
 ad.primitive_jvps[scatter_p] = _scatter_jvp
@@ -3302,9 +3250,8 @@ batching.primitive_batchers[scatter_p] = (
 def _reduce_shape_rule(operand, init_value, computation, jaxpr, consts, dimensions):
   return tuple(onp.delete(operand.shape, dimensions))
 
-def _reduce_translation_rule(c, operand, init_value, computation, jaxpr, consts, dimensions,
-                             backend=None):
-  xla_computation = _reduction_computation(c, jaxpr, backend, consts, init_value)
+def _reduce_translation_rule(c, operand, init_value, computation, jaxpr, consts, dimensions):
+  xla_computation = _reduction_computation(c, jaxpr, consts, init_value)
   return c.Reduce(operand, init_value, xla_computation, dimensions)
 
 def _reduce_batch_rule(batched_args, batch_dims, computation, jaxpr, consts, dimensions):
@@ -3313,42 +3260,18 @@ def _reduce_batch_rule(batched_args, batch_dims, computation, jaxpr, consts, dim
   if init_value_bdim is None:
     assert operand_bdim is not None
     new_dimensions = [d + bool(d >= operand_bdim) for d in dimensions]
-    new_operand_bdim = operand_bdim - int(onp.sum(onp.less(dimensions, operand_bdim)))
+    new_operand_bdim = operand_bdim - onp.sum(onp.less(dimensions, operand_bdim))
     return reduce(operand, init_value, computation, new_dimensions), new_operand_bdim
   else:
     raise NotImplementedError  # loop and stack
 
-def _reduction_computation(c, jaxpr, backend, consts, init_value):
+def _reduction_computation(c, jaxpr, consts, init_value):
   shape = c.GetShape(init_value)
-  axis_env = xla.AxisEnv()  # no parallel primitives inside reductions
-  subc = xla_bridge.make_computation_builder("reduction_computation")
-  consts = [subc.ParameterWithShape(const) for const in consts]
-  args = [subc.ParameterWithShape(shape), subc.ParameterWithShape(shape)]
-  out, = xla.jaxpr_subcomp(subc, jaxpr, backend, axis_env, consts, (), *args)
-  return subc.Build(out)
+  return xla.jaxpr_computation(jaxpr, consts, (), shape, shape)
 
-def _masking_defreducer(prim, identity):
-  masking.shape_rules[prim] = _reducer_polymorphic_shape_rule
-  masking.masking_rules[prim] = partial(_reducer_masking_rule, prim, identity)
-
-def _reducer_polymorphic_shape_rule(shape_exprs, axes, **unused_params):
-  shape_expr, = shape_exprs
-  return ShapeExpr([d for i, d in enumerate(shape_expr) if i not in axes])
-
-def _reducer_masking_rule(prim, identity, padded_vals, logical_shapes,
-                          axes, input_shape):
-  del input_shape  # Unused.
-  (padded_val,), (logical_shape,) = padded_vals, logical_shapes
-  padded_shape = masking.padded_shape_as_value(padded_val.shape)
-  masks = [broadcasted_iota(onp.int32, padded_shape, i) < d
-           for i, d in enumerate(logical_shape) if i in axes]
-  mask = _reduce(operator.and_, masks)
-  masked_val = select(mask, padded_val, identity(padded_shape, padded_val.dtype))
-  return prim.bind(masked_val, axes=axes, input_shape=padded_shape)
-
-reduce_p = standard_reduction_primitive(_reduce_shape_rule, _input_dtype, 'reduce',
-                                        _reduce_translation_rule)
-batching.primitive_batchers[reduce_p] = _reduce_batch_rule
+reduce_p = standard_primitive(_reduce_shape_rule, _input_dtype, 'reduce',
+                              _reduce_translation_rule)
+# batching.primitive_batchers[reduce_p] = _reduce_batch_rule  # TODO(mattjj): test
 
 
 def _reduce_sum_shape_rule(operand, axes, input_shape):
@@ -3358,7 +3281,7 @@ def _reduce_sum_shape_rule(operand, axes, input_shape):
 
 def _reduce_sum_translation_rule(c, operand, axes, input_shape):
   dtype = c.GetShape(operand).numpy_dtype()
-  scalar = ShapedArray((), dtype)
+  scalar = xla_bridge.Shape.array_shape(dtype, ())
   return c.Reduce(operand, c.Constant(onp.array(0, dtype)),
                   xla.primitive_computation(add_p, scalar, scalar),
                   axes)
@@ -3373,8 +3296,6 @@ reduce_sum_p = standard_primitive(_reduce_sum_shape_rule, _input_dtype,
                                   'reduce_sum', _reduce_sum_translation_rule)
 ad.deflinear(reduce_sum_p, _reduce_sum_transpose_rule)
 batching.defreducer(reduce_sum_p)
-_masking_defreducer(reduce_sum_p,
-                    lambda shape, dtype: onp.broadcast_to(onp.array(0, dtype), shape))
 
 
 def _reduce_prod_shape_rule(operand, axes):
@@ -3382,7 +3303,7 @@ def _reduce_prod_shape_rule(operand, axes):
 
 def _reduce_prod_translation_rule(c, operand, axes):
   dtype = c.GetShape(operand).numpy_dtype()
-  scalar = ShapedArray((), dtype)
+  scalar = xla_bridge.Shape.array_shape(dtype, ())
   return c.Reduce(operand, c.Constant(onp.array(1, dtype)),
                   xla.primitive_computation(mul_p, scalar, scalar),
                   axes)
@@ -3428,7 +3349,7 @@ def _reduce_chooser_shape_rule(operand, axes):
 
 def _reduce_chooser_translation_rule(prim, identity, c, operand, axes):
   dtype = c.GetShape(operand).numpy_dtype()
-  scalar = ShapedArray((), dtype)
+  scalar = xla_bridge.Shape.array_shape(dtype, ())
   return c.Reduce(operand, c.Constant(identity(dtype)),
                   xla.primitive_computation(prim, scalar, scalar), axes)
 
@@ -3465,7 +3386,7 @@ def _reduce_logical_shape_rule(operand, axes):
   return tuple(onp.delete(operand.shape, axes))
 
 def _reduce_logical_translation_rule(prim, identity, c, operand, axes):
-  scalar = ShapedArray((), onp.bool_)
+  scalar = xla_bridge.Shape.array_shape(onp.dtype(onp.bool_), ())
   return c.Reduce(operand, c.Constant(identity(onp.bool_)),
                   xla.primitive_computation(prim, scalar, scalar), axes)
 
@@ -3482,6 +3403,7 @@ reduce_and_p = standard_primitive(_reduce_logical_shape_rule, _fixed_dtype(onp.b
                                  'reduce_and', _reduce_and_translation_rule)
 batching.defreducer(reduce_and_p)
 
+
 def _reduce_window_shape_rule(operand, init_value, jaxpr, consts,
                               window_dimensions, window_strides, padding):
   if operand.dtype != init_value.dtype:
@@ -3492,32 +3414,14 @@ def _reduce_window_shape_rule(operand, init_value, jaxpr, consts,
                                          window_strides, padding)
 
 def _reduce_window_translation_rule(c, operand, init_value, jaxpr, consts,
-                                    window_dimensions, window_strides, padding, backend=None):
-  xla_computation = _reduction_computation(c, jaxpr, backend, consts, init_value)
+                                    window_dimensions, window_strides, padding):
+  xla_computation = _reduction_computation(c, jaxpr, consts, init_value)
   return c.ReduceWindow(operand, init_value, xla_computation, window_dimensions,
                         window_strides, padding)
 
-def _generic_reduce_window_batch_rule(
-    batched_args, batch_dims, jaxpr, consts, window_dimensions, window_strides,
-    padding):
-  operand, init = batched_args
-  bdim, init_bdim = batch_dims
-  if init_bdim is not None:
-    raise NotImplementedError("reduce_window batching is not implemented for "
-                              "initial values")
-
-  def reduce_window(x, window_dimensions, window_strides, padding):
-    return reduce_window_p.bind(
-      x, init, jaxpr=jaxpr, consts=consts, window_dimensions=window_dimensions,
-      window_strides=window_strides, padding=padding)
-  return _reduce_window_batch_rule(reduce_window, (operand,), (bdim,),
-                                   window_dimensions, window_strides, padding)
-
-
-reduce_window_p = standard_reduction_primitive(
+reduce_window_p = standard_primitive(
     _reduce_window_shape_rule, _input_dtype, 'reduce_window',
     _reduce_window_translation_rule)
-batching.primitive_batchers[reduce_window_p] = _generic_reduce_window_batch_rule
 
 
 def _reduce_window_sum_shape_rule(operand, window_dimensions, window_strides,
@@ -3528,7 +3432,7 @@ def _reduce_window_sum_shape_rule(operand, window_dimensions, window_strides,
 def _reduce_window_sum_translation_rule(c, operand, window_dimensions,
                                         window_strides, padding, input_shape):
   dtype = c.GetShape(operand).numpy_dtype()
-  scalar = ShapedArray((), dtype)
+  scalar = xla_bridge.Shape.array_shape(dtype, ())
   return c.ReduceWindow(operand, c.Constant(onp.array(0, dtype)),
                         xla.primitive_computation(add_p, scalar, scalar),
                         window_dimensions, window_strides, padding)
@@ -3549,9 +3453,8 @@ def _reduce_window_sum_transpose_rule(cotangent, window_dimensions,
   assert result.shape == input_shape
   return [result]
 
-def _reduce_window_batch_rule(
-    reduce_window, batched_args, bdims, window_dimensions, window_strides,
-    padding, input_shape=None):
+def _reduce_window_sum_batch_rule(
+    batched_args, bdims, window_dimensions, window_strides, padding, **kwargs):
   operand, = batched_args
   bdim, = bdims
 
@@ -3560,22 +3463,21 @@ def _reduce_window_batch_rule(
         window_dimensions[:bdim] + (1,) + window_dimensions[bdim:]
     window_strides = window_strides[:bdim] + (1,) + window_strides[bdim:]
 
-  operand = reduce_window(
+  oprand = _reduce_window_sum(
       operand, window_dimensions, window_strides, padding)
 
-  return operand, bdim
+  return oprand, 0
 
 reduce_window_sum_p = standard_primitive(
     _reduce_window_sum_shape_rule, _input_dtype, 'reduce_window_sum',
     _reduce_window_sum_translation_rule)
 ad.deflinear(reduce_window_sum_p, _reduce_window_sum_transpose_rule)
-batching.primitive_batchers[reduce_window_sum_p] = partial(
-  _reduce_window_batch_rule, _reduce_window_sum)
+batching.primitive_batchers[reduce_window_sum_p] = _reduce_window_sum_batch_rule
 
 def _reduce_window_chooser_translation_rule(
     prim, identity, c, operand, window_dimensions, window_strides, padding):
   dtype = c.GetShape(operand).numpy_dtype()
-  scalar = ShapedArray((), dtype)
+  scalar = xla_bridge.Shape.array_shape(dtype, ())
   return c.ReduceWindow(operand, c.Constant(identity(dtype)),
                         xla.primitive_computation(prim, scalar, scalar),
                         window_dimensions, window_strides, padding)
@@ -3612,14 +3514,28 @@ def reduce_window_shape_tuple(operand_shape, window_dimensions, window_strides,
       onp.subtract(operand_padded, window_dimensions), window_strides) + 1
   return tuple(t)
 
+def _reduce_window_max_batch_rule(
+    batched_args, bdims, window_dimensions, window_strides, padding, **kwargs):
+  operand, = batched_args
+  bdim, = bdims
+
+  if bdim is not None:
+    window_dimensions = \
+        window_dimensions[:bdim] + (1,) + window_dimensions[bdim:]
+    window_strides = window_strides[:bdim] + (1,) + window_strides[bdim:]
+
+  operand = _reduce_window_max(
+      operand, window_dimensions, window_strides, padding)
+
+  return operand, 0
+
 _reduce_window_max_translation_rule = partial(
     _reduce_window_chooser_translation_rule, max_p, _get_max_identity)
 reduce_window_max_p = standard_primitive(
     _common_reduce_window_shape_rule, _input_dtype, 'reduce_window_max',
     _reduce_window_max_translation_rule)
 ad.defjvp(reduce_window_max_p, partial(_reduce_window_chooser_jvp_rule, max_p))
-batching.primitive_batchers[reduce_window_max_p] = partial(
-  _reduce_window_batch_rule, _reduce_window_max)
+batching.primitive_batchers[reduce_window_max_p] = _reduce_window_max_batch_rule
 
 _reduce_window_min_translation_rule = partial(
     _reduce_window_chooser_translation_rule, min_p, _get_min_identity)
@@ -3627,11 +3543,6 @@ reduce_window_min_p = standard_primitive(
     _common_reduce_window_shape_rule, _input_dtype, 'reduce_window_min',
     _reduce_window_min_translation_rule)
 ad.defjvp(reduce_window_min_p, partial(_reduce_window_chooser_jvp_rule, min_p))
-
-_reduce_window_min_batch_rule = partial(_reduce_window_batch_rule,
-                                        _reduce_window_min)
-batching.primitive_batchers[reduce_window_min_p] = partial(
-  _reduce_window_batch_rule, _reduce_window_min)
 
 
 def _select_and_scatter_shape_rule(
@@ -3647,13 +3558,13 @@ def _select_and_scatter_shape_rule(
 
 def _select_and_scatter_translation(
   c, operand, source, init_value, select_jaxpr, select_consts, scatter_jaxpr,
-  scatter_consts, window_dimensions, window_strides, padding, backend=None):
-  select = _reduction_computation(c, select_jaxpr, backend, select_consts, init_value)
-  scatter = _reduction_computation(c, scatter_jaxpr, backend, scatter_consts, init_value)
+  scatter_consts, window_dimensions, window_strides, padding):
+  select = _reduction_computation(c, select_jaxpr, select_consts, init_value)
+  scatter = _reduction_computation(c, scatter_jaxpr, scatter_consts, init_value)
   return c.SelectAndScatter(operand, select, window_dimensions, window_strides,
                             padding, source, init_value, scatter)
 
-select_and_scatter_p = standard_reduction_primitive(
+select_and_scatter_p = standard_primitive(
     _select_and_scatter_shape_rule, _input_dtype, 'select_and_scatter',
     _select_and_scatter_translation)
 
@@ -3666,7 +3577,7 @@ def _select_and_scatter_add_translation(
     c, source, operand, select_prim, window_dimensions, window_strides,
     padding):
   dtype = c.GetShape(operand).numpy_dtype()
-  scalar = ShapedArray((), dtype)
+  scalar = xla_bridge.Shape.array_shape(dtype, ())
   select = xla.primitive_computation(select_prim, scalar, scalar)
   scatter = xla.primitive_computation(add_p, scalar, scalar)
   zero = c.Constant(onp.array(0, dtype))
@@ -3693,7 +3604,7 @@ def _select_and_scatter_add_jvp(
 def _select_and_scatter_add_transpose(
     t, source, operand, select_prim, window_dimensions, window_strides,
     padding):
-  assert source is ad.undefined_primal and operand is not ad.undefined_primal
+  assert source is None and operand is not None
   source_t = _select_and_gather_add(t, operand, select_prim, window_dimensions,
                                     window_strides, padding)
   return [source_t, None]
@@ -3704,8 +3615,8 @@ def _select_and_scatter_add_batch_rule(batched_args, batch_dims, **kwargs):
 
   if s_bdims is not None and o_bdims is not None:
     #TODO(#212): use a map construct instead of unrolling.
-    source = batching.moveaxis(source, s_bdims, 0)
-    operand = batching.moveaxis(operand, o_bdims, 0)
+    source = batching.move_dim_to_front(source, s_bdims)
+    operand = batching.move_dim_to_front(operand, o_bdims)
     outputs = [
         _select_and_scatter_add(s, o, **kwargs) for s, o in zip(source, operand)]
     outputs = [reshape(out, (1,) + out.shape) for out in outputs]
@@ -3713,7 +3624,7 @@ def _select_and_scatter_add_batch_rule(batched_args, batch_dims, **kwargs):
     return outputs, 0
   elif s_bdims is not None:
     #TODO(#212): use a map construct instead of unrolling.
-    source = batching.moveaxis(source, s_bdims, 0)
+    source = batching.move_dim_to_front(source, s_bdims)
     outputs = [
         _select_and_scatter_add(s, operand, **kwargs) for s in source]
     outputs = [reshape(out, (1,) + out.shape) for out in outputs]
@@ -3721,7 +3632,7 @@ def _select_and_scatter_add_batch_rule(batched_args, batch_dims, **kwargs):
     return outputs, 0
   elif o_bdims is not None:
     #TODO(#212): use a map construct instead of unrolling.
-    operand = batching.moveaxis(operand, o_bdims, 0)
+    operand = batching.move_dim_to_front(operand, o_bdims)
     outputs = [
         _select_and_scatter_add(source, o, **kwargs) for o in operand]
     outputs = [reshape(out, (1,) + out.shape) for out in outputs]
@@ -3753,103 +3664,68 @@ _UINT_DTYPES = {
   64: onp.uint64,
 }
 
+def _select_and_gather_add_pair_reducer(dtype, select_prim):
+  bits = onp.finfo(dtype).bits
+  pair_uint_dtype = _UINT_DTYPES[bits * 2]
+  uint_etype = xla_bridge.dtype_to_etype_exact(_UINT_DTYPES[bits])
+  etype = xla_bridge.dtype_to_etype_exact(dtype)
+
+  c = xla_bridge.make_computation_builder("select_and_gather_pair_reducer")
+  x = c.ParameterWithShape(
+    xla_bridge.Shape.array_shape(onp.dtype(pair_uint_dtype), ()))
+  y = c.ParameterWithShape(
+    xla_bridge.Shape.array_shape(onp.dtype(pair_uint_dtype), ()))
+
+  bits_const = c.Constant(pair_uint_dtype(bits), canonicalize_types=False)
+
+  def fst(t):
+    st = c.ConvertElementType(c.ShiftRightLogical(t, bits_const), uint_etype)
+    return c.BitcastConvertType(st, etype)
+  sx = fst(x)
+  sy = fst(y)
+
+  assert select_prim is ge_p or select_prim is le_p
+  which = c.Ge(sx, sy) if select_prim is ge_p else c.Le(sx, sy)
+  c.Select(which, x, y)
+  return c.Build()
 
 def _select_and_gather_add_translation(
     c, tangents, operand, select_prim, window_dimensions, window_strides,
-    padding, max_bits=64):
-  shape = c.GetShape(operand)
-  dtype = shape.numpy_dtype()
-  etype = shape.xla_element_type()
-  nbits = onp.finfo(dtype).bits
+    padding):
+  # XLA doesn't yet implement ReduceWindow on tuples (Google bug b/73062247), so
+  # we implement a pair-wise ReduceWindow by packing two k-bit values into
+  # 2k-bit unsigned integer using bit tricks. This will only work for <= 32-bit
+  # inputs (since we don't have 128-bit integer types).
+  dtype = c.GetShape(operand).numpy_dtype()
+  bits = onp.finfo(dtype).bits
+  if bits > 32:
+    raise NotImplementedError(
+        "select_and_gather_add is not implemented for type larger than 32 bits")
+  etype = xla_bridge.dtype_to_etype(dtype)
+  uint_etype = xla_bridge.dtype_to_etype(_UINT_DTYPES[bits])
+  pair_uint_dtype = _UINT_DTYPES[bits * 2]
+  pair_uint_etype = xla_bridge.dtype_to_etype_exact(pair_uint_dtype)
 
-  assert nbits <= max_bits
-  double_word_reduction = nbits * 2 <= max_bits
-
-  const = lambda c, dtype, x: c.Constant(onp.array(x, dtype=dtype),
-                                         canonicalize_types=False)
-
-  if double_word_reduction:
-    # XLA doesn't yet implement ReduceWindow on tuples (Google bug b/73062247), so
-    # we implement a pair-wise ReduceWindow by packing two k-bit values into
-    # 2k-bit unsigned integer using bit tricks.
-    word_dtype = _UINT_DTYPES[nbits]
-    double_word_dtype = _UINT_DTYPES[nbits * 2]
-    word_type = xla_client.dtype_to_etype(word_dtype)
-    double_word_type = xla_client.dtype_to_etype(double_word_dtype)
-
-    # Packs two values into a tuple.
-    def pack(a, b):
-      a = c.BitcastConvertType(a, word_type)
-      b = c.BitcastConvertType(b, word_type)
-      a = c.ConvertElementType(a, double_word_type)
-      b = c.ConvertElementType(b, double_word_type)
-      a = c.ShiftLeft(a, const(c, double_word_dtype, nbits))
-      return c.Or(a, b)
-
-    # Unpacks the first element of a tuple.
-    def fst(c, t):
-      st = c.ShiftRightLogical(t, const(c, double_word_dtype, nbits))
-      return c.BitcastConvertType(c.ConvertElementType(st, word_type), etype)
-
-    # Unpacks the second element of a tuple.
-    def snd(t):
-      return c.BitcastConvertType(c.ConvertElementType(t, word_type), etype)
-
-  else:
-    # The double-word trick above only works if we have a sufficiently large
-    # type. As an alternative, we can pack two half words into a single word,
-    # at the cost of precision.
-    # TODO(b/73062247): add support for tuple reductions and remove this case.
-    warnings.warn("Using reduced precision for gradient of reduce-window "
-                  "min/max operator to work around missing XLA support for "
-                  "pair-reductions. This is likely from a second or "
-                  "higher derivative of a max-pooling operation.")
-    r_nbits = nbits // 2
-    # Drop/round the bottom mantissa bits.
-    nexp = onp.finfo(dtype).nexp
-    nmant = r_nbits - nexp - 1
-
-    double_word_dtype = word_dtype = _UINT_DTYPES[nbits]
-    word_type = xla_client.dtype_to_etype(word_dtype)
-
-    # Packs two values into a tuple.
-    def pack(a, b):
-      a = c.ReducePrecision(a, exponent_bits=nexp, mantissa_bits=nmant)
-      b = c.ReducePrecision(b, exponent_bits=nexp, mantissa_bits=nmant)
-      a = c.BitcastConvertType(a, word_type)
-      b = c.BitcastConvertType(b, word_type)
-      b = c.ShiftRightLogical(b, const(c, word_dtype, r_nbits))
-      return c.Or(a, b)
-
-    # Unpacks the first element of a tuple.
-    def fst(c, t):
-      st = c.And(t, const(c, word_dtype, ((1 << r_nbits) - 1) << r_nbits))
-      return c.BitcastConvertType(st, etype)
-
-    # Unpacks the second element of a tuple.
-    def snd(t):
-      return c.BitcastConvertType(c.ShiftLeft(t, const(c, word_dtype, r_nbits)),
-                                  etype)
-
-  def reducer():
-    c = xla_bridge.make_computation_builder("select_and_gather_pair_reducer")
-    x = c.ParameterWithShape(
-      xla_client.Shape.array_shape(onp.dtype(double_word_dtype), ()))
-    y = c.ParameterWithShape(
-      xla_client.Shape.array_shape(onp.dtype(double_word_dtype), ()))
-    assert select_prim is ge_p or select_prim is le_p
-    which = c.Ge if select_prim is ge_p else c.Le
-    c.Select(which(fst(c, x), fst(c, y)), x, y)
-    return c.Build()
-
+  operand = c.BitcastConvertType(operand, uint_etype)
+  tangents = c.BitcastConvertType(tangents, uint_etype)
+  operand = c.ConvertElementType(operand, pair_uint_etype)
+  tangents = c.ConvertElementType(tangents, pair_uint_etype)
+  operand = c.ShiftLeft(
+    operand, c.Constant(pair_uint_dtype(bits), canonicalize_types=False))
 
   assert select_prim is ge_p or select_prim is le_p
   init = -onp.inf if select_prim is ge_p else onp.inf
-  out = c.ReduceWindow(pack(operand, tangents),
-                       pack(const(c, dtype, init), const(c, dtype, 0)),
-                       reducer(), window_dimensions, window_strides,
+  init = c.BitcastConvertType(c.Constant(dtype.type(init)), uint_etype)
+  init = c.ConvertElementType(init, pair_uint_etype)
+  init = c.ShiftLeft(
+    init, c.Constant(pair_uint_dtype(bits), canonicalize_types=False))
+
+  xla_computation = _select_and_gather_add_pair_reducer(dtype, select_prim)
+  out = c.ReduceWindow(c.Or(operand, tangents), init,
+                       xla_computation, window_dimensions, window_strides,
                        padding)
-  return snd(out)
+  out = c.ConvertElementType(out, uint_etype)
+  return c.BitcastConvertType(out, etype)
 
 def _select_and_gather_add_jvp(
     primals, tangents, select_prim, window_dimensions, window_strides,
@@ -3871,7 +3747,7 @@ def _select_and_gather_add_jvp(
 def _select_and_gather_add_transpose(
     t, tangents, operand, select_prim, window_dimensions, window_strides,
     padding):
-  assert tangents is ad.undefined_primal and operand is not ad.undefined_primal
+  assert tangents is None and operand is not None
   result = _select_and_scatter_add(t, operand, select_prim, window_dimensions,
                                    window_strides, padding)
   return [result, None]
@@ -3882,9 +3758,6 @@ select_and_gather_add_p = standard_primitive(
 ad.primitive_jvps[select_and_gather_add_p] = _select_and_gather_add_jvp
 ad.primitive_transposes[select_and_gather_add_p] = \
     _select_and_gather_add_transpose
-xla.backend_specific_translations['tpu'][select_and_gather_add_p] = partial(
-  _select_and_gather_add_translation,
-  max_bits=32)
 
 
 sort_shape = lambda operand, dimension: operand.shape
@@ -3893,20 +3766,17 @@ def _sort_jvp_rule(g, operand, dimension):
   _, g_out = sort_key_val(operand, g, dimension)
   return g_out
 
-def _sort_batch_rule(batched_args, batch_dims, dimension):
-  operand, = batched_args
-  bdim, = batch_dims
-  dimension = dimension % (operand.ndim - 1)
-  new_dimension = dimension + (bdim <= dimension)
-  return sort(operand, dimension=new_dimension), bdim
-
 sort_p = standard_primitive(sort_shape, _input_dtype, 'sort')
 ad.defjvp(sort_p, _sort_jvp_rule)
-batching.primitive_batchers[sort_p] = _sort_batch_rule
 
 
 def _sort_key_val_abstract_eval(keys, values, dimension):
-  return keys, values
+  return core.AbstractTuple((keys, values))
+
+def _sort_key_val_impl(keys, values, dimension):
+  out = xla.apply_primitive(sort_key_val_p, keys, values, dimension=dimension)
+  sorted_keys, sorted_values = out
+  return core.pack((sorted_keys, sorted_values))
 
 def _sort_key_val_jvp(primals, tangents, dimension):
   # NOTE(mattjj): this re-sorts three times, but if we had a variadic
@@ -3931,15 +3801,15 @@ def _sort_key_val_jvp(primals, tangents, dimension):
     values_tangents_out = _sort_jvp_rule(values_tangents, keys, dimension)
 
   tangents_out = keys_tangents_out, values_tangents_out
-  return val_out, tangents_out
+  return core.pack(val_out), ad.TangentTuple(tangents_out)
 
 def _sort_key_val_transpose_rule(t, keys, values, dimension):
   t_keys, t_values = t
   assert t_keys is ad_util.zero
   iota = broadcasted_iota(onp.int32, keys.shape, dimension % keys.ndim)
   _, perm = sort_key_val(keys, iota)
-  keys_result = ad_util.zero if keys is ad.undefined_primal else None
-  values_result = sort_key_val(perm, t_values)[1] if values is ad.undefined_primal else None
+  keys_result = ad_util.zero if keys is None else None
+  values_result = sort_key_val(perm, t_values)[1] if values is None else None
   return [keys_result, values_result]
 
 def _sort_key_val_batch_rule(batched_args, batch_dims, dimension):
@@ -3948,27 +3818,31 @@ def _sort_key_val_batch_rule(batched_args, batch_dims, dimension):
   assert keys_bdim is not None or values_bdim is not None
   if keys_bdim == values_bdim:
     new_dimension = dimension + (keys_bdim <= dimension)
-    return sort_key_val(keys, values, new_dimension), (keys_bdim, keys_bdim)
+    out = sort_key_val(keys, values, new_dimension)
+    return core.pack(out), keys_bdim
   elif keys_bdim is not None and values_bdim is not None:
-    keys_trans = batching.moveaxis(keys, keys_bdim, values_bdim)
+    keys_trans = batching.moveaxis(keys.shape[keys_bdim], values_bdim,
+                                   keys_bdim, keys)
     new_dimension = dimension + (values_bdim <= dimension)
-    return sort_key_val(keys_trans, values, new_dimension), (values_bdim, values_bdim)
+    out = sort_key_val(keys_trans, values, new_dimension)
+    return core.pack(out), values_bdim
   elif keys_bdim is None:
     broadcast_dimensions = onp.delete(onp.arange(values.ndim), values_bdim)
     new_keys = broadcast_in_dim(keys, values.shape, broadcast_dimensions)
     new_dimension = dimension + (values_bdim <= dimension)
-    return sort_key_val(new_keys, values, new_dimension), (values_bdim, values_bdim)
+    out = sort_key_val(new_keys, values, new_dimension)
+    return core.pack(out), values_bdim
   elif values_bdim is None:
     broadcast_dimensions = onp.delete(onp.arange(keys.ndim), keys_bdim)
     new_values = broadcast_in_dim(values, keys.shape, broadcast_dimensions)
     new_dimension = dimension + (keys_bdim <= dimension)
-    return sort_key_val(keys, new_values, new_dimension), (keys_bdim, keys_bdim)
+    out = sort_key_val(keys, new_values, new_dimension)
+    return core.pack(out), keys_bdim
   else:
     raise Exception  # unreachable
 
 sort_key_val_p = Primitive('sort_key_val')
-sort_key_val_p.multiple_results = True
-sort_key_val_p.def_impl(partial(xla.apply_primitive, sort_key_val_p))
+sort_key_val_p.def_impl(_sort_key_val_impl)
 sort_key_val_p.def_abstract_eval(_sort_key_val_abstract_eval)
 xla.translations[sort_key_val_p] = partial(standard_translate, 'sort_key_val')
 ad.primitive_jvps[sort_key_val_p] = _sort_key_val_jvp
@@ -3990,8 +3864,8 @@ tie_in_p.def_abstract_eval(lambda x, y: y)
 xla.translations[tie_in_p] = lambda c, x, y: y
 ad.deflinear(tie_in_p, _tie_in_transpose_rule)
 batching.primitive_batchers[tie_in_p] = _tie_in_batch_rule
-masking.shape_rules[tie_in_p] = lambda shape_exprs: shape_exprs[1]
-masking.masking_rules[tie_in_p] = lambda vals, logical_shapes: vals[1]
+parallel.defidentity(tie_in_p, argnum=1)
+
 
 shaped_identity_p = Primitive('shape_id')
 shaped_identity_p.def_impl(lambda x, shape: x)
@@ -4010,7 +3884,10 @@ class _FilledConstant(xla.DeviceConstant):
 
   def __init__(self, fill_value, shape):
     assert type(fill_value) is onp.ndarray
-    self.aval = ShapedArray(shape, _dtype(fill_value))
+    self.shape = shape
+    self.dtype = _dtype(fill_value)
+    self.ndim = len(shape)
+    self.size = prod(shape)
     self._npy_value = None
 
     self.fill_value = fill_value
@@ -4030,7 +3907,10 @@ class _IotaConstant(xla.DeviceConstant):
   __slots__ = ["axis"]
 
   def __init__(self, dtype, shape, axis):
-    self.aval = ShapedArray(shape, onp.dtype(dtype))
+    self.shape = shape
+    self.dtype = onp.dtype(dtype)
+    self.ndim = len(shape)
+    self.size = prod(shape)
     self._npy_value = None
 
     self.axis = axis
@@ -4056,7 +3936,10 @@ class _EyeConstant(xla.DeviceConstant):
   __slots__ = ["axes"]
 
   def __init__(self, shape, axes, dtype):
-    self.aval = ShapedArray(shape, onp.dtype(dtype))
+    self.shape = shape
+    self.dtype = onp.dtype(dtype)
+    self.ndim = len(shape)
+    self.size = prod(shape)
     self._npy_value = None
 
     self.axes = axes
@@ -4077,7 +3960,7 @@ class _EyeConstant(xla.DeviceConstant):
     if canonicalize_types:
       etype = xla_bridge.dtype_to_etype(diag_const.dtype)
     else:
-      etype = xla_client.dtype_to_etype(diag_const.dtype)
+      etype = xla_bridge.dtype_to_etype_exact(diag_const.dtype)
     etype = xla_bridge.dtype_to_etype(diag_const.dtype)
     iotas = [c.BroadcastedIota(onp.uint32, diag_const.shape, axis)
              for axis in diag_const.axes]
@@ -4088,10 +3971,9 @@ class _EyeConstant(xla.DeviceConstant):
 for _t in [_FilledConstant, _IotaConstant, _EyeConstant]:
   xla_bridge.register_constant_handler(_t, _t.constant_handler)
   core.pytype_aval_mappings[_t] = ConcreteArray
-  xla.pytype_aval_mappings[_t] = make_shaped_array
-  xla.device_put_handlers[_t] = xla._instantiate_device_constant
-  pxla.shard_arg_handlers[_t] = pxla._shard_array
+  xla.pytype_aval_mappings[_t] = xla.pytype_aval_mappings[xla.DeviceArray]
   xla.canonicalize_dtype_handlers[_t] = _identity
+  batching.pytype_aval_mappings[_t] = make_shaped_array
   ad_util.jaxval_adders[_t] = add
   ad_util.jaxval_zeros_likers[_t] = zeros_like_array
 
@@ -4115,102 +3997,11 @@ xla.translations[stop_gradient_p] = lambda c, x: x
 ad.primitive_jvps[stop_gradient_p] = _stop_gradient_jvp_rule
 batching.primitive_batchers[stop_gradient_p] = _stop_gradient_batch_rule
 
-def create_token(x):
-  """Creates an XLA token value with no preconditions for sequencing effects.
-
-  Experimental.
-
-  Args:
-    x: a dummy argument used to tie the CreateToken operator into a trace. The
-       value of `x` is ignored.
-  """
-  # x is a dummy argument used to tie the operator into a trace.
-  return create_token_p.bind(x)
-
-create_token_p = Primitive("create_token")
-create_token_p.def_impl(partial(xla.apply_primitive, create_token_p))
-create_token_p.def_abstract_eval(lambda _: abstract_token)
-xla.translations[create_token_p] = lambda c, _: c.CreateToken()
-
-def after_all(*operands):
-  """Merges one or more XLA token values. Experimental.
-
-  Wraps the XLA AfterAll operator."""
-  return after_all_p.bind(*operands)
-
-def _after_all_abstract_eval(*operands):
-  if any(x is not abstract_token for x in operands):
-    raise TypeError("Arguments to after_all must be tokens")
-  return abstract_token
-
-
-def _after_all_translation_rule(c, *operands):
-  return c.AfterAll(operands)
-
-after_all_p = Primitive("after_all")
-after_all_p.def_impl(partial(xla.apply_primitive, after_all_p))
-after_all_p.def_abstract_eval(_after_all_abstract_eval)
-xla.translations[after_all_p] = _after_all_translation_rule
-
-
-def infeed(token, shape=None):
-  """Consumes an infeed value of `shape` from the host. Experimental.
-
-  `token` is used to sequence infeed and outfeed effects.
-  """
-  flat_shapes, treedef = pytree.flatten(shape)
-  for shape in flat_shapes:
-    if not isinstance(shape, ShapedArray):
-      raise TypeError("shapes argument to infeed must be a pytree of "
-                      "ShapedArray values, got {}".format(shapes))
-  xs_and_token = infeed_p.bind(token, shapes=tuple(flat_shapes))
-  return (treedef.unflatten(xs_and_token[:-1]), xs_and_token[-1])
-
-def _infeed_abstract_eval(token, shapes=None):
-  if token is not abstract_token:
-    raise TypeError("First argument to infeed must be a token")
-  return shapes + (abstract_token,)
-
-
-def _infeed_translation_rule(c, token, shapes=None):
-  shape = tuple(map(xla.aval_to_xla_shape, shapes))
-  xs_and_token = c.Infeed(xla_client.Shape.tuple_shape(shape), token)
-  xs = c.GetTupleElement(xs_and_token, 0)
-  token = c.GetTupleElement(xs_and_token, 1)
-  outs = [c.GetTupleElement(xs, i) for i in range(len(shapes))] + [token]
-  return c.Tuple(*outs)
-
-infeed_p = Primitive("infeed")
-infeed_p.multiple_results = True
-infeed_p.def_impl(partial(xla.apply_primitive, infeed_p))
-infeed_p.def_abstract_eval(_infeed_abstract_eval)
-xla.translations[infeed_p] = _infeed_translation_rule
-
-def outfeed(token, xs):
-  """Outfeeds value `xs` to the host. Experimental.
-
-  `token` is used to sequence infeed and outfeed effects.
-  """
-  flat_xs, _ = pytree.flatten(xs)
-  return outfeed_p.bind(token, *flat_xs)
-
-def _outfeed_abstract_eval(token, *xs):
-  if token is not abstract_token:
-    raise TypeError("First argument to outfeed must be a token")
-  return abstract_token
-
-
-def _outfeed_translation_rule(c, token, *xs):
-  return c.Outfeed(c.Tuple(*xs), token)
-
-outfeed_p = Primitive("outfeed")
-outfeed_p.def_impl(partial(xla.apply_primitive, outfeed_p))
-outfeed_p.def_abstract_eval(_outfeed_abstract_eval)
-xla.translations[outfeed_p] = _outfeed_translation_rule
 
 ### util
 
-_ndim = onp.ndim
+def _ndim(x):
+  return x.ndim
 
 
 def _dilate_shape(shape, dilation):
@@ -4333,9 +4124,6 @@ def conv_transpose_shape_tuple(lhs_shape, rhs_shape, window_strides, padding,
 
 def _check_shapelike(fun_name, arg_name, obj):
   """Check that `obj` is a shape-like value (e.g. tuple of nonnegative ints)."""
-  if (type(obj) is masking.ShapeExpr
-      or type(obj) is tuple and any(type(d) is masking.Poly for d in obj)):
-    return obj
   if not isinstance(obj, (tuple, list, onp.ndarray)):
     msg = "{} {} must be of type tuple/list/ndarray, got {}."
     raise TypeError(msg.format(fun_name, arg_name, type(obj)))
@@ -4355,23 +4143,11 @@ def _check_shapelike(fun_name, arg_name, obj):
 
 
 def _dynamic_slice_indices(operand, start_indices):
-  if not isinstance(start_indices, (tuple, list)):
-    if start_indices.ndim != 1:
-      raise ValueError("Slice indices must be a 1D sequence, got {}"
-                       .format(start_indices.shape))
-    start_indices = [reshape(slice(start_indices, [i], [i+1]), ())
-                     for i in range(operand.ndim)]
-  else:
-    start_indices = [onp.asarray(i) if isinstance(i, int) else i
-                     for i in start_indices]
-  if len(start_indices) != operand.ndim:
-    msg = ("Length of slice indices must match number of operand dimensions ({} "
-          "vs {})")
-    raise ValueError(msg.format(len(start_indices, operand.shape)))
+  if isinstance(start_indices, (tuple, list)):
+    start_indices = concatenate([reshape(i, [1]) for i in start_indices], 0)
   # map int over operand.shape to raise any dynamic-shape errors
-  return [select(lt(i, _const(i, 0)), add(i, _const(i, int(d))), i)
-          for i, d in zip(start_indices, operand.shape)]
-
+  shape = onp.asarray(list(map(int, operand.shape)), start_indices.dtype)
+  return rem(start_indices, shape)
 
 
 def _const(example, val):
@@ -4399,17 +4175,6 @@ def ranges_like(*xs):
 def remaining(original, *removed_lists):
   blacklist = set(itertools.chain(*removed_lists))
   return [i for i in original if i not in blacklist]
-
-
-def _canonicalize_precision(precision):
-  if precision is None:
-    return None
-  if isinstance(precision, Precision):
-    return precision
-  else:
-    msg = "Precision argument must be None or a lax.Precision value; got {}"
-    raise ValueError(msg.format(precision))
-
 
 # lhs_spec and out_spec are lists containing
 #   [batch dim, feature dim, spatial dims ...]
@@ -4500,7 +4265,7 @@ def conv_general_permutations(dimension_numbers):
 def _conv_general_proto(dimension_numbers):
   assert type(dimension_numbers) is ConvDimensionNumbers
   lhs_spec, rhs_spec, out_spec = dimension_numbers
-  proto = xla_client.ConvolutionDimensionNumbers()
+  proto = xla_bridge.xla_data_pb2.ConvolutionDimensionNumbers()
   proto.input_batch_dimension = lhs_spec[0]
   proto.input_feature_dimension = lhs_spec[1]
   proto.output_batch_dimension = out_spec[0]
@@ -4559,16 +4324,5 @@ def subvals(lst, replace):
 
 
 def _abstractify(x):
-  return raise_to_shaped(core.get_aval(x))
-
-
-def _check_user_dtype_supported(dtype, fun_name=None):
-  if dtype is not None and onp.dtype(dtype) != xla_bridge.canonicalize_dtype(dtype):
-    msg = ("Explicitly requested dtype {} {} is not available, "
-           "and will be truncated to dtype {}. To enable more dtypes, set the "
-           "jax_enable_x64 configuration option or the JAX_ENABLE_X64 shell "
-           "environment variable. "
-           "See https://github.com/google/jax#current-gotchas for more.")
-    fun_name = "requested in {}".format(fun_name) if fun_name else ""
-    truncated_dtype = xla_bridge.canonicalize_dtype(dtype).name
-    warnings.warn(msg.format(dtype, fun_name , truncated_dtype))
+  # used internally for initial-style higher-order primitives
+  return pe.PartialVal((raise_to_shaped(core.get_aval(x)), core.unit))

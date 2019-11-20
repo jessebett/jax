@@ -20,11 +20,10 @@ import numpy as onp
 import scipy.stats as osp_stats
 
 from ... import lax
-from ... import numpy as np
 from ...numpy.lax_numpy import _promote_args_like, _constant_like, _wraps
 from .. import special
 
-@_wraps(osp_stats.norm.logpdf, update_doc=False)
+@_wraps(osp_stats.norm.logpdf)
 def logpdf(x, loc=0, scale=1):
   x, loc, scale = _promote_args_like(osp_stats.norm.logpdf, x, loc, scale)
   two = _constant_like(x, 2)
@@ -34,23 +33,18 @@ def logpdf(x, loc=0, scale=1):
   return lax.div(lax.neg(lax.add(log_normalizer, quadratic)), two)
 
 
-@_wraps(osp_stats.norm.pdf, update_doc=False)
+@_wraps(osp_stats.norm.pdf)
 def pdf(x, loc=0, scale=1):
   return lax.exp(logpdf(x, loc, scale))
 
 
-@_wraps(osp_stats.norm.cdf, update_doc=False)
+@_wraps(osp_stats.norm.cdf)
 def cdf(x, loc=0, scale=1):
   x, loc, scale = _promote_args_like(osp_stats.norm.cdf, x, loc, scale)
   return special.ndtr(lax.div(lax.sub(x, loc), scale))
 
 
-@_wraps(osp_stats.norm.logcdf, update_doc=False)
+@_wraps(osp_stats.norm.logcdf)
 def logcdf(x, loc=0, scale=1):
   x, loc, scale = _promote_args_like(osp_stats.norm.logcdf, x, loc, scale)
   return special.log_ndtr(lax.div(lax.sub(x, loc), scale))
-
-
-@_wraps(osp_stats.norm.ppf, update_doc=False)
-def ppf(q, loc=0, scale=1):
-  return np.array(special.ndtri(q) * scale + loc, 'float64')

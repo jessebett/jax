@@ -17,33 +17,22 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-from functools import partial
-import unittest
-import warnings
-import weakref
 
 from absl.testing import absltest
 import numpy as onp
 import six
 
-if six.PY3:
-  import concurrent.futures
-
-import jax
 import jax.numpy as np
-from jax import jit, grad, device_put, jacfwd, jacrev, hessian
+from jax import jit, grad, device_get, device_put, jacfwd, jacrev, hessian
 from jax import api, lax
-from jax.core import Primitive
+from jax.core import Primitive, pack, JaxTuple
 from jax.interpreters import ad
-from jax.interpreters.xla import DeviceArray
+from jax.interpreters.xla import DeviceArray, DeviceTuple
 from jax.abstract_arrays import concretization_err_msg
-from jax.lib import xla_bridge as xb
 from jax import test_util as jtu
-from jax import tree_util
 
 from jax.config import config
 config.parse_flags_with_absl()
-FLAGS = config.FLAGS
 
 class APITest(jtu.JaxTestCase):
 
@@ -117,13 +106,6 @@ class APITest(jtu.JaxTestCase):
 
     f(1, 2, z=onp.zeros(3))  # doesn't crash
 
-  def test_jit_many_args(self):
-    @jit
-    def f(args_list):
-      return sum(args_list)
-
-    self.assertEqual(f(list(range(500))), sum(range(500)))
-
   def test_grad_of_jit(self):
     side = []
 
@@ -156,13 +138,11 @@ class APITest(jtu.JaxTestCase):
     def f(x):
       return x
 
-    self.assertRaisesRegexp(
-      TypeError, ".* 'foo' of type <.*'str'> is not a valid JAX type",
-      lambda: grad(f)("foo"))
+    jtu.check_raises_regexp(lambda: grad(f)("foo"), TypeError,
+                     "Argument 'foo' of type <.*'str'> is not a valid JAX type")
 
-    self.assertRaisesRegexp(
-      TypeError, ".* 'foo' of type <.*'str'> is not a valid JAX type",
-      lambda: jit(f)("foo"))
+    jtu.check_raises_regexp(lambda: jit(f)("foo"), TypeError,
+                     "Argument 'foo' of type <.*'str'> is not a valid JAX type")
 
   # TODO(dougalm): enable when we remove 'None' from pytree nodes
   # def test_bad_output(self):
@@ -198,23 +178,17 @@ class APITest(jtu.JaxTestCase):
     def f(x, y):
       return x + y
 
-    jtu.check_raises(
-        lambda: f(np.zeros(3), np.zeros(4)),
-        TypeError,
-        "add got incompatible shapes for broadcasting: (3,), (4,).")
-
-    jtu.check_raises(
-        lambda: grad(f)(onp.zeros(3), onp.zeros(4)),
-        TypeError,
-        "add got incompatible shapes for broadcasting: (3,), (4,).")
+    jtu.check_raises(lambda: grad(f)(onp.zeros(3), onp.zeros(4)),
+                     ValueError,
+                     "Incompatible shapes for broadcasting: ((3,), (4,))")
 
   def test_dot_mismatch(self):
     def f(x, y):
       return np.dot(x, y)
 
-    self.assertRaisesRegexp(
-      TypeError, "Incompatible shapes for dot: got \\(3L?,\\) and \\(4L?,\\).",
-      lambda: grad(f)(onp.zeros(3), onp.zeros(4)))
+    jtu.check_raises_regexp(
+        lambda: grad(f)(onp.zeros(3), onp.zeros(4)), TypeError,
+        "Incompatible shapes for dot: got \\(3L?,\\) and \\(4L?,\\).")
 
   def test_switch_value_jit(self):
     def f(x):
@@ -235,19 +209,18 @@ class APITest(jtu.JaxTestCase):
       return x
 
     assert jit(f, static_argnums=(1,))(0, 5) == 10
-    self.assertRaisesRegexp(
-        TypeError,
+    jtu.check_raises_regexp(
+        lambda: jit(f)(0, 5), TypeError,
         "('JaxprTracer' object cannot be interpreted as an integer"
-        "|Abstract value passed to .*)",
-        lambda: jit(f)(0, 5))
+        "|Abstract value passed to .*)")
 
   def test_casts(self):
     for castfun in [float, complex, hex, oct] + list(six.integer_types):
       f = lambda x: castfun(x)
-      self.assertRaisesRegexp(
-          TypeError,
+      jtu.check_raises_regexp(
+          lambda: jit(f)(0), TypeError,
           "('JaxprTracer' object cannot be interpreted as an integer"
-          "|Abstract value passed to .*)", lambda: jit(f)(0))
+          "|Abstract value passed to .*)")
 
   def test_unimplemented_interpreter_rules(self):
     foo_p = Primitive('foo')
@@ -266,7 +239,7 @@ class APITest(jtu.JaxTestCase):
     foo_p.def_abstract_eval(lambda x: x)
 
     jtu.check_raises(lambda: jit(foo)(1.0), NotImplementedError,
-                     "XLA translation rule for primitive 'foo' not found")
+                     "XLA translation rule for 'foo' not implemented")
 
     foo_p.def_impl(lambda x: x)
     ad.defjvp(foo_p, lambda g, x: foo(g))
@@ -276,35 +249,23 @@ class APITest(jtu.JaxTestCase):
 
   def test_device_put_and_get(self):
     x = onp.arange(12.).reshape((3, 4)).astype("float32")
-    dx = api.device_put(x)
-    self.assertIsInstance(dx, DeviceArray)
-    x2 = api.device_get(dx)
-    self.assertIsInstance(x2, onp.ndarray)
+    dx = device_put(x)
+    assert isinstance(dx, DeviceArray)
+    x2 = device_get(dx)
+    assert isinstance(x2, onp.ndarray)
     assert onp.all(x == x2)
 
     y = [x, (2 * x, 3 * x)]
-    dy = api.device_put(y)
-    y2 = api.device_get(dy)
-    self.assertIsInstance(y2, list)
-    self.assertIsInstance(y2[0], onp.ndarray)
+    dy = device_put(y)
+    y2 = device_get(dy)
+    assert isinstance(y2, list)
+    assert isinstance(y2[0], onp.ndarray)
     assert onp.all(y2[0] == x)
-    self.assertIsInstance(y2[1], tuple)
-    self.assertIsInstance(y2[1][0], onp.ndarray)
+    assert isinstance(y2[1], tuple)
+    assert isinstance(y2[1][0], onp.ndarray)
     assert onp.all(y2[1][0] == 2 * x)
-    self.assertIsInstance(y2[1][1], onp.ndarray)
+    assert isinstance(y2[1][1], onp.ndarray)
     assert onp.all(y2[1][1] == 3 * x)
-
-  def test_device_put_across_devices(self):
-    if xb.device_count() == 1:
-      raise unittest.SkipTest("this test requires multiple devices")
-    d1, d2 = xb.local_devices()[:2]
-    x = api.device_put(onp.array([1,2,3]), device=d1)
-    self.assertEqual(x.device_buffer.device(), d1)
-    y = api.device_put(x, device=d2)
-    self.assertEqual(y.device_buffer.device(), d2)
-    # Make sure these don't crash
-    api.device_put(x)
-    api.device_put(y)
 
   @jtu.skip_on_devices("tpu")
   def test_jacobian(self):
@@ -380,41 +341,6 @@ class APITest(jtu.JaxTestCase):
                 (onp.array([0., 0.]), onp.array([0., 2.])))
     self.assertAllClose(ans, expected, check_dtypes=False)
 
-  @jtu.skip_on_devices("tpu")
-  def test_issue1372(self):
-    def quad(x):
-      return np.dot(x, x)
-
-    def f(x, u):
-      return quad(x) + quad(u)
-
-    x, u = np.ones(5), np.ones(2)
-
-    rev = jacrev
-    fwd = jacfwd
-
-    # Diagonal entries
-    self.assertEqual(rev(rev(f, 0), 0)(x, u).shape, (5, 5))
-    self.assertEqual(rev(fwd(f, 0), 0)(x, u).shape, (5, 5))
-    self.assertEqual(fwd(rev(f, 0), 0)(x, u).shape, (5, 5))
-    self.assertEqual(fwd(fwd(f, 0), 0)(x, u).shape, (5, 5))
-    self.assertEqual(rev(rev(f, 1), 1)(x, u).shape, (2, 2))
-    self.assertEqual(rev(fwd(f, 1), 1)(x, u).shape, (2, 2))
-    self.assertEqual(fwd(rev(f, 1), 1)(x, u).shape, (2, 2))
-    self.assertEqual(fwd(fwd(f, 1), 1)(x, u).shape, (2, 2))
-
-    # Off-diagonal entries by reverse-mode on the outside
-    self.assertEqual(rev(rev(f, 1), 0)(x, u).shape, (2, 5))
-    self.assertEqual(rev(fwd(f, 1), 0)(x, u).shape, (2, 5))
-    self.assertEqual(rev(rev(f, 0), 1)(x, u).shape, (5, 2))
-    self.assertEqual(rev(fwd(f, 0), 1)(x, u).shape, (5, 2))
-
-    # Off-diagonal entries by forward-mode on the outside
-    self.assertEqual(fwd(rev(f, 1), 0)(x, u).shape, (2, 5))
-    self.assertEqual(fwd(fwd(f, 1), 0)(x, u).shape, (2, 5))
-    self.assertEqual(fwd(rev(f, 0), 1)(x, u).shape, (5, 2))
-    self.assertEqual(fwd(fwd(f, 0), 1)(x, u).shape, (5, 2))
-
   def test_disable_jit(self):
     effects = []
 
@@ -470,28 +396,6 @@ class APITest(jtu.JaxTestCase):
     g, aux = grad(lambda x: (x**3, [x**2, 4.]), has_aux=True)(4.)
     self.assertEqual(g, grad(lambda x: x**3)(4.))
     self.assertEqual(aux, [4.**2, 4.])
-
-  def test_jvp_mismatched_arguments(self):
-    self.assertRaisesRegex(
-      TypeError,
-      ("primal and tangent arguments to jax.jvp must have the same tree "
-       "structure"),
-      lambda: api.jvp(lambda x, y: x * y, (onp.float32(2),), ()))
-    self.assertRaisesRegex(
-      TypeError,
-      "primal and tangent arguments to jax.jvp must have equal types",
-      lambda: api.jvp(lambda x: -x, (onp.float16(2),), (onp.float32(4),)))
-
-  def test_vjp_mismatched_arguments(self):
-    _, pullback = api.vjp(lambda x, y: x * y, onp.float32(3), onp.float32(4))
-    self.assertRaisesRegex(
-      TypeError,
-      "Tree structure of cotangent input.*does not match",
-      lambda: pullback((onp.float32(7), onp.float32(100))))
-    self.assertRaisesRegex(
-      TypeError,
-      "Type of cotangent input to vjp pullback.*does not match type",
-      lambda: pullback((onp.float16(42))))
 
   def test_jarrett_jvps(self):
     def f1(x):
@@ -658,35 +562,6 @@ class APITest(jtu.JaxTestCase):
     self.assertAllClose(grad_ans, 3. * 4. + onp.cos(onp.sin(3. * 4)),
                         check_dtypes=False)
 
-  # TODO
-  # def test_defjvp_closure_error(self):
-  #   def foo(x):
-  #     @api.custom_transforms
-  #     def bar(y):
-  #       return x * y
-
-  #     api.defjvp(bar, lambda y_dot, ans, y: x * y)
-  #     return bar(x)
-  #   jtu.check_raises(
-  #       lambda: api.jvp(foo, (1.,), (1.,)), ValueError,
-  #       "Detected differentiation with respect to closed-over values with "
-  #       "custom JVP rule, which isn't supported.")
-
-  # TODO
-  # def test_defvjp_closure_error(self):
-  #   def foo(x):
-  #     @api.custom_transforms
-  #     def bar(y):
-  #       return x * y
-
-  #     api.defvjp(bar, lambda g, ans, y: x * y)
-  #     return bar(x)
-  #   jtu.check_raises(
-  #       lambda: grad(foo)(1.,), ValueError,
-  #       "Detected differentiation w.r.t. variables from outside "
-  #       "the scope of <jax.custom_transforms function bar>, but defvjp and "
-  #       "defvjp_all only support differentiation w.r.t. positional arguments.")
-
   def test_custom_transforms_eval_with_pytrees(self):
     @api.custom_transforms
     def f(x):
@@ -739,24 +614,31 @@ class APITest(jtu.JaxTestCase):
     expected = {'hi': 2 * onp.arange(3), 'bye': 2 * onp.ones((3, 2))}
     self.assertAllClose(ans, expected, check_dtypes=False)
 
-  def test_custom_transforms_jvp_with_closure(self):
-    def f(x):
-      @api.custom_transforms
-      def g(y):
-        return x * y
-      return g(x)
-
-    ans = api.grad(f)(1.)
-    expected = 2.
-    self.assertAllClose(ans, expected, check_dtypes=False)
-
   def test_custom_gradient(self):
     @api.custom_gradient
     def f(x):
       return x ** 2, lambda g: (g * x,)
 
-    self.assertAllClose(f(3.), 9., check_dtypes=False)
-    self.assertAllClose(api.grad(f)(3.), 3., check_dtypes=False)
+    self.assertEqual(f(3.), 9.)
+    self.assertEqual(api.grad(f)(3.), 3.)
+
+  def test_devicetuple_iteration(self):
+    tup = device_put(pack((1, 2)))
+    self.assertIsInstance(tup, DeviceTuple)
+    self.assertEqual(tuple(tup), (1, 2))
+
+    tup = device_put(pack((1, pack((2, 3)))))
+    self.assertIsInstance(tup, DeviceTuple)
+    self.assertAllClose(tup, (1, (2, 3)), check_dtypes=False)
+
+  def test_devicetuple_isinstance(self):
+    tup = device_put(pack((1, 2)))
+    self.assertIsInstance(tup, DeviceTuple)
+    self.assertIsInstance(tup, JaxTuple)
+
+  def test_devicetuple_repr(self):
+    tup = device_put(pack((1, 2)))
+    self.assertEqual(repr(tup), 'DeviceTuple(len=2)')
 
   def test_legacy_devicearray_repr(self):
     dx = device_put(3.)
@@ -774,14 +656,14 @@ class APITest(jtu.JaxTestCase):
   def test_devicearray_delete(self):
     x = device_put(1.)
     x.delete()
-    self.assertRaisesRegexp(ValueError, "DeviceValue has been deleted.",
-                            lambda: repr(x))
+    jtu.check_raises_regexp(lambda: repr(x), ValueError,
+                            "DeviceValue has been deleted.")
+
 
   def test_devicearray_block_until_ready(self):
     x = device_put(1.)
-    y = x.block_until_ready()
-    # Tests mostly that block_until_ready() does not produce an error.
-    self.assertTrue(y is x)
+    x.block_until_ready()
+    # Tests only that block_until_ready() does not produce an error.
 
   def test_namedtuple_transparency(self):
     # See https://github.com/google/jax/issues/446
@@ -824,7 +706,7 @@ class APITest(jtu.JaxTestCase):
     y = np.ones((3, 4))
     out_shape = api.eval_shape(fun, x, y)
 
-    self.assertEqual(out_shape.shape, (2, 4))
+    self.assertEqual(out_shape, (2, 4))
 
   def test_eval_shape_constants(self):
     def fun():
@@ -834,7 +716,7 @@ class APITest(jtu.JaxTestCase):
 
     out_shape = api.eval_shape(fun)
 
-    self.assertEqual(out_shape.shape, (2, 4))
+    self.assertEqual(out_shape, (2, 4))
 
   def test_eval_shape_tuple_unpacking(self):
     def fun(x, y):
@@ -845,7 +727,7 @@ class APITest(jtu.JaxTestCase):
     y = 3.
     out_shape = api.eval_shape(fun, x, y)
 
-    self.assertEqual(out_shape.shape, (2,))
+    self.assertEqual(out_shape, (2,))
 
   def test_eval_shape_tuple_itemgetting(self):
     def fun(x, y):
@@ -855,7 +737,7 @@ class APITest(jtu.JaxTestCase):
     y = 3.
     out_shape = api.eval_shape(fun, x, y)
 
-    self.assertEqual(out_shape.shape, (2,))
+    self.assertEqual(out_shape, (2,))
 
   def test_eval_shape_output_dict(self):
     def fun(x, y):
@@ -864,7 +746,6 @@ class APITest(jtu.JaxTestCase):
     x = (np.ones(2), np.ones(2))
     y = 3.
     out_shape = api.eval_shape(fun, x, y)
-    out_shape = tree_util.tree_map(onp.shape, out_shape)
 
     self.assertEqual(out_shape, {'hi': (2,)})
 
@@ -891,7 +772,17 @@ class APITest(jtu.JaxTestCase):
     x = MyArgArray((4, 5), np.float32)
     out_shape = api.eval_shape(fun, A, b, x)
 
-    self.assertEqual(out_shape.shape, (3, 5))
+    self.assertEqual(out_shape, (3, 5))
+
+  def test_detuplification(self):
+    def fun(x):
+      y = pack((x, x))
+      z = pack((y, x))
+      y1, _ = z
+      y2, _ = y1
+      return y2
+
+    assert len(api.make_jaxpr(fun)(1).eqns) == 0
 
   def test_issue_871(self):
     T = np.array([[1., 2.], [3., 4.], [5., 6.]])
@@ -926,332 +817,11 @@ class APITest(jtu.JaxTestCase):
 
   def test_grad_of_int_errors(self):
     dfn = grad(lambda x: x ** 2)
-    self.assertRaisesRegexp(
-      TypeError,
+    jtu.check_raises_regexp(
+      lambda: dfn(3), TypeError,
       "Primal inputs to reverse-mode differentiation must be of float or "
-      "complex type, got type int..", lambda: dfn(3))
+      "complex type, got type int..")
 
-  def test_xla_computation(self):
-    # these tests basically check the examples in the xla_computation docstring
-
-    def h(x):
-      return np.sin(np.cos(x))
-    c = api.xla_computation(h)(2.)
-    self.assertIn('cosine', c.GetHloText())
-    self.assertIn('sine', c.GetHloText())
-
-    def f(x):
-      return x - lax.psum(x, 'i')
-    axis_env = [('i', 4)]
-    c = api.xla_computation(f, axis_env=axis_env)(2)
-    self.assertIn('all-reduce', c.GetHloText())
-    self.assertIn('replica_groups={{0,1,2,3}}', c.GetHloText())
-
-    def g(x):
-      rowsum = lax.psum(x, 'i')
-      colsum = lax.psum(x, 'j')
-      allsum = lax.psum(x, ('i', 'j'))
-      return rowsum, colsum, allsum
-    axis_env = [('i', 4), ('j', 2)]
-    c = api.xla_computation(g, axis_env=axis_env)(5.)
-    self.assertIn('all-reduce', c.GetHloText())
-    self.assertIn('replica_groups={{0,2,4,6},{1,3,5,7}}', c.GetHloText())
-    self.assertIn('replica_groups={{0,1},{2,3},{4,5},{6,7}}', c.GetHloText())
-    self.assertIn('replica_groups={{0,1,2,3,4,5,6,7}}', c.GetHloText())
-
-  def test_xla_computation_args(self):
-    def foo(x, y, z):
-      return x + y + z
-
-    c = api.xla_computation(foo)(1., 2., 3.)
-    self.assertEqual(len(c.GetProgramShape().parameter_shapes()), 3)
-
-    c = api.xla_computation(foo, tuple_args=True)(1., 2., 3.)
-    param_shapes = c.GetProgramShape().parameter_shapes()
-    self.assertEqual(len(param_shapes), 1)
-    self.assertEqual(param_shapes[0].xla_element_type(),
-                     xb.xla_client.PrimitiveType.TUPLE)
-
-  def test_staging_out_multi_replica(self):
-    def f(x):
-      return api.pmap(np.mean)(x)
-    xla_comp = api.xla_computation(f)
-    xla_comp(np.arange(8)).GetHloText()  # doesn't crash
-
-  def test_jit_device(self):
-    device = xb.devices()[-1]
-    x = api.jit(lambda x: x, device=device)(3.)
-    self.assertIsInstance(x, DeviceArray)
-    self.assertEqual(x.device_buffer.device(), device)
-
-  def test_jit_of_noncallable(self):
-    self.assertRaisesRegexp(TypeError, "Expected a callable value.*",
-                            lambda: api.jit(3))
-
-  def test_issue_1062(self):
-    # code from https://github.com/google/jax/issues/1062 @shoyer
-    # this tests, among other things, whether ShardedDeviceTuple constants work
-    device_count = xb.device_count()
-
-    @jit
-    def multi_step(state, count):
-      return lax.fori_loop(0, count, lambda i, s: s, state)
-
-    @jit
-    def multi_step_pmap(state, count=2):
-      @partial(api.pmap, axis_name='x')
-      def pmapped_multi_step(state):
-        return multi_step(state, count)
-
-      return pmapped_multi_step(state)
-
-    u = np.ones((device_count, 100))
-    u_final = multi_step_pmap(u)  # doesn't crash
-
-  @unittest.skipIf(six.PY2, "Test requires Python 3")
-  def test_concurrent_device_get_and_put(self):
-    def f(x):
-      for _ in range(100):
-        y = jax.device_put(x)
-        x = jax.device_get(y)
-      return x
-
-    xs = [onp.random.randn(i) for i in range(10)]
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-      futures = [executor.submit(partial(f, x)) for x in xs]
-      ys = [f.result() for f in futures]
-    for x, y in zip(xs, ys):
-      self.assertAllClose(x, y, check_dtypes=True)
-
-  @unittest.skipIf(six.PY2, "Test requires Python 3")
-  def test_concurrent_jit(self):
-    @jit
-    def f(x):
-      return x + x - 3.
-
-    xs = [onp.random.randn(i) for i in range(10)]
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-      futures = [executor.submit(partial(f, x)) for x in xs]
-      ys = [f.result() for f in futures]
-    for x, y in zip(xs, ys):
-      self.assertAllClose(x * 2 - 3., y, check_dtypes=True)
-
-  def test_dtype_warning(self):
-    # cf. issue #1230
-    if FLAGS.jax_enable_x64:
-      return  # test only applies when x64 is disabled
-
-    def check_warning(warn, nowarn):
-      with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-
-        nowarn()  # get rid of extra startup warning
-
-        prev_len = len(w)
-        nowarn()
-        assert len(w) == prev_len
-
-        warn()
-        assert len(w) > 0
-        msg = str(w[-1].message)
-        expected_prefix = "Explicitly requested dtype "
-        self.assertEqual(expected_prefix, msg[:len(expected_prefix)])
-
-        prev_len = len(w)
-        nowarn()
-        assert len(w) == prev_len
-
-    check_warning(lambda: np.array([1, 2, 3], dtype="float64"),
-                  lambda: np.array([1, 2, 3], dtype="float32"),)
-    check_warning(lambda: np.ones(3, dtype=onp.float64),
-                  lambda: np.ones(3))
-    check_warning(lambda: np.ones_like(3, dtype=onp.int64),
-                  lambda: np.ones_like(3, dtype=onp.int32))
-    check_warning(lambda: np.zeros(3, dtype="int64"),
-                  lambda: np.zeros(3, dtype="int32"))
-    check_warning(lambda: np.zeros_like(3, dtype="float64"),
-                  lambda: np.zeros_like(3, dtype="float32"))
-    check_warning(lambda: np.full((2, 3), 1, dtype="int64"),
-                  lambda: np.full((2, 3), 1))
-    check_warning(lambda: np.ones(3).astype("float64"),
-                  lambda: np.ones(3).astype("float32"))
-    check_warning(lambda: np.eye(3, dtype=onp.float64),
-                  lambda: np.eye(3))
-    check_warning(lambda: np.arange(3, dtype=onp.float64),
-                  lambda: np.arange(3, dtype=onp.float32))
-    check_warning(lambda: np.linspace(0, 3, dtype=onp.float64),
-                  lambda: np.linspace(0, 3, dtype=onp.float32))
-    check_warning(lambda: np.tri(2, dtype="float64"),
-                  lambda: np.tri(2, dtype="float32"))
-
-  def test_custom_vjp_zeros(self):
-    @api.custom_transforms
-    def f(x, y):
-      return 2 * x, 3 * y
-
-    def f_vjp(x, y):
-      return (2 * x, 3 * y), lambda ts: (4 * ts[0], 5 * ts[1])
-
-    api.defvjp_all(f, f_vjp, )
-    api.grad(lambda x, y: f(x, y)[0])(1., 2.)  # doesn't crash
-
-  def test_custom_transforms_vjp_nones(self):
-    # issue rasied by jsnoek@ and jumper@
-    @jax.custom_transforms
-    def solve(a, b):
-      return np.dot(np.linalg.inv(a), b)
-    # print(solve(a, b))
-
-    def solve_vjp(a, b):
-      x = solve(a, b)
-      def vjp(x_tangent):
-        dx = np.dot(solve(a, x_tangent), x.T)
-        out = (dx, b * 0.)
-        return out
-      return x, vjp
-    jax.defvjp_all(solve, solve_vjp)
-    gf = grad(lambda a,b: np.sum(solve(a, b)))
-
-    n = 3
-    a_in = np.linspace(0, 1, n)[:, None]
-    a = np.dot(a_in, a_in.T) + np.eye(n) * 0.1
-    real_x = onp.random.RandomState(0).randn(n)
-    b = np.dot(a + np.eye(a.shape[0]), real_x)
-    print(gf(a, b))  # doesn't crash
-
-  def test_vmap_in_axes_tree_prefix_error(self):
-    # https://github.com/google/jax/issues/795
-    self.assertRaisesRegexp(
-        ValueError,
-        "axes specification must be a tree prefix of the corresponding "
-        r"value, got specification \(0, 0\) for value "
-        r"PyTreeDef\(tuple, \[\*\]\).",
-        lambda: api.vmap(lambda x: x, in_axes=(0, 0))(np.ones(3))
-    )
-
-  def test_vmap_unbatched_object_passthrough_issue_183(self):
-    # https://github.com/google/jax/issues/183
-    fun = lambda f, x: f(x)
-    vfun = api.vmap(fun, (None, 0))
-    ans = vfun(lambda x: x + 1, np.arange(3))
-    self.assertAllClose(ans, onp.arange(1, 4), check_dtypes=False)
-
-  def test_vmap_mismatched_axis_sizes_error_message_issue_705(self):
-    # https://github.com/google/jax/issues/705
-    def h(a, b):
-      return np.sum(a) + np.sum(b)
-
-    X = onp.random.randn(10, 4)
-    U = onp.random.randn(10, 2)
-
-    self.assertRaisesRegex(
-        ValueError,
-        "vmap got inconsistent sizes for array axes to be mapped:\n"
-        r"arg 0 has shape \(10, 4\) and axis 0 is to be mapped" "\n"
-        r"arg 1 has shape \(10, 2\) and axis 1 is to be mapped" "\n"
-        "so\n"
-        "arg 0 has an axis to be mapped of size 10\n"
-        "arg 1 has an axis to be mapped of size 2",
-        lambda: api.vmap(h, in_axes=(0, 1))(X, U))
-
-    self.assertRaisesRegex(
-        ValueError,
-        "vmap got inconsistent sizes for array axes to be mapped:\n"
-        r"arg 0 has shape \(10, 4\) and axis 0 is to be mapped" "\n"
-        r"arg 1 has shape \(10, 2\) and axis 1 is to be mapped" "\n"
-        r"arg 2 has shape \(10, 4\) and axis 0 is to be mapped" "\n"
-        "so\n"
-        "args 0, 2 have axes to be mapped of size 10\n"
-        "arg 1 has an axis to be mapped of size 2",
-        lambda: api.vmap(lambda x, y, z: None, in_axes=(0, 1, 0))(X, U, X))
-
-    self.assertRaisesRegex(
-        ValueError,
-        "vmap got inconsistent sizes for array axes to be mapped:\n"
-        "the tree of axis sizes is:\n"
-        r"\(10, \[2, 2\]\)",
-        lambda: api.vmap(h, in_axes=(0, 1))(X, [U, U]))
-
-  def test_vmap_structured_in_axes(self):
-
-    A, B, C, D = 2, 3, 4, 5
-    K = 6  # batch size
-    x = onp.ones((K, A, B))  # batch axis in different locations
-    y = onp.ones((B, K, C))
-    z = onp.ones((C, D, K))
-
-    def foo(tree_arg):
-      x, (y, z) = tree_arg
-      return np.dot(x, np.dot(y, z))
-
-    tree = (x, (y, z))
-    vfoo = api.vmap(foo, in_axes=((0, (1, 2)),))
-    self.assertEqual(vfoo(tree).shape, (6, 2, 5))
-
-    Point = collections.namedtuple("Point", ["x", "y"])
-    tree = (x, Point(y, z))
-    vfoo = api.vmap(foo, in_axes=((0, Point(1, 2)),))
-    self.assertEqual(vfoo(tree).shape, (6, 2, 5))
-
-    def foo(tree_arg):
-      x, dct = tree_arg
-      y, z = dct['a'], dct['b']
-      return np.dot(x, np.dot(y, z))
-
-    tree = (x, {'a':y, 'b':z})
-    vfoo = api.vmap(foo, in_axes=((0, {'a':1, 'b':2}),))
-    self.assertEqual(vfoo(tree).shape, (6, 2, 5))
-
-    tree = (x, collections.OrderedDict([('a', y), ('b', z)]))
-    vfoo = api.vmap(
-        foo, in_axes=((0, collections.OrderedDict([('a', 1), ('b', 2)])),))
-    self.assertEqual(vfoo(tree).shape, (6, 2, 5))
-
-  def test_jit_reference_dropping(self):
-    x = onp.ones(10)
-    f = (lambda x: lambda: x)(x)  # reference to x in f's closure
-    g = jit(f)
-    x = weakref.ref(x)      # no more strong ref to x in this scope
-    assert x() is not None  # x is still around
-    f()                     # f runs
-    g()                     # g runs
-    g()                     # g runs a second time
-    del f                   # delete the raw callable
-    assert x() is not None  # x is still around
-    g()                     # g still runs
-    del g                   # no more references to x
-    assert x() is None      # x is gone
-
-  def test_jit_global_cache(self):
-    def f(x):
-      assert python_should_be_executing
-      return x
-
-    python_should_be_executing = True
-    api.jit(f)(2)
-    python_should_be_executing = False
-    api.jit(f)(3)
-
-  def test_pmap_global_cache(self):
-    def f(x):
-      assert python_should_be_executing
-      return x
-
-    x = onp.ones(1)
-
-    python_should_be_executing = True
-    api.pmap(f)(x)
-    python_should_be_executing = False
-    api.pmap(f)(x)
-
-    python_should_be_executing = True
-    api.pmap(f, 'i')(x)
-    python_should_be_executing = False
-    api.pmap(f, 'i')(x)
-
-  def test_repr(self):
-    rep = repr(np.ones(()) + 1.)
-    self.assertStartsWith(rep, 'DeviceArray')
 
 if __name__ == '__main__':
   absltest.main()

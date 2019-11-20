@@ -15,7 +15,7 @@
 """A basic MNIST example using JAX with the mini-libraries stax and optimizers.
 
 The mini-library jax.experimental.stax is for neural network building, and
-the mini-library jax.experimental.optimizers is for first-order stochastic
+the mini-library jax.experimentaloptimizers is for first-order stochastic
 optimization.
 """
 
@@ -40,7 +40,7 @@ from examples import datasets
 def loss(params, batch):
   inputs, targets = batch
   preds = predict(params, inputs)
-  return -np.mean(np.sum(preds * targets, axis=1))
+  return -np.mean(preds * targets)
 
 def accuracy(params, batch):
   inputs, targets = batch

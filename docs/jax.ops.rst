@@ -11,8 +11,7 @@ Indexed update operators
 ------------------------
 
 JAX is intended to be used with a functional style of programming, and hence
-does not support NumPy-style indexed assignment directly. Instead, JAX provides
-pure alternatives, namely :func:`jax.ops.index_update` and its relatives.
+does not support NumPy-style indexed assignment directly.
 
 .. autosummary::
   :toctree: _autosummary
@@ -22,11 +21,4 @@ pure alternatives, namely :func:`jax.ops.index_update` and its relatives.
     index_add
     index_min
     index_max
-
-Other operators
----------------
-
-.. autosummary::
-  :toctree: _autosummary
-
     segment_sum

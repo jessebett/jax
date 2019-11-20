@@ -57,23 +57,23 @@ acos = onp.arccos
 atan = onp.arctan
 sinh = onp.sinh
 cosh = onp.cosh
+asinh = onp.arcsinh
+acosh = onp.arccosh
 
 lgamma = scipy.special.gammaln
 digamma = scipy.special.digamma
 erf = scipy.special.erf
 erfc = scipy.special.erfc
-erf_inv = scipy.special.erfinv
-bessel_i0e = scipy.special.i0e
-bessel_i1e = scipy.special.i1e
+erf_inv = scipy.special.erfi
 
 real = onp.real
 imag = onp.imag
 
 def conj(x):
-  return onp.conj(x) + onp.complex64(0)
+  return onp.asarray(onp.conj(x), dtype=onp.complex64)
 
 def complex(x, y):
-  return x + onp.complex64(1j) * y
+  return onp.asarray(x + 1j * y, dtype=onp.complex64)
 
 abs = onp.absolute
 pow = onp.power

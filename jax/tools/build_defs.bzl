@@ -139,7 +139,6 @@ EOF
         srcs = [
             runner + ".py",
         ],
-        python_version = "PY2",
         deps = deps + [
             "//third_party/py/jax/jaxlib",
             "//third_party/py/jax/tools:jax_to_hlo",

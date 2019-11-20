@@ -14,7 +14,7 @@
 
 # JAX is Autograd and XLA
 
-licenses(["notice"])
+licenses(["notice"])  # Apache 2
 
 package(default_visibility = ["//visibility:public"])
 
@@ -32,7 +32,6 @@ py_library(
             "ops/*.py",
             "scipy/*.py",
             "scipy/stats/*.py",
-            "nn/*.py",
         ],
         exclude = [
             "*_test.py",
@@ -61,19 +60,15 @@ py_library(
 )
 
 py_library(
-    name = "optix",
-    srcs = ["experimental/optix.py"],
+    name = "lapax",
+    srcs = ["experimental/lapax.py"],
     deps = [":jax"],
 )
 
-py_library(
-    name = "ode",
-    srcs = ["experimental/ode.py"],
-    deps = [":jax"],
-)
-
-py_library(
-    name = "vectorize",
-    srcs = ["experimental/vectorize.py"],
+# this is a dummy target for building purposes
+py_binary(
+    name = "build_jax",
+    srcs = ["__init__.py"],
+    main = "__init__.py",
     deps = [":jax"],
 )
