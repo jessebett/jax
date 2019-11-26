@@ -317,6 +317,37 @@ def prop_div(primals_in, series_in):
   return v[0], list(v[1:])
 fdb.prop_rules[div_p] = prop_div
 
+def sol_recursive(f,z,t):
+  # closure to expand z
+  def g(z):
+    return f(z,t)
+
+  # Explicitly call coefficient functions
+  def y0_coeff(x0):
+    return jet(g, (x0, ), ((np.zeros_like(x0), ), ))[0]
+
+  def y1_coeff(x0,x1):
+    return jet(g, (x0, ), ((x1, ), ))[1]
+
+  def y1_coeff(x0,x1):
+    return jet(g, (x0, ), ((x1, ), ))[1]
+
+  # First coeffs computed recursively
+  (y0, [y1h]) = jet(g, (z, ), ((1., ), ))
+  (y0, [y1, y2h]) = jet(g, (z, ), ((
+      y0,
+      y1h,
+  ), ))
+  (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
+  (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
+  (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z, ),
+                                    ((y0, y1, y2, y3, y4h), ))
+  (y0, [y1, y2, y3, y4, y5,y6h]) = jet(g, (z, ),
+                                    ((y0, y1, y2, y3, y4, y5h), ))
+
+  
+  return (y0, [y1, y2, y3, y4, y5])
+  # print(true_ds,"\n")
 # from scipy.integrate import odeint as odeint_impl
 #
 # def odeint(f,z0,t, rtol=1e-7,atol=1e-9):
