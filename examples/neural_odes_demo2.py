@@ -13,12 +13,12 @@ import sys
 
 import jax
 import jax.numpy as np
-from jax import random, grad, lax
+from jax import random, grad
 from jax.config import config
-from jax.experimental import stax, optimizers
+from jax.experimental import optimizers
 from jax.experimental.ode import odeint, build_odeint, vjp_odeint
-from jax.experimental.stax import Dense, Tanh
 from jax.flatten_util import ravel_pytree
+from jax.nn.initializers import glorot_normal, normal
 
 REGS = ['r0', 'r1']
 NUM_REGS = len(REGS)
@@ -91,27 +91,44 @@ def pack_batch(key):
     return key, flat_batch_y0_t, flat_batch_y0_t_r0_allr0, batch_t, batch_y
 
 
-def run(reg, lam, key, dirname):
+def run(reg, lam, rng, dirname):
     """
     Run the neural ODEs method.
     """
     print("Reg: %s\tLambda %.4e" % (reg, lam))
     print("Reg: %s\tLambda %.4e" % (reg, lam), file=sys.stderr)
 
-    # set up MLP
-    init_random_params, predict = stax.serial(
-        Dense(50), Tanh,
-        Dense(D)
-    )
+    def sigmoid(z):
+        return 1./(1. + np.exp(-z))
 
-    output_shape, init_params = init_random_params(key, (-1, D + 1))
-    assert output_shape == (-1, D)
+    def predict(params, y_t):
+        w_1, b_1 = params[0]
+        z_1 = np.dot(y_t, w_1) + np.expand_dims(b_1, axis=0)
+        out_1 = sigmoid(z_1)
+
+        w_2, b_2 = params[1]
+        z_1 = np.dot(out_1, w_2) + np.expand_dims(b_2, axis=0)
+
+        return z_1
+
+    hidden_dim = 50
+
+    # initialize the parameters
+    rng, layer_rng = random.split(rng)
+    k1, k2 = random.split(layer_rng)
+    w_1, b_1 = glorot_normal()(k1, (D + 1, hidden_dim)), normal()(k2, (hidden_dim,))
+
+    rng, layer_rng = random.split(rng)
+    k1, k2 = random.split(layer_rng)
+    w_2, b_2 = glorot_normal()(k1, (hidden_dim, D)), normal()(k2, (D,))
+
+    init_params = [(w_1, b_1), (w_2, b_2)]
 
     # define ravel objects
 
     flat_params, ravel_params = ravel_pytree(init_params)
 
-    key, batch_y0, batch_t, batch_y = get_batch(key)
+    rng, batch_y0, batch_t, batch_y = get_batch(rng)
 
     r0 = np.zeros((parse_args.batch_size, 1))
     allr0 = np.zeros((parse_args.batch_size, NUM_REGS))
@@ -327,7 +344,7 @@ def run(reg, lam, key, dirname):
         for batch in range(batch_per_epoch):
             itr = epoch * batch_per_epoch + batch + 1
 
-            key, flat_batch_y0_t, flat_batch_y0_t_r0_allr0, batch_t, batch_y = pack_batch(key)
+            key, flat_batch_y0_t, flat_batch_y0_t_r0_allr0, batch_t, batch_y = pack_batch(rng)
 
             fargs = get_params(opt_state)
 
