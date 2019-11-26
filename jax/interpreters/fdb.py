@@ -56,7 +56,7 @@ class JetTrace(core.Trace):
     order, = {len(terms) for terms in series_in if terms is not zero_series}
     series_in = [[zero_term] * order if s is zero_series else s
                  for s in series_in]
-    series_in = [[onp.zeros_like(x) if t is zero_term else t for t in series]
+    series_in = [[onp.zeros(onp.shape(x), dtype=onp.result_type(x)) if t is zero_term else t for t in series]
                  for x, series in zip(primals_in, series_in)]
     primal_out, terms_out = prop_rules[primitive](primals_in, zip(*series_in), **params)
     return JetTracer(self, primal_out, terms_out)

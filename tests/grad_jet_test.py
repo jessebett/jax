@@ -48,7 +48,7 @@ def test_grad_mlp():
   f_mlp = lambda x: mlp(M1,M2,x)
   M1,M2 = (npr.randn(10,10), npr.randn(10,5))
   x= npr.randn(2,10)
-  terms_in = [np.ones_like(x),np.zeros_like(x), np.zeros_like(x),np.zeros_like(x)]
+  terms_in = [np.ones_like(x)]+ [np.zeros_like(x)]*5
   # jvp_test_jet(f_mlp,(x,),[terms_in])
 
   def jvp_mlp(M1):
@@ -73,12 +73,17 @@ def test_grad_mlp():
   d2fdm_jvp = grad(lambda m1 : jvp_mlp(m1)[1][0])(M1)
   # gradient of third x-derivative wrt m1 with jvp
   d3fdm_jvp = grad(lambda m1 : jvp_mlp(m1)[1][1])(M1)
+  # gradient of fifth x-derivative wrt m1 with jvp
+  d5fdm_jvp = grad(lambda m1 : jvp_mlp(m1)[1][4])(M1)
 
   # gradient of second x-derivative wrt m1 with jet
   d2fdm_jet = grad(lambda m1 : jet_mlp(m1)[1][0])(M1)
   # gradient of third x-derivative wrt m1 with jet
   d3fdm_jet = grad(lambda m1 : jet_mlp(m1)[1][1])(M1)
+  # gradient of fifth x-derivative wrt m1 with jet
+  d5fdm_jet = grad(lambda m1 : jet_mlp(m1)[1][4])(M1)
 
   assert np.allclose(d2fdm_jet,d2fdm_jvp)
   assert np.allclose(d3fdm_jet,d3fdm_jvp)
+  assert np.allclose(d5fdm_jet,d5fdm_jvp)
 

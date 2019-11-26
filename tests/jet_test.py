@@ -286,8 +286,8 @@ def test_sol_recursive():
   (y0, [y1, y2, y3, y4h]) = jet(g, (z_eval_true, ), ((y0, y1, y2, y3h), ))
   (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z_eval_true, ),
                                     ((y0, y1, y2, y3, y4h), ))
-  # print (y0, [y1, y2, y3, y4, y5h])
-  # print true_ds
+  print((y0, [y1, y2, y3, y4, y5h]),"\n")
+  print(true_ds,"\n")
 
 
 def test_sol_newtondouble_explicit():

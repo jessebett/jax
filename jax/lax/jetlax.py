@@ -216,9 +216,8 @@ def prop_mul(primals_in, series_in):
   vu, vw = zip(*series_in)
   u = [u0,] + list(vu)
   w = [w0,] + list(vw)
-  import ipdb; ipdb.set_trace()
-  # v = manual_mul_conv(u,w)
-  v_conv = mul_conv(u,w)
+  v_conv = manual_mul_conv(u,w)
+  # v_conv = mul_conv(u,w) #TODO: GPU backed convolution. Ask mattj about double tracer
   return v_conv[0], v_conv[1:]
 fdb.prop_rules[mul_p] = prop_mul
 
