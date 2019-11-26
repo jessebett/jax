@@ -13,14 +13,14 @@ import sys
 
 import jax
 import jax.numpy as np
-from jax import random, grad
+from jax import random, grad, jet
 from jax.config import config
 from jax.experimental import optimizers
 from jax.experimental.ode import odeint, build_odeint, vjp_odeint
 from jax.flatten_util import ravel_pytree
 from jax.nn.initializers import glorot_normal, normal
 
-REGS = ['r0', 'r1']
+REGS = ['r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6']
 NUM_REGS = len(REGS)
 
 parser = argparse.ArgumentParser('ODE demo')
@@ -32,7 +32,7 @@ parser.add_argument('--nepochs', type=int, default=1000)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--reg', type=str, choices=['none'] + REGS, default='none')
 parser.add_argument('--test_freq', type=int, default=1)
-parser.add_argument('--save_freq', type=int, default=500)
+parser.add_argument('--save_freq', type=int, default=1)
 parser.add_argument('--dirname', type=str, default='tmp15')
 parser.add_argument('--viz', action='store_true')
 parser.add_argument('--gpu', type=int, default=0)
@@ -53,6 +53,24 @@ true_y = np.concatenate((np.expand_dims(true_y0, axis=0),
                         axis=0)  # (T, N, D)
 t = np.array([0., 1.])  # (T)
 
+
+def sol_recursive(f,z,t):
+  # closure to expand z
+  def g(z):
+    return f(z,t)
+
+  # First coeffs computed recursively
+  (y0, [y1h]) = jet(g, (z, ), ((np.ones_like(z), ), ))
+  (y0, [y1, y2h]) = jet(g, (z, ), (( y0, y1h,), ))
+  (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
+  (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
+  (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z, ),
+                                    ((y0, y1, y2, y3, y4h), ))
+  (y0, [y1, y2, y3, y4, y5,y6h]) = jet(g, (z, ),
+                                    ((y0, y1, y2, y3, y4, y5h), ))
+
+
+  return (y0, [y1, y2, y3, y4, y5])
 
 @jax.jit
 def get_batch(key):
@@ -110,6 +128,14 @@ def run(reg, lam, rng, dirname):
         z_1 = np.dot(out_1, w_2) + np.expand_dims(b_2, axis=0)
 
         return z_1
+
+    def jet_wrap_predict(params):
+        """
+        Function which returns a closure that has the correct API for jet.
+        """
+        return lambda z, t: predict(params, np.concatenate((z,
+                                                            np.ones((z.shape[0], 1)) * t),
+                                                           axis=1))
 
     hidden_dim = 50
 
@@ -231,19 +257,35 @@ def run(reg, lam, rng, dirname):
                                       np.ones((parse_args.batch_size, 1))),
                                      axis=1)
 
+        y0, y_n = sol_recursive(jet_wrap_predict(params), y, y_t[:, -1][0])
+
+        none = np.zeros(parse_args.batch_size)
         r0 = np.sum(y ** 2, axis=1) ** 0.5
         r1 = np.sum(predictions_y ** 2, axis=1)
-        if reg == "r0":
-            regularization = r0
-        elif reg == "r1":
-            regularization = r1
-        else:
-            regularization = np.zeros(parse_args.batch_size)
+        r2 = np.sum(y_n[0] ** 2, axis=1)
+        r3 = np.sum(y_n[1] ** 2, axis=1)
+        r4 = np.sum(y_n[2] ** 2, axis=1)
+        r5 = np.sum(y_n[3] ** 2, axis=1)
+        r6 = np.sum(y_n[4] ** 2, axis=1)
+
+        regs_map = {
+            "none": none,
+            "r0": r0,
+            "r1": r1,
+            "r2": r2,
+            "r3": r3,
+            "r4": r4,
+            "r5": r5,
+            "r6": r6
+        }
+
+        regularization = regs_map[reg]
+
+        regs = tuple(np.expand_dims(regs_map[reg_name], axis=1) for reg_name in REGS)
 
         pred_reg = np.concatenate((predictions,
                                    np.expand_dims(regularization, axis=1),
-                                   np.expand_dims(r0, axis=1),
-                                   np.expand_dims(r1, axis=1)),
+                                   *regs),
                                   axis=1)
         flat_pred_reg = np.reshape(pred_reg, (-1,))
         return flat_pred_reg
@@ -269,19 +311,35 @@ def run(reg, lam, rng, dirname):
                                       np.ones((parse_args.data_size, 1))),
                                      axis=1)
 
+        y0, y_n = sol_recursive(jet_wrap_predict(params), y, y_t[:, -1][0])
+
+        none = np.zeros(parse_args.batch_size)
         r0 = np.sum(y ** 2, axis=1) ** 0.5
-        r1 = np.sum(predictions_y ** 2, axis=1) ** 0.5
-        if reg == "r0":
-            regularization = r0
-        elif reg == "r1":
-            regularization = r1
-        else:
-            regularization = np.zeros(parse_args.data_size)
+        r1 = np.sum(predictions_y ** 2, axis=1)
+        r2 = np.sum(y_n[0] ** 2, axis=1)
+        r3 = np.sum(y_n[1] ** 2, axis=1)
+        r4 = np.sum(y_n[2] ** 2, axis=1)
+        r5 = np.sum(y_n[3] ** 2, axis=1)
+        r6 = np.sum(y_n[4] ** 2, axis=1)
+
+        regs_map = {
+            "none": none,
+            "r0": r0,
+            "r1": r1,
+            "r2": r2,
+            "r3": r3,
+            "r4": r4,
+            "r5": r5,
+            "r6": r6
+        }
+
+        regularization = regs_map[reg]
+
+        regs = tuple(np.expand_dims(regs_map[reg_name], axis=1) for reg_name in REGS)
 
         pred_reg = np.concatenate((predictions,
                                    np.expand_dims(regularization, axis=1),
-                                   np.expand_dims(r0, axis=1),
-                                   np.expand_dims(r1, axis=1)),
+                                   *regs),
                                   axis=1)
         flat_pred_reg = np.reshape(pred_reg, (-1,))
         return flat_pred_reg
@@ -375,16 +433,12 @@ def run(reg, lam, rng, dirname):
 
                 total_loss = total_loss_fun(pred_y_t_r, true_y)
 
-                r0_reg = np.mean(pred_y_t_r_allr[1, :, -2])
-                r1_reg = np.mean(pred_y_t_r_allr[1, :, -1])
+                rk_reg = tuple(pred_y_t_r_allr[1, :, reg_ind - NUM_REGS] for reg_ind in range(NUM_REGS))
+                print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | Loss {:.6f} | ' + \
+                            ' | '.join("%s {.6f}" % reg for reg in REGS)
 
-                print('Iter {:04d} | Total (Regularized) Loss {:.6f} | Loss {:.6f} | '
-                      'r0 {:.6f} | r1 {:.6f}'.
-                      format(itr, total_loss, loss, r0_reg, r1_reg))
-                print('Iter {:04d} | Total (Regularized) Loss {:.6f} | Loss {:.6f} | '
-                      'r0 {:.6f} | r1 {:.6f}'.
-                      format(itr, total_loss, loss, r0_reg, r1_reg),
-                      file=sys.stderr)
+                print(print_str.format(itr, total_loss, loss, *rk_reg))
+                print(print_str.format(itr, total_loss, loss, *rk_reg), file=sys.stderr)
 
             if itr % parse_args.save_freq == 0:
                 param_filename = "%s/reg_%s_lam_%.4e_%d_fargs.pickle" % (dirname, reg, lam, itr)
