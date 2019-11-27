@@ -20,7 +20,7 @@ from jax.experimental.ode import odeint, build_odeint, vjp_odeint
 from jax.flatten_util import ravel_pytree
 from jax.nn.initializers import glorot_normal, normal
 
-REGS = ['r0', 'r1']
+REGS = ['r0', 'r1', 'r2']
 NUM_REGS = len(REGS)
 
 parser = argparse.ArgumentParser('ODE demo')
@@ -272,7 +272,7 @@ def run(reg, lam, rng, dirname):
             "none": none,
             "r0": r0,
             "r1": r1,
-            # "r2": r2,
+            "r2": r2,
             # "r3": r3,
             # "r4": r4,
             # "r5": r5,
@@ -326,7 +326,7 @@ def run(reg, lam, rng, dirname):
             "none": none,
             "r0": r0,
             "r1": r1,
-            # "r2": r2,
+            "r2": r2,
             # "r3": r3,
             # "r4": r4,
             # "r5": r5,
