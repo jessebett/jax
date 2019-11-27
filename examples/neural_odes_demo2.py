@@ -20,7 +20,7 @@ from jax.experimental.ode import odeint, build_odeint, vjp_odeint
 from jax.flatten_util import ravel_pytree
 from jax.nn.initializers import glorot_normal, normal
 
-REGS = ['r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6']
+REGS = ['r0', 'r1']
 NUM_REGS = len(REGS)
 
 parser = argparse.ArgumentParser('ODE demo')
@@ -272,11 +272,11 @@ def run(reg, lam, rng, dirname):
             "none": none,
             "r0": r0,
             "r1": r1,
-            "r2": r2,
-            "r3": r3,
-            "r4": r4,
-            "r5": r5,
-            "r6": r6
+            # "r2": r2,
+            # "r3": r3,
+            # "r4": r4,
+            # "r5": r5,
+            # "r6": r6
         }
 
         regularization = regs_map[reg]
@@ -313,7 +313,7 @@ def run(reg, lam, rng, dirname):
 
         y0, y_n = sol_recursive(jet_wrap_predict(params), y, y_t[:, -1][0])
 
-        none = np.zeros(parse_args.batch_size)
+        none = np.zeros(parse_args.data_size)
         r0 = np.sum(y ** 2, axis=1) ** 0.5
         r1 = np.sum(predictions_y ** 2, axis=1)
         r2 = np.sum(y_n[0] ** 2, axis=1)
@@ -326,11 +326,11 @@ def run(reg, lam, rng, dirname):
             "none": none,
             "r0": r0,
             "r1": r1,
-            "r2": r2,
-            "r3": r3,
-            "r4": r4,
-            "r5": r5,
-            "r6": r6
+            # "r2": r2,
+            # "r3": r3,
+            # "r4": r4,
+            # "r5": r5,
+            # "r6": r6
         }
 
         regularization = regs_map[reg]
@@ -433,9 +433,9 @@ def run(reg, lam, rng, dirname):
 
                 total_loss = total_loss_fun(pred_y_t_r, true_y)
 
-                rk_reg = tuple(pred_y_t_r_allr[1, :, reg_ind - NUM_REGS] for reg_ind in range(NUM_REGS))
+                rk_reg = tuple(float(np.mean(pred_y_t_r_allr[1, :, reg_ind - NUM_REGS])) for reg_ind in range(NUM_REGS))
                 print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | Loss {:.6f} | ' + \
-                            ' | '.join("%s {.6f}" % reg for reg in REGS)
+                            ' | '.join("%s {:.6f}" % reg for reg in REGS)
 
                 print(print_str.format(itr, total_loss, loss, *rk_reg))
                 print(print_str.format(itr, total_loss, loss, *rk_reg), file=sys.stderr)
