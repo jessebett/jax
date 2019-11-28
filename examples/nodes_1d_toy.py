@@ -243,6 +243,10 @@ def unpack_aug(yr):
   return yr[:,:D],yr[:,D:]
 
 @jax.jit
+def r2(y,t,params):
+  return np.sum(sol_recursive(jet_wrap_predict(ravel_params(params)),y,t)[1][0]**2,axis=1,keepdims=True)
+
+@jax.jit
 def aug_dynamics(yr,t,*args):
   """
   yr::unravel((BS,D+R))
@@ -253,7 +257,6 @@ def aug_dynamics(yr,t,*args):
   y,r = ravel_yr(yr)[:,:D], ravel_yr(yr)[:,D:] # because jax needs flat yr
   yt = append_time(y,t)
   dydt = predict(ravel_params(np.array(args)),yt)
-  # drdt = 0.*r #trivial dynamics
   drdt = r2(y,t,np.array(args))
 
   return np.ravel(append_aug(dydt,drdt)) # jax needs flat y
@@ -286,38 +289,11 @@ dr2dp_func=jax.jit(grad(loss_aug, argnums=-1))
 
 dr2dp = dr2dp_func(b_y0,ts,flat_params)
 
-sol_recursive(jet_wrap_predict(ravel_params(flat_params)),b_y0,0.)[1][0]
 
-jax.jacobian(jet_wrap_predict(ravel_params(flat_params)))(b_y0,0.)
-
-
-l_p = lambda params : nodes_predict_and_loss(b_y1, np.ravel(b_y0), ts, params)
-
-l_p(flat_params)
-
-dldp = jax.grad(l_p)(flat_params)
-
-nd(l_p,flat_params)
-
-
-j1_p = lambda params : np.sum(sol_recursive(jet_wrap_predict(ravel_params(params)),b_y0,0.)[1][0])
-j2_p = lambda params : np.sum(sol_recursive(jet_wrap_predict(ravel_params(params)),b_y0,0.)[1][1]**2,axis=1,keepdims=True)
-
-r3 = j2_p(flat_params)
-
-flat_yr, ravel_yr = ravel_pytree(append_reg(b_y0,r3))
-
-
-jax.grad(j1_p)(flat_params)
-
-nd(j1_p,flat_params)
-
-
-jax.grad(j2_p)(flat_params)
-
-nd(j2_p,flat_params)
+### For testing gradients 
 
 # numerical grad test
+import numpy as onp
 def nd(f, x, eps=1e-5):
   flat_x, unravel = ravel_pytree(x)
   dim = len(flat_x)
@@ -328,76 +304,11 @@ def nd(f, x, eps=1e-5):
     g[i] = (f(unravel(flat_x + d)) - f(unravel(flat_x - d))) / (2.0 * eps)
   return g
 
-## Try integrating sol
-def append_reg(y,r):
-  """
-  y::(BS,D)
-  r::(BS,R)
-  yr::(BS,D+R)
-  """
-  yr = np.concatenate((y,r),axis=1)
-  return yr
 
-def unpack_reg(yr):
-  return yr[:,:D],yr[:,D:]
+# test grad ode jet sol nn
+dr2dp_func=jax.jit(grad(loss_aug, argnums=-1))
+dr2dp = dr2dp_func(b_y0,ts,flat_params)
 
-@jax.jit
-def r2(y,t,params):
-  return np.sum(sol_recursive(jet_wrap_predict(ravel_params(params)),y,t)[1][0]**2,axis=1,keepdims=True)
-
-
-@jax.jit
-def reg_dynamics(yr,t,*args):
-  """
-  yr::unravel((BS,D+R))
-  t::scalar
-  args::flat_params
-  return::unravel((BS,D+R))
-  """
-  y,r = ravel_yr(yr)[:,:D], ravel_yr(yr)[:,D:] # because jax needs flat yr
-  yt = append_time(y,t)
-  dydt = predict(ravel_params(np.array(args)),yt)
-  # drdt = r2(y,t,np.array(args))
-  drdt = 0.*r
-  return np.ravel(append_reg(dydt,drdt)) # jax needs flat y
-
-nodeint_r = jax.jit(build_odeint(reg_dynamics))
-
-
-def reg_init(y):
-  return append_reg(y,np.zeros_like(y))
-
-reg_init(b_y0)
-
-yr_sol = nodeint_r(np.ravel(reg_init(b_y0)),ts,*flat_params)
-yr_sol = np.array(jax.map(ravel_yr,yr_sol))
-
-yr0, yr1 = yr_sol
-
-y1_pred, r_pred = unpack_reg(yr1)
-
-np.sum(r_pred)
-
-
-@jax.jit
-def r2_p(params):
-  # Integrate Regularized Dynamics
-  yr_sol = nodeint_r(np.ravel(reg_init(b_y0)),ts,*params)
-  yr_sol = np.array(jax.map(ravel_yr,yr_sol))
-
-  # Get final state
-  yr1 = yr_sol[-1]
-
-  # Separate state and regularizer state
-  y1_pred, r_pred = unpack_reg(yr1)
-
-  # compute mean
-  return np.mean(r_pred)
-
-r2_p(flat_params)
-
-jax.grad(r2_p)(flat_params)
-
-import numpy as onp
-
-nd(r2_p, flat_params)
+# make closure for numerical version
+dr2_p_closure = jax.jit(lambda params : loss_aug(b_y0,ts,params))
+dr2dp_numerical = nd(dr2_p_closure, flat_params)
