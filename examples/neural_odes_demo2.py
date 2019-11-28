@@ -32,7 +32,7 @@ parser.add_argument('--nepochs', type=int, default=1000)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--reg', type=str, choices=['none'] + REGS, default='none')
 parser.add_argument('--test_freq', type=int, default=1)
-parser.add_argument('--save_freq', type=int, default=1)
+parser.add_argument('--save_freq', type=int, default=500)
 parser.add_argument('--dirname', type=str, default='tmp15')
 parser.add_argument('--viz', action='store_true')
 parser.add_argument('--gpu', type=int, default=0)
@@ -402,7 +402,7 @@ def run(reg, lam, rng, dirname):
         for batch in range(batch_per_epoch):
             itr = epoch * batch_per_epoch + batch + 1
 
-            key, flat_batch_y0_t, flat_batch_y0_t_r0_allr0, batch_t, batch_y = pack_batch(rng)
+            rng, flat_batch_y0_t, flat_batch_y0_t_r0_allr0, batch_t, batch_y = pack_batch(rng)
 
             fargs = get_params(opt_state)
 
