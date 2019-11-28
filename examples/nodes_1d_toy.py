@@ -16,7 +16,7 @@ import jax.numpy as np
 from jax import random, grad, jet
 from jax.config import config
 from jax.experimental import optimizers
-from jax.experimental.ode import build_odeint
+from jax.experimental.ode import build_odeint, odeint, vjp_odeint
 from jax.flatten_util import ravel_pytree
 from jax.nn.initializers import glorot_normal, normal
 
@@ -215,6 +215,7 @@ def run(reg, lam, rng, dirname):
       ys_pred = nodeint(np.ravel(y0), ts, *flat_params)
       y1_pred = np.reshape(ys_pred[-1], (-1, D))
       return loss_fun(y1_pred, y1_target)
+    grad_loss_fun = grad(loss_fun)
 
     @jax.jit
     def loss_reg(flat_params, ys, ts):
@@ -253,6 +254,14 @@ def run(reg, lam, rng, dirname):
     opt_init, opt_update, get_params = optimizers.rmsprop(step_size=1e-2, gamma=0.99)
     opt_state = opt_init(flat_params)
 
+    @jax.jit
+    def update(itr, opt_state, batch_y):
+      """
+      Update the parameters.
+      """
+      dldp = grad(loss_aug)(flat_params, batch_y, ts)
+      return opt_update(itr, dldp, opt_state)
+
     if parse_args.test:
       import numpy as onp
 
@@ -280,22 +289,44 @@ def run(reg, lam, rng, dirname):
       print(abs_diff)
       assert onp.allclose(dr2dp, dr2dp_numerical, atol=1e-5)
 
-    assert parse_args.data_size % parse_args.batch_size == 0
-    batch_per_epoch = parse_args.data_size // parse_args.batch_size
+    # counting NFE
+    unreg_nodeint = jax.jit(lambda y0, t, args: odeint(dynamics, y0, t, *args))
+    unreg_nodeint_vjp = jax.jit(lambda cotangent, y0, t, args:
+                                vjp_odeint(dynamics, y0, t, *args, nfe=True)[1](np.reshape(cotangent,
+                                                                                           (parse_args.batch_time,
+                                                                                            parse_args.batch_size *
+                                                                                            D)))[-1])
 
-    @jax.jit
-    def update(itr, opt_state, batch_y):
-        dldp = grad(loss_aug)(flat_params, batch_y, ts)
-        return opt_update(itr, dldp, opt_state)
+    def count_nfe(opt_state, ys):
+      """
+      Count NFE and print.
+      """
+      y0, y1_target = ys
+      flat_params = get_params(opt_state)
+      flat_y0 = np.ravel(y0)
+
+      ys_pred, f_nfe = unreg_nodeint(flat_y0, ts, flat_params)
+      y1_pred = np.reshape(ys_pred[-1], (-1, D))
+
+      grad_loss_fun_ = grad_loss_fun(y1_pred, y1_target)
+      # grad is 0 at t0 (since always equal)
+      cotangent = np.stack((np.zeros_like(grad_loss_fun_), grad_loss_fun_), axis=0)
+      b_nfe = unreg_nodeint_vjp(cotangent, flat_y0, ts, flat_params)
+
+      print("forward NFE: %d" % f_nfe)
+      print("backward NFE: %d" % b_nfe)
 
     itr = 0
+    assert parse_args.data_size % parse_args.batch_size == 0
+    batch_per_epoch = parse_args.data_size // parse_args.batch_size
     for epoch in range(parse_args.nepochs):
       for batch in range(batch_per_epoch):
         itr += 1
 
-        # TODO: count forward NFE
-
         rng, batch_y = get_batch(rng)
+
+        count_nfe(opt_state, batch_y)
+
         opt_state = update(itr, opt_state, batch_y)
 
         if itr % parse_args.test_freq == 0:
