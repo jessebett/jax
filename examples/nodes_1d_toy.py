@@ -124,14 +124,15 @@ def sol_recursive(f,z,t):
   (y0, [y1h]) = jet(g, (z, ), ((np.ones_like(z), ), ))
   (y0, [y1, y2h]) = jet(g, (z, ), (( y0, y1h,), ))
   (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
-  (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
-  (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z, ),
-                                    ((y0, y1, y2, y3, y4h), ))
-  (y0, [y1, y2, y3, y4, y5,y6h]) = jet(g, (z, ),
-                                    ((y0, y1, y2, y3, y4, y5h), ))
+  # (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
+  # (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z, ),
+  #                                   ((y0, y1, y2, y3, y4h), ))
+  # (y0, [y1, y2, y3, y4, y5,y6h]) = jet(g, (z, ),
+  #                                   ((y0, y1, y2, y3, y4, y5h), ))
+  #
 
-
-  return (y0, [y1, y2, y3, y4, y5])
+  # return (y0, [y1, y2, y3, y4, y5])
+  return  (y0, [y1, y2])
 
 # Neural ODE
 @jax.jit
@@ -228,6 +229,62 @@ for epoch in range(parse_args.nepochs):
       b_y1_pred = y_sol[-1]
       print(loss_fun(b_y1_pred,b_y1))
 
+### Integrate regularizer
+def append_aug(y,r):
+  """
+  y::(BS,D)
+  r::(BS,R)
+  yr::(BS,D+R)
+  """
+  yr = np.concatenate((y,r),axis=1)
+  return yr
+
+def unpack_aug(yr):
+  return yr[:,:D],yr[:,D:]
+
+@jax.jit
+def aug_dynamics(yr,t,*args):
+  """
+  yr::unravel((BS,D+R))
+  t::scalar
+  args::flat_params
+  return::unravel((BS,D+R))
+  """
+  y,r = ravel_yr(yr)[:,:D], ravel_yr(yr)[:,D:] # because jax needs flat yr
+  yt = append_time(y,t)
+  dydt = predict(ravel_params(np.array(args)),yt)
+  # drdt = 0.*r #trivial dynamics
+  drdt = r2(y,t,np.array(args))
+
+  return np.ravel(append_aug(dydt,drdt)) # jax needs flat y
+
+nodeint_aug = jax.jit(build_odeint(aug_dynamics))
+
+def aug_init(y):
+  return append_aug(y,np.zeros_like(y))
+
+flat_yr, ravel_yr = ravel_pytree(aug_init(b_y0))
+
+@jax.jit
+def loss_aug(y0, ts, params):
+  # Integrate Augmented Dynamics
+  yr_sol = nodeint_aug(np.ravel(aug_init(y0)),ts,*params)
+  yr_sol = np.array(jax.map(ravel_yr,yr_sol))
+
+  # Get final state
+  yr1 = yr_sol[-1]
+
+  # Separate state and augmented state
+  y1_pred, r_pred = unpack_aug(yr1)
+
+  # compute mean
+  return np.mean(r_pred)
+
+loss_aug(b_y0,ts,flat_params) 
+
+dr2dp_func=jax.jit(grad(loss_aug, argnums=-1))
+
+dr2dp = dr2dp_func(b_y0,ts,flat_params)
 
 sol_recursive(jet_wrap_predict(ravel_params(flat_params)),b_y0,0.)[1][0]
 
