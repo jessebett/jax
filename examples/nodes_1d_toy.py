@@ -343,7 +343,7 @@ def run(reg, lam, rng, dirname):
             loss_reg_ = loss_reg(flat_params, true_y, ts)
 
             print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
-                        'Loss {:.6f} | r2 {:.6f}'.format(itr, loss_, loss_aug_, loss_reg_)
+                        'Loss {:.6f} | r {:.6f}'.format(itr, loss_, loss_aug_, loss_reg_)
 
             print(print_str)
             print(print_str, file=sys.stderr)
