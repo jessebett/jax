@@ -20,8 +20,7 @@ from jax.experimental.ode import build_odeint, odeint, vjp_odeint
 from jax.flatten_util import ravel_pytree
 from jax.nn.initializers import glorot_normal, normal
 
-REGS = ['r2']
-NUM_REGS = len(REGS)
+REGS = ['none', 'r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6']
 
 parser = argparse.ArgumentParser('ODE demo')
 parser.add_argument('--data_size', type=int, default=1000)
@@ -29,7 +28,7 @@ parser.add_argument('--batch_time', type=int, default=2)
 parser.add_argument('--batch_size', type=int, default=200)
 parser.add_argument('--nepochs', type=int, default=1000)
 parser.add_argument('--lam', type=float, default=0)
-parser.add_argument('--reg', type=str, choices=['none'] + REGS, default='none')
+parser.add_argument('--reg', type=str, choices=REGS, default='none')
 parser.add_argument('--test_freq', type=int, default=1)
 parser.add_argument('--save_freq', type=int, default=500)
 parser.add_argument('--dirname', type=str, default='tmp15')
@@ -50,6 +49,7 @@ def run(reg, lam, rng, dirname):
     # set up data
     D = 1
     NUM_REG = 1
+    REG_IND = REGS.index(reg) - 3
     true_y0_range = 3
     true_fn = lambda x: x ** 3
     # only for evaluating on a fixed test set
@@ -102,15 +102,13 @@ def run(reg, lam, rng, dirname):
       (y0, [y1h]) = jet(g, (z, ), ((np.ones_like(z), ), ))
       (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
       (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
-      # (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
-      # (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z, ),
-      #                                   ((y0, y1, y2, y3, y4h), ))
-      # (y0, [y1, y2, y3, y4, y5,y6h]) = jet(g, (z, ),
-      #                                   ((y0, y1, y2, y3, y4, y5h), ))
-      #
+      (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
+      (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z, ),
+                                        ((y0, y1, y2, y3, y4h), ))
+      (y0, [y1, y2, y3, y4, y5, y6h]) = jet(g, (z, ),
+                                            ((y0, y1, y2, y3, y4, y5h), ))
 
-      # return (y0, [y1, y2, y3, y4, y5])
-      return (y0, [y1, y2])
+      return (y0, [y1, y2, y3, y4, y5])
 
     # set up model
     def sigmoid(z):
@@ -169,12 +167,21 @@ def run(reg, lam, rng, dirname):
       return yr[:, :D], yr[:, D:]
 
     @jax.jit
-    def r2(y, t, params):
+    def reg_dynamics(y, t, params):
       """
       Computes regularization dynamics.
       """
-      y0, y_n = sol_recursive(jet_wrap_predict(params), y, t)
-      return np.sum(y_n[0] ** 2, axis=1, keepdims=True)
+      if reg == "none":
+        regularization = np.zeros_like(y)
+      elif reg == "r0":
+        regularization = y
+      else:
+        y0, y_n = sol_recursive(jet_wrap_predict(params), y, t)
+        if reg == "r1":
+          regularization = y0
+        else:
+          regularization = y_n[REG_IND]
+      return np.sum(regularization ** 2, axis=1, keepdims=True)
 
     @jax.jit
     def aug_dynamics(yr, t, *args):
@@ -187,7 +194,7 @@ def run(reg, lam, rng, dirname):
       params = ravel_params(np.array(args))
       y, r = unpack_aug(np.reshape(yr, (-1, D + NUM_REG)))
       dydt = predict(params, append_time(y, t))
-      drdt = r2(y, t, params)
+      drdt = reg_dynamics(y, t, params)
       return np.ravel(append_aug(dydt, drdt))
     nodeint_aug = build_odeint(aug_dynamics)
 
@@ -325,7 +332,7 @@ def run(reg, lam, rng, dirname):
 
         rng, batch_y = get_batch(rng)
 
-        count_nfe(opt_state, batch_y)
+        # count_nfe(opt_state, batch_y)
 
         opt_state = update(itr, opt_state, batch_y)
 
@@ -351,5 +358,5 @@ def run(reg, lam, rng, dirname):
 
 if __name__ == "__main__":
   assert os.path.exists(parse_args.dirname)
-  assert parse_args.reg in ['none'] + REGS
+  assert parse_args.reg in REGS
   run(parse_args.reg, parse_args.lam, random.PRNGKey(0), parse_args.dirname)
