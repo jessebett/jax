@@ -351,4 +351,5 @@ def run(reg, lam, rng, dirname):
 
 if __name__ == "__main__":
   assert os.path.exists(parse_args.dirname)
+  assert parse_args.reg in ['none'] + REGS
   run(parse_args.reg, parse_args.lam, random.PRNGKey(0), parse_args.dirname)
