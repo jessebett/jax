@@ -332,7 +332,7 @@ def run(reg, lam, rng, dirname):
 
         rng, batch_y = get_batch(rng)
 
-        # count_nfe(opt_state, batch_y)
+        count_nfe(opt_state, batch_y)
 
         opt_state = update(itr, opt_state, batch_y)
 
