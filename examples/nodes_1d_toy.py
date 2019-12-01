@@ -20,7 +20,7 @@ from jax.experimental.ode import build_odeint, odeint, vjp_odeint
 from jax.flatten_util import ravel_pytree
 from jax.nn.initializers import glorot_normal, normal
 
-REGS = ['none', 'r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6']
+REGS = ['none', 'r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r45']
 
 parser = argparse.ArgumentParser('ODE demo')
 parser.add_argument('--data_size', type=int, default=1000)
@@ -179,6 +179,8 @@ def run(reg, lam, rng, dirname):
         y0, y_n = sol_recursive(jet_wrap_predict(params), y, t)
         if reg == "r1":
           regularization = y0
+        elif reg == 'r45':
+            return np.sum(y_n[3] ** 2 - y_n[2] ** 2, axis=1, keepdims=True)
         else:
           regularization = y_n[REG_IND]
       return np.sum(regularization ** 2, axis=1, keepdims=True)
@@ -358,5 +360,4 @@ def run(reg, lam, rng, dirname):
 
 if __name__ == "__main__":
   assert os.path.exists(parse_args.dirname)
-  assert parse_args.reg in REGS
   run(parse_args.reg, parse_args.lam, random.PRNGKey(0), parse_args.dirname)
