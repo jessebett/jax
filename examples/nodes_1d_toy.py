@@ -26,7 +26,7 @@ parser = argparse.ArgumentParser('ODE demo')
 parser.add_argument('--data_size', type=int, default=1000)
 parser.add_argument('--batch_time', type=int, default=2)
 parser.add_argument('--batch_size', type=int, default=200)
-parser.add_argument('--nepochs', type=int, default=1000)
+parser.add_argument('--nepochs', type=int, default=500)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--reg', type=str, choices=REGS, default='none')
 parser.add_argument('--test_freq', type=int, default=1)
@@ -266,7 +266,7 @@ def run(reg, lam, rng, dirname):
       """
       Update the parameters.
       """
-      dldp = grad(loss_aug)(flat_params, batch_y, ts)
+      dldp = grad(loss_aug)(get_params(opt_state), batch_y, ts)
       return opt_update(itr, dldp, opt_state)
 
     if parse_args.test:
@@ -343,7 +343,7 @@ def run(reg, lam, rng, dirname):
             loss_reg_ = loss_reg(flat_params, true_y, ts)
 
             print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
-                        'Loss {:.6f} | r {:.6f}'.format(itr, loss_, loss_aug_, loss_reg_)
+                        'Loss {:.6f} | r {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_)
 
             print(print_str)
             print(print_str, file=sys.stderr)
