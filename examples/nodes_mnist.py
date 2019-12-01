@@ -91,7 +91,7 @@ def run(reg, lam, rng, dirname):
         """
         Function which returns a closure that has the correct API for jet.
         """
-        return lambda z, t: predict(params, append_time(z, t))
+        return lambda z, t: dynamics_predict(params, append_time(z, t))
 
     def sol_recursive(f, z, t):
         """
