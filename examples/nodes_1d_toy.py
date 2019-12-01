@@ -156,7 +156,7 @@ def run(reg, lam, rng, dirname):
       """
       Append 0s to get initial state of augmented system.
       """
-      return append_aug(y, np.zeros_like(y))
+      return append_aug(y, np.zeros((y.shape[0], NUM_REG)))
 
     def unpack_aug(yr):
       """
