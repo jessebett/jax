@@ -196,7 +196,7 @@ def run(reg, lam, rng, dirname):
         if reg == "r1":
           regularization = y0
         elif reg == 'r45':
-            return np.sum(y_n[3] ** 2 - y_n[2] ** 2, axis=1, keepdims=True)
+            regularization = y_n[3] - y_n[2]
         else:
           regularization = y_n[REG_IND]
       return np.sum(regularization ** 2, axis=1, keepdims=True)
