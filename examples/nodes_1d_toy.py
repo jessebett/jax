@@ -33,6 +33,7 @@ parser.add_argument('--test_freq', type=int, default=1)
 parser.add_argument('--save_freq', type=int, default=500)
 parser.add_argument('--dirname', type=str, default='tmp15')
 parser.add_argument('--test', action='store_true')
+parser.add_argument('--all_reg', action='store_true')
 parse_args = parser.parse_args()
 
 
@@ -152,11 +153,26 @@ def run(reg, lam, rng, dirname):
       yr = np.concatenate((y, r), axis=1)
       return yr
 
+    def append_all_aug(y, *r):
+      """
+      y::(BS,D)
+      r::(BS,R)
+      yr::(BS,D+R)
+      """
+      yr = np.concatenate((y, *r), axis=1)
+      return yr
+
     def aug_init(y):
       """
       Append 0s to get initial state of augmented system.
       """
       return append_aug(y, np.zeros((y.shape[0], NUM_REG)))
+
+    def all_aug_init(y):
+      """
+      Append 0s to get initial state of augmented system.
+      """
+      return append_aug(y, np.zeros((y.shape[0], len(REGS) - 1)))
 
     def unpack_aug(yr):
       """
@@ -186,6 +202,16 @@ def run(reg, lam, rng, dirname):
       return np.sum(regularization ** 2, axis=1, keepdims=True)
 
     @jax.jit
+    def all_reg_dynamics(y, t, params):
+      """
+      Computes all regularization dynamics.
+      """
+      y0, y_n = sol_recursive(jet_wrap_predict(params), y, t)
+      regs = (y, y0, *(y_n[i - 3] for i in range(3, len(REGS) - 1)))
+      ret = (np.sum(reg ** 2, axis=1, keepdims=True) for reg in regs)
+      return (*ret, np.sum(y_n[3] ** 2 - y_n[2] ** 2, axis=1, keepdims=True))
+
+    @jax.jit
     def aug_dynamics(yr, t, *args):
       """
       yr::unravel((BS,D+R))
@@ -199,6 +225,18 @@ def run(reg, lam, rng, dirname):
       drdt = reg_dynamics(y, t, params)
       return np.ravel(append_aug(dydt, drdt))
     nodeint_aug = build_odeint(aug_dynamics)
+
+    @jax.jit
+    def all_aug_dynamics(yr, t, *args):
+      """
+      Augmented dynamics for computing all regularization.
+      """
+      params = ravel_params(np.array(args))
+      y, r = unpack_aug(np.reshape(yr, (-1, D + len(REGS) - 1)))
+      dydt = predict(params, append_time(y, t))
+      drdt = all_reg_dynamics(y, t, params)
+      return np.ravel(append_all_aug(dydt, *drdt))
+    nodeint_all_aug = build_odeint(all_aug_dynamics)
 
     # set up loss
     @jax.jit
@@ -214,6 +252,13 @@ def run(reg, lam, rng, dirname):
       Mean.
       """
       return np.mean(r_pred)
+
+    @jax.jit
+    def all_reg_loss_fun(rs_pred):
+      """
+      Mean.
+      """
+      return np.mean(rs_pred, axis=0)
 
     @jax.jit
     def loss(flat_params, ys, ts):
@@ -257,6 +302,18 @@ def run(reg, lam, rng, dirname):
       loss_ = loss_fun(y1_pred, y1_target)
       reg_ = reg_loss_fun(r_pred)
       return loss_ + lam * reg_, loss_, reg_
+
+    @jax.jit
+    def sep_losses_all_reg(flat_params, ys, ts):
+      """
+      Convenience function for calculating losses separately (and all reg).
+      """
+      y0, y1_target = ys
+      yrs_pred = nodeint_all_aug(np.ravel(all_aug_init(y0)), ts, *flat_params)
+      y1_pred, rs_pred = unpack_aug(np.reshape(yrs_pred[-1], (-1, D + len(REGS) - 1)))
+      loss_ = loss_fun(y1_pred, y1_target)
+      regs_ = all_reg_loss_fun(rs_pred)
+      return loss_, tuple(regs_)
 
     # initialize the parameters
     hidden_dim = 50
@@ -355,13 +412,22 @@ def run(reg, lam, rng, dirname):
 
         if itr % parse_args.test_freq == 0:
             flat_params = get_params(opt_state)
-            loss_aug_, loss_, loss_reg_ = sep_losses(flat_params, true_y, ts)
+            if parse_args.all_reg:
+                loss_, regs_ = sep_losses_all_reg(flat_params, true_y, ts)
+                print_str = 'Iter {:04d} | Loss {:.6f} | %s' % \
+                            " | ".join(("%s {:.6f}" % reg_name for reg_name in REGS[1:]))
+                print_str = print_str.format(itr, loss_, *regs_)
 
-            print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
-                        'Loss {:.6f} | r {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_)
+                print(print_str)
+                print(print_str, file=sys.stderr)
+            else:
+                loss_aug_, loss_, loss_reg_ = sep_losses(flat_params, true_y, ts)
 
-            print(print_str)
-            print(print_str, file=sys.stderr)
+                print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
+                            'Loss {:.6f} | r {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_)
+
+                print(print_str)
+                print(print_str, file=sys.stderr)
 
         if itr % parse_args.save_freq == 0:
             flat_params = get_params(opt_state)
