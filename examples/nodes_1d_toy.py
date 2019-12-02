@@ -246,6 +246,18 @@ def run(reg, lam, rng, dirname):
       y1_pred, r_pred = unpack_aug(np.reshape(yrs_pred[-1], (-1, D + NUM_REG)))
       return loss_fun(y1_pred, y1_target) + lam * reg_loss_fun(r_pred)
 
+    @jax.jit
+    def sep_losses(flat_params, ys, ts):
+      """
+      Convenience function for calculating losses separately.
+      """
+      y0, y1_target = ys
+      yrs_pred = nodeint_aug(np.ravel(aug_init(y0)), ts, *flat_params)
+      y1_pred, r_pred = unpack_aug(np.reshape(yrs_pred[-1], (-1, D + NUM_REG)))
+      loss_ = loss_fun(y1_pred, y1_target)
+      reg_ = reg_loss_fun(r_pred)
+      return loss_ + lam * reg_, loss_, reg_
+
     # initialize the parameters
     hidden_dim = 50
     rng, layer_rng = random.split(rng)
@@ -340,9 +352,7 @@ def run(reg, lam, rng, dirname):
 
         if itr % parse_args.test_freq == 0:
             flat_params = get_params(opt_state)
-            loss_ = loss(flat_params, true_y, ts)
-            loss_aug_ = loss_aug(flat_params, true_y, ts)
-            loss_reg_ = loss_reg(flat_params, true_y, ts)
+            loss_aug_, loss_, loss_reg_ = sep_losses(flat_params, true_y, ts)
 
             print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
                         'Loss {:.6f} | r {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_)
