@@ -318,6 +318,7 @@ def run(reg, lam, rng, dirname):
                                                                                             parse_args.batch_size *
                                                                                             D)))[-1])
 
+    @jax.jit
     def count_nfe(opt_state, ys):
       """
       Count NFE and print.
@@ -334,8 +335,7 @@ def run(reg, lam, rng, dirname):
       cotangent = np.stack((np.zeros_like(grad_loss_fun_), grad_loss_fun_), axis=0)
       b_nfe = unreg_nodeint_vjp(cotangent, flat_y0, ts, flat_params)
 
-      print("forward NFE: %d" % f_nfe)
-      print("backward NFE: %d" % b_nfe)
+      return f_nfe, b_nfe
 
     itr = 0
     assert parse_args.data_size % parse_args.batch_size == 0
@@ -346,7 +346,10 @@ def run(reg, lam, rng, dirname):
 
         rng, batch_y = get_batch(rng)
 
-        count_nfe(opt_state, batch_y)
+        f_nfe, b_nfe = count_nfe(opt_state, batch_y)
+
+        print("forward NFE: %d" % f_nfe)
+        print("backward NFE: %d" % b_nfe)
 
         opt_state = update(itr, opt_state, batch_y)
 
