@@ -16,7 +16,7 @@ import numpy.random as npr
 
 import jax
 import jax.numpy as np
-from examples import datasets
+from jax.examples import datasets
 from jax import random, grad, jet
 from jax.experimental import optimizers
 from jax.experimental.ode import build_odeint, odeint, vjp_odeint
