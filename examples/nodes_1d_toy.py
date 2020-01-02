@@ -40,202 +40,245 @@ parse_args = parser.parse_args()
 config.update('jax_enable_x64', True)
 
 
-def run(reg, lam, rng, dirname):
+assert os.path.exists(parse_args.dirname)
+
+reg = parse_args.reg
+lam = parse_args.lam
+rng = random.PRNGKey(0)
+dirname = parse_args.dirname
+
+
+# set up data
+D = 1
+NUM_REG = 1
+REG_IND = REGS.index(reg) - 3
+true_y0_range = 3
+true_fn = lambda x: x ** 3
+# only for evaluating on a fixed test set
+true_y0 = np.repeat(
+    np.expand_dims(np.linspace(-true_y0_range, true_y0_range, parse_args.data_size), axis=1), D, axis=1)  # (N, D)
+true_y1 = np.repeat(np.expand_dims(true_fn(true_y0[:, 0]), axis=1), D, axis=1)
+true_y = (true_y0, true_y1)
+ts = np.array([0., 1.])
+
+
+# set up jet interface
+def jet_wrap_predict(params):
+  """
+  Function which returns a closure that has the correct API for jet.
+  """
+  return lambda z, t: mlp_predict(params, append_time(z, t))
+
+
+def sol_recursive(f, z, t):
+  """
+  Recursively compute higher order derivatives of dynamics of ODE.
+  """
+  def g(z):
+    """
+    Closure to expand z.
+    """
+    return f(z, t)
+
+  # First coeffs computed recursively
+  (y0, [y1h]) = jet(g, (z, ), ((np.ones_like(z), ), ))
+  (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
+  (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
+  (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
+  (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z, ),
+                                    ((y0, y1, y2, y3, y4h), ))
+  (y0, [y1, y2, y3, y4, y5, y6h]) = jet(g, (z, ),
+                                        ((y0, y1, y2, y3, y4, y5h), ))
+
+  return (y0, [y1, y2, y3, y4, y5])
+
+
+# set up utility functions
+def append_time(y, t):
+  """
+  y::(BS,D)
+  t::scalar
+  yt::(BS,D+1)
+  """
+  yt = np.concatenate((y,
+                       np.ones((y.shape[0], 1)) * t),
+                      axis=1)
+  return yt
+
+
+def append_aug(y, r):
+  """
+  y::(BS,D)
+  r::(BS,R)
+  yr::(BS,D+R)
+  """
+  yr = np.concatenate((y, r), axis=1)
+  return yr
+
+
+def append_all_aug(y, *r):
+  """
+  y::(BS,D)
+  r::(BS,R)
+  yr::(BS,D+R)
+  """
+  yr = np.concatenate((y, *r), axis=1)
+  return yr
+
+
+def aug_init(y):
+  """
+  Append 0s to get initial state of augmented system.
+  """
+  return append_aug(y, np.zeros((y.shape[0], NUM_REG)))
+
+
+def all_aug_init(y):
+  """
+  Append 0s to get initial state of augmented system.
+  """
+  return append_aug(y, np.zeros((y.shape[0], len(REGS) - 1)))
+
+
+def unpack_aug(yr):
+  """
+  yr::(BS,D+R)
+  y::(BS,D)
+  r::(BS,R)
+  """
+  return yr[:, :D], yr[:, D:]
+
+
+# set up model
+def sigmoid(z):
+  """
+  Defined using only numpy primitives (but probably less numerically stable).
+  """
+  return 1./(1. + np.exp(-z))
+
+
+def mlp_predict(params, y_t):
+  """
+  MLP for dynamics of ODE.
+  """
+  w_1, b_1 = params[0]
+  z_1 = np.dot(y_t, w_1) + np.expand_dims(b_1, axis=0)
+  out_1 = sigmoid(z_1)
+
+  w_2, b_2 = params[1]
+  z_1 = np.dot(out_1, w_2) + np.expand_dims(b_2, axis=0)
+
+  return z_1
+
+
+# set up ODE
+def dynamics(y, t, *args):
+  """
+  y::unravel((BS,D))
+  t::scalar
+  args::flat_params
+  """
+  y = np.reshape(y, (-1, D))
+  dydt = mlp_predict(ravel_params(np.array(args)), append_time(y, t))
+  return np.ravel(dydt)
+
+
+def reg_dynamics(y, t, params):
+  """
+  Computes regularization dynamics.
+  """
+  if reg == "none":
+    regularization = np.zeros_like(y)
+  elif reg == "r0":
+    regularization = y
+  else:
+    y0, y_n = sol_recursive(jet_wrap_predict(params), y, t)
+    if reg == "r1":
+      regularization = y0
+    elif reg == 'r45':
+        regularization = y_n[3] - y_n[2]
+    else:
+      regularization = y_n[REG_IND]
+  return np.sum(regularization ** 2, axis=1, keepdims=True)
+
+
+def all_reg_dynamics(y, t, params):
+  """
+  Computes all regularization dynamics.
+  """
+  y0, y_n = sol_recursive(jet_wrap_predict(params), y, t)
+  regs = (y, y0, *(y_n[i - 3] for i in range(3, len(REGS) - 1)))
+  ret = (np.sum(reg ** 2, axis=1, keepdims=True) for reg in regs)
+  return (*ret, np.sum(y_n[3] ** 2 - y_n[2] ** 2, axis=1, keepdims=True))
+
+
+def aug_dynamics(yr, t, *args):
+  """
+  yr::unravel((BS,D+R))
+  t::scalar
+  args::flat_params
+  return::unravel((BS,D+R))
+  """
+  params = ravel_params(np.array(args))
+  y, r = unpack_aug(np.reshape(yr, (-1, D + NUM_REG)))
+  dydt = mlp_predict(params, append_time(y, t))
+  drdt = reg_dynamics(y, t, params)
+  return np.ravel(append_aug(dydt, drdt))
+
+
+def all_aug_dynamics(yr, t, *args):
+  """
+  Augmented dynamics for computing all regularization.
+  """
+  params = ravel_params(np.array(args))
+  y, r = unpack_aug(np.reshape(yr, (-1, D + len(REGS) - 1)))
+  dydt = mlp_predict(params, append_time(y, t))
+  drdt = all_reg_dynamics(y, t, params)
+  return np.ravel(append_all_aug(dydt, *drdt))
+
+
+def initialize(rng, hidden_dim):
+  """
+  Initialize the parameters of the MLP.
+  """
+  rng, layer_rng = random.split(rng)
+  k1, k2 = random.split(layer_rng)
+  w_1, b_1 = glorot_normal()(k1, (D + 1, hidden_dim)), normal()(k2, (hidden_dim,))
+
+  rng, layer_rng = random.split(rng)
+  k1, k2 = random.split(layer_rng)
+  w_2, b_2 = glorot_normal()(k1, (hidden_dim, D)), normal()(k2, (D,))
+
+  init_params = [(w_1, b_1), (w_2, b_2)]
+
+  return rng, init_params
+
+
+@jax.jit
+def get_batch(key):
+  """
+  Get batch.
+  """
+  key, subkey = random.split(key)
+  batch_y0 = random.uniform(subkey, (parse_args.batch_size, D),
+                            minval=-true_y0_range, maxval=true_y0_range)              # (M, D)
+  batch_y1 = np.repeat(np.expand_dims(true_fn(batch_y0[:, 0]), axis=1), D, axis=1)    # (M, D)
+  return key, (batch_y0, batch_y1)
+
+
+# define ravel
+_, ravel_params = ravel_pytree(initialize(rng, 50)[1])
+
+
+def run(rng):
     """
     Run the Neural ODEs method.
     """
     print("Reg: %s\tLambda %.4e" % (reg, lam))
     print("Reg: %s\tLambda %.4e" % (reg, lam), file=sys.stderr)
 
-    # set up data
-    D = 1
-    NUM_REG = 1
-    REG_IND = REGS.index(reg) - 3
-    true_y0_range = 3
-    true_fn = lambda x: x ** 3
-    # only for evaluating on a fixed test set
-    true_y0 = np.repeat(
-        np.expand_dims(np.linspace(-true_y0_range, true_y0_range, parse_args.data_size), axis=1), D, axis=1)  # (N, D)
-    true_y1 = np.repeat(np.expand_dims(true_fn(true_y0[:, 0]), axis=1), D, axis=1)
-    true_y = (true_y0, true_y1)
-    ts = np.array([0., 1.])
-
-    @jax.jit
-    def get_batch(key):
-      """
-      Get batch.
-      """
-      key, subkey = random.split(key)
-      batch_y0 = random.uniform(subkey, (parse_args.batch_size, D),
-                                minval=-true_y0_range, maxval=true_y0_range)              # (M, D)
-      batch_y1 = np.repeat(np.expand_dims(true_fn(batch_y0[:, 0]), axis=1), D, axis=1)    # (M, D)
-      return key, (batch_y0, batch_y1)
-
-    def append_time(y, t):
-      """
-      y::(BS,D)
-      t::scalar
-      yt::(BS,D+1)
-      """
-      yt = np.concatenate((y,
-                           np.ones((y.shape[0], 1)) * t),
-                          axis=1)
-      return yt
-
-    # set up jet interface
-    def jet_wrap_predict(params):
-      """
-      Function which returns a closure that has the correct API for jet.
-      """
-      return lambda z, t: predict(params, append_time(z, t))
-
-    def sol_recursive(f, z, t):
-      """
-      Recursively compute higher order derivatives of dynamics of ODE.
-      """
-      def g(z):
-        """
-        Closure to expand z.
-        """
-        return f(z, t)
-
-      # First coeffs computed recursively
-      (y0, [y1h]) = jet(g, (z, ), ((np.ones_like(z), ), ))
-      (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
-      (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
-      (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
-      (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z, ),
-                                        ((y0, y1, y2, y3, y4h), ))
-      (y0, [y1, y2, y3, y4, y5, y6h]) = jet(g, (z, ),
-                                            ((y0, y1, y2, y3, y4, y5h), ))
-
-      return (y0, [y1, y2, y3, y4, y5])
-
-    # set up model
-    def sigmoid(z):
-      """
-      Defined using only numpy primitives (but probably less numerically stable).
-      """
-      return 1./(1. + np.exp(-z))
-
-    def predict(params, y_t):
-      """
-      MLP for dynamics of ODE.
-      """
-      w_1, b_1 = params[0]
-      z_1 = np.dot(y_t, w_1) + np.expand_dims(b_1, axis=0)
-      out_1 = sigmoid(z_1)
-
-      w_2, b_2 = params[1]
-      z_1 = np.dot(out_1, w_2) + np.expand_dims(b_2, axis=0)
-
-      return z_1
-
-    # set up ODE
-    @jax.jit
-    def dynamics(y, t, *args):
-      """
-      y::unravel((BS,D))
-      t::scalar
-      args::flat_params
-      """
-      y = np.reshape(y, (-1, D))
-      dydt = predict(ravel_params(np.array(args)), append_time(y, t))
-      return np.ravel(dydt)
     nodeint = build_odeint(dynamics)
-
-    def append_aug(y, r):
-      """
-      y::(BS,D)
-      r::(BS,R)
-      yr::(BS,D+R)
-      """
-      yr = np.concatenate((y, r), axis=1)
-      return yr
-
-    def append_all_aug(y, *r):
-      """
-      y::(BS,D)
-      r::(BS,R)
-      yr::(BS,D+R)
-      """
-      yr = np.concatenate((y, *r), axis=1)
-      return yr
-
-    def aug_init(y):
-      """
-      Append 0s to get initial state of augmented system.
-      """
-      return append_aug(y, np.zeros((y.shape[0], NUM_REG)))
-
-    def all_aug_init(y):
-      """
-      Append 0s to get initial state of augmented system.
-      """
-      return append_aug(y, np.zeros((y.shape[0], len(REGS) - 1)))
-
-    def unpack_aug(yr):
-      """
-      yr::(BS,D+R)
-      y::(BS,D)
-      r::(BS,R)
-      """
-      return yr[:, :D], yr[:, D:]
-
-    @jax.jit
-    def reg_dynamics(y, t, params):
-      """
-      Computes regularization dynamics.
-      """
-      if reg == "none":
-        regularization = np.zeros_like(y)
-      elif reg == "r0":
-        regularization = y
-      else:
-        y0, y_n = sol_recursive(jet_wrap_predict(params), y, t)
-        if reg == "r1":
-          regularization = y0
-        elif reg == 'r45':
-            regularization = y_n[3] - y_n[2]
-        else:
-          regularization = y_n[REG_IND]
-      return np.sum(regularization ** 2, axis=1, keepdims=True)
-
-    @jax.jit
-    def all_reg_dynamics(y, t, params):
-      """
-      Computes all regularization dynamics.
-      """
-      y0, y_n = sol_recursive(jet_wrap_predict(params), y, t)
-      regs = (y, y0, *(y_n[i - 3] for i in range(3, len(REGS) - 1)))
-      ret = (np.sum(reg ** 2, axis=1, keepdims=True) for reg in regs)
-      return (*ret, np.sum(y_n[3] ** 2 - y_n[2] ** 2, axis=1, keepdims=True))
-
-    @jax.jit
-    def aug_dynamics(yr, t, *args):
-      """
-      yr::unravel((BS,D+R))
-      t::scalar
-      args::flat_params
-      return::unravel((BS,D+R))
-      """
-      params = ravel_params(np.array(args))
-      y, r = unpack_aug(np.reshape(yr, (-1, D + NUM_REG)))
-      dydt = predict(params, append_time(y, t))
-      drdt = reg_dynamics(y, t, params)
-      return np.ravel(append_aug(dydt, drdt))
     nodeint_aug = build_odeint(aug_dynamics)
-
-    @jax.jit
-    def all_aug_dynamics(yr, t, *args):
-      """
-      Augmented dynamics for computing all regularization.
-      """
-      params = ravel_params(np.array(args))
-      y, r = unpack_aug(np.reshape(yr, (-1, D + len(REGS) - 1)))
-      dydt = predict(params, append_time(y, t))
-      drdt = all_reg_dynamics(y, t, params)
-      return np.ravel(append_all_aug(dydt, *drdt))
     nodeint_all_aug = build_odeint(all_aug_dynamics)
 
     # set up loss
@@ -315,20 +358,8 @@ def run(reg, lam, rng, dirname):
       regs_ = all_reg_loss_fun(rs_pred)
       return loss_, tuple(regs_)
 
-    # initialize the parameters
-    hidden_dim = 50
-    rng, layer_rng = random.split(rng)
-    k1, k2 = random.split(layer_rng)
-    w_1, b_1 = glorot_normal()(k1, (D + 1, hidden_dim)), normal()(k2, (hidden_dim,))
-
-    rng, layer_rng = random.split(rng)
-    k1, k2 = random.split(layer_rng)
-    w_2, b_2 = glorot_normal()(k1, (hidden_dim, D)), normal()(k2, (D,))
-
-    init_params = [(w_1, b_1), (w_2, b_2)]
-
-    # optimizer
-    flat_params, ravel_params = ravel_pytree(init_params)
+    rng, init_params = initialize(rng, 50)
+    flat_params, _ = ravel_pytree(init_params)
     opt_init, opt_update, get_params = optimizers.rmsprop(step_size=1e-2, gamma=0.99)
     opt_state = opt_init(flat_params)
 
@@ -438,5 +469,4 @@ def run(reg, lam, rng, dirname):
 
 
 if __name__ == "__main__":
-  assert os.path.exists(parse_args.dirname)
-  run(parse_args.reg, parse_args.lam, random.PRNGKey(0), parse_args.dirname)
+  run(rng)
