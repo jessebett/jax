@@ -180,6 +180,8 @@ def reg_dynamics(y, t, params):
     regularization = np.zeros_like(y)
   elif reg == "r0":
     regularization = y
+  elif reg == "r1":
+    regularization = dynamics_predict(params, append_time(y, t))
   else:
     y0, y_n = sol_recursive(jet_wrap_predict(params), y, t)
     if reg == "r1":
