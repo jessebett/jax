@@ -18,7 +18,7 @@ import numpy.random as npr
 
 import jax
 import jax.numpy as np
-from examples import datasets
+from jax.examples import datasets
 from jax import random, grad, jet
 from jax.experimental import optimizers
 from jax.experimental.ode import build_odeint, odeint, vjp_odeint
@@ -354,7 +354,7 @@ def run(rng):
         Update the params based on grad for current batch.
         """
         forward_start = time.time()
-        _ = loss_aug(get_params(opt_state, batch))
+        _ = loss_aug(get_params(opt_state), batch)
         forward_time = time.time() - forward_start
 
         thing_start = time.time()
