@@ -13,20 +13,19 @@ import itertools
 import os
 import pickle
 import sys
+import time
 
 import numpy.random as npr
+from jax.examples import datasets
 
 import jax
 import jax.numpy as np
-from jax.examples import datasets
 from jax import random, grad, jet
 from jax.experimental import optimizers
 from jax.experimental.ode import build_odeint, odeint, vjp_odeint
 from jax.flatten_util import ravel_pytree
 from jax.nn import log_softmax
 from jax.nn.initializers import glorot_normal, normal
-
-import time
 
 REGS = ['none', 'r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r45']
 
@@ -353,14 +352,7 @@ def run(rng):
         """
         Update the params based on grad for current batch.
         """
-        forward_start = time.time()
-        _ = loss_aug(get_params(opt_state), batch)
-        forward_time = time.time() - forward_start
-
-        thing_start = time.time()
-        thing = grad(loss_aug)(get_params(opt_state), batch)
-        thing_time = time.time() - thing_start
-        return opt_update(i, thing, opt_state), forward_time, thing_time
+        return opt_update(i, grad(loss_aug)(get_params(opt_state), batch), opt_state)
 
     # unregularized system for counting NFE
     unreg_nodeint = jax.jit(lambda y0, t, args: odeint(dynamics, y0, t, *args))
@@ -381,19 +373,15 @@ def run(rng):
         out_1 = pre_ode(inputs)
 
         in_ode = np.ravel(out_1)
-        f_nfe_start = time.time()
         flat_out_ode, f_nfe = unreg_nodeint(in_ode, t, flat_ode_params)
-        f_nfe_time = time.time() - f_nfe_start
         out_ode = np.reshape(flat_out_ode[-1], (-1, ode_dim))
 
         grad_partial_loss_ = grad(partial_loss)(out_ode, targets, params[2])
         # grad is 0 at t0 (since always equal)
         cotangent = np.stack((np.zeros_like(grad_partial_loss_), grad_partial_loss_), axis=0)
-        b_nfe_start = time.time()
         b_nfe = unreg_nodeint_vjp(cotangent, np.reshape(in_ode, (-1, )), t, flat_ode_params)
-        b_nfe_time = time.time() - b_nfe_start
 
-        return f_nfe, b_nfe, f_nfe_time, b_nfe_time
+        return f_nfe, b_nfe
 
     itercount = itertools.count()
     for epoch in range(parse_args.nepochs):
@@ -401,16 +389,18 @@ def run(rng):
             batch = next(batches)
             itr = next(itercount)
 
-            f_nfe, b_nfe, f_nfe_time, b_nfe_time = count_nfe(opt_state, batch)
+            nfe_start = time.time()
+            f_nfe, b_nfe = count_nfe(opt_state, batch)
+            nfe_time = time.time() - nfe_start
 
             print("forward NFE: %d" % f_nfe)
             print("backward NFE: %d" % b_nfe)
-            print("forward NFE time: %.5f" % f_nfe_time)
-            print("backward NFE time: %.5f" % b_nfe_time)
 
-            opt_state, forward_time, update_time = update(itr, opt_state, batch)
-            print("forward time: %.5f" % forward_time)
-            print("update time: %.5f" % update_time)
+            update_start = time.time()
+            opt_state = update(itr, opt_state, batch)
+            update_time = time.time() - update_start
+
+            print("nfe: %.5f, update: %.5f" % (nfe_time, update_time))
 
             if itr % parse_args.test_freq == 0:
 
