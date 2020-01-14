@@ -276,6 +276,101 @@ plt.plot(plot_ts,tay_5(plot_ts))
 tay_6 = lambda t : d0 + (t-t0) * d1 + (t-t0)**2 * d2/fact(2)+ (t-t0)**3 * d3/fact(3) + (t-t0)**4 * d4/fact(4)+ (t-t0)**5 * d5/fact(5) + (t-t0)**6 * d6/fact(6)
 plt.plot(plot_ts,tay_6(plot_ts))
 
+
+# Animation
+anim_dir = 'anim'
+
+y0 = 2.5
+plot_y0 =  np.expand_dims(np.repeat(y0,200),1)
+plot_ts = np.linspace(0.,1.,100)
+plot_sol = nodeint(np.ravel(plot_y0),plot_ts, *flat_params)
+
+ys= plot_sol[:,1]
+
+
+compute_jet = lambda z,t : sol_recursive(jet_wrap_predict(ravel_params(flat_params)),np.expand_dims(np.repeat(z,200),1),t)
+jit_jet = jax.jit(compute_jet)
+
+
+# animation code
+def plot_tays(ti):
+  d0 = ys[ti:ti+1]
+  t0 = plot_ts[ti]
+  (p1,[p2,p3,p4,p5,p6]) =  jit_jet(d0,t0)
+
+  d1 = p1[1,1]
+  d2 = p2[1,1]
+  d3 = p3[1,1]
+  d4 = p4[1,1]
+  d5 = p5[1,1]
+  d6 = p6[1,1]
+
+
+  def common_options(order):
+    plt.xlim(-0.05,1.05)
+    plt.ylim(-10,20)  
+    plt.title(f"{order}-order Taylor Approximation to Neural ODE Solution")
+    plt.xlabel("t")
+    plt.ylabel("y")
+    plt.legend(loc=2)
+
+  tay_1 = lambda t : d0 + (t-t0) * d1
+  plt.clf()
+  plt.plot(plot_ts,ys, label="Neural ODE Solution")
+  plt.plot(plot_ts,tay_1(plot_ts), label="Taylor Approximation")
+  plt.scatter(t0,d0, zorder=10)
+  common_options(1)
+  plt.savefig(os.path.join(anim_dir,'1',str(ti).zfill(4)))
+  plt.close()
+
+  tay_2 = lambda t : d0 + (t-t0) * d1 + (t-t0)**2 * d2/fact(2)
+  plt.clf()
+  plt.plot(plot_ts,ys, label="Neural ODE Solution")
+  plt.plot(plot_ts,tay_2(plot_ts), label="Taylor Approximation")
+  plt.scatter(t0,d0, zorder=10)
+  common_options(2)
+  plt.savefig(os.path.join(anim_dir,'2',str(ti).zfill(4)))
+  plt.close()
+
+  tay_3 = lambda t : d0 + (t-t0) * d1 + (t-t0)**2 * d2/fact(2)+ (t-t0)**3 * d3/fact(3)
+  plt.clf()
+  plt.plot(plot_ts,ys, label="Neural ODE Solution")
+  plt.plot(plot_ts,tay_3(plot_ts), label="Taylor Approximation")
+  plt.scatter(t0,d0, zorder=10)
+  common_options(3)
+  plt.savefig(os.path.join(anim_dir,'3',str(ti).zfill(4)))
+  plt.close()
+
+  tay_4 = lambda t : d0 + (t-t0) * d1 + (t-t0)**2 * d2/fact(2)+ (t-t0)**3 * d3/fact(3) + (t-t0)**4 * d4/fact(4)
+  plt.clf()
+  plt.plot(plot_ts,ys, label="Neural ODE Solution")
+  plt.plot(plot_ts,tay_4(plot_ts), label="Taylor Approximation")
+  plt.scatter(t0,d0, zorder=10)
+  common_options(4)
+  plt.savefig(os.path.join(anim_dir,'4',str(ti).zfill(4)))
+  plt.close()
+
+  tay_5 = lambda t : d0 + (t-t0) * d1 + (t-t0)**2 * d2/fact(2)+ (t-t0)**3 * d3/fact(3) + (t-t0)**4 * d4/fact(4)+ (t-t0)**5 * d5/fact(5)
+  plt.clf()
+  plt.plot(plot_ts,ys, label="Neural ODE Solution")
+  plt.plot(plot_ts,tay_5(plot_ts), label="Taylor Approximation")
+  plt.scatter(t0,d0, zorder=10)
+  common_options(5)
+  plt.savefig(os.path.join(anim_dir,'5',str(ti).zfill(4)))
+  plt.close()
+
+  tay_6 = lambda t : d0 + (t-t0) * d1 + (t-t0)**2 * d2/fact(2)+ (t-t0)**3 * d3/fact(3) + (t-t0)**4 * d4/fact(4)+ (t-t0)**5 * d5/fact(5) + (t-t0)**6 * d6/fact(6)
+  plt.clf()
+  plt.plot(plot_ts,ys, label="Neural ODE Solution")
+  plt.plot(plot_ts,tay_6(plot_ts), label="Taylor Approx.")
+  plt.scatter(t0,d0, zorder=10)
+  common_options(6)
+  plt.savefig(os.path.join(anim_dir,'6',str(ti).zfill(4)))
+  plt.close()
+
+for ti in range(len(plot_ts)):
+  plot_tays(ti)
+
 ### Integrate regularizer
 def append_aug(y,r):
   """
