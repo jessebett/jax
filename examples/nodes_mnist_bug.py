@@ -2,7 +2,7 @@
 Neural ODEs on MNIST (only parameters are dynamics).
 """
 import jax.numpy as np
-from examples import datasets
+from jax.examples import datasets
 from jax import random
 from jax.experimental.ode import build_odeint
 from jax.flatten_util import ravel_pytree
@@ -10,7 +10,7 @@ from jax.nn import log_softmax
 from jax.nn.initializers import glorot_normal, normal
 
 img_dim = 784
-ode_dim = 64
+ode_dim = 200
 num_reg = 1
 n_classes = 10
 batch_size = 128
