@@ -286,8 +286,8 @@ def test_sol_recursive():
   (y0, [y1, y2, y3, y4h]) = jet(g, (z_eval_true, ), ((y0, y1, y2, y3h), ))
   (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z_eval_true, ),
                                     ((y0, y1, y2, y3, y4h), ))
-  print((y0, [y1, y2, y3, y4, y5h]),"\n")
-  print(true_ds,"\n")
+  print((y0, [y1, y2, y3, y4, y5h]))
+  print(true_ds)
 
 
 def test_sol_newtondouble_explicit():
@@ -346,6 +346,10 @@ def test_sol_newtondouble_explicit():
   x4 = 1./4 * (y3h/fact(3) + A0(x3))
   x5 = 1./5 * (y4h/fact(4) + A1(x3) + A0(x4))
   x6 = 1./6 * (y5h/fact(5) + A2(x3) + A1(x4) + A0(x5))
+
+  y_012 = lambda x0,x1,x2 : jet(g,(x0,),((x1,x2),))
+
+  As = lambda v: jvp(y_012,(x0,x1,x2),(v))
 
   # print x1,x2,x3,x4,x5,x6
   # print true_ds[1]
