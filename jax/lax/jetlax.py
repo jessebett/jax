@@ -2,6 +2,7 @@ from functools import partial
 from jax import vmap
 from jax.lax import *
 from jax.lax import dot_general_p as dot_p
+from jax.ad_util import add_jaxvals_p
 from jax import ops
 import jax.numpy as np
 from ..interpreters import fdb
@@ -35,6 +36,8 @@ deflinear(reshape_p)
 deflinear(concatenate_p)  # TODO
 deflinear(reduce_sum_p) #TODO: correct?
 deflinear(add_p)
+deflinear(add_jaxvals_p)
+deflinear(broadcast_in_dim_p)
 
 
 def make_derivs_sin(primals, order):
@@ -220,6 +223,7 @@ def prop_mul(primals_in, series_in):
   # v_conv = mul_conv(u,w) #TODO: GPU backed convolution. Ask mattj about double tracer
   return v_conv[0], v_conv[1:]
 fdb.prop_rules[mul_p] = prop_mul
+fdb.prop_rules[safe_mul_p] = prop_mul
 
 def manual_dot_conv(u,w):
   v = copy(u)
