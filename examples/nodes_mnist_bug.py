@@ -72,8 +72,6 @@ def dynamics(flat_y, t, *flat_params):
     Dynamics of the ODEBlock.
     """
     y = np.reshape(flat_y, (-1, ode_dim))
-    thing = ravel_ode_params(np.array(flat_params))
-    thing = append_time(y, t)
     dydt = dynamics_predict(ravel_ode_params(np.array(flat_params)), append_time(y, t))
     return np.ravel(dydt)
 
