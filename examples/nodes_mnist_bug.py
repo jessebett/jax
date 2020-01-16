@@ -3,7 +3,7 @@ Neural ODEs on MNIST (only parameters are dynamics).
 """
 import jax.numpy as np
 from jax.examples import datasets
-from jax import random
+from jax import random, grad
 from jax.experimental.ode import build_odeint
 from jax.flatten_util import ravel_pytree
 from jax.nn import log_softmax
@@ -93,6 +93,22 @@ def predict(args, x):
     return out
 
 
+def loss_fun(preds, targets):
+    """
+    Negative log-likelihood.
+    """
+    return -np.mean(np.sum(preds * targets, axis=1))
+
+
+def loss(params, batch):
+    """
+    Unaugmented loss to do GD over.
+    """
+    inputs, targets = batch
+    preds = predict(params, inputs)
+    return loss_fun(preds, targets)
+
+
 def initialize(rng):
     """
     Initialize parameters of the model.
@@ -111,4 +127,11 @@ _, _init_params, ravel_ode_params = initialize(rng)
 
 train_images, train_labels, test_images, test_labels = datasets.mnist()
 
-predict(_init_params, train_images[:batch_size])
+loss(_init_params, (train_images[:batch_size], train_labels[:batch_size]))
+print("forward worked")
+
+grad_ = grad(loss)
+print("built grad")
+
+grad_(_init_params, (train_images[:batch_size], train_labels[:batch_size]))
+print("backward worked")
