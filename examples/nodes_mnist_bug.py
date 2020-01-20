@@ -10,7 +10,7 @@ from jax.nn import log_softmax
 from jax.nn.initializers import glorot_normal, normal
 
 img_dim = 784
-ode_dim = 200
+ode_dim = 64
 num_reg = 1
 n_classes = 10
 batch_size = 128
