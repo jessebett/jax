@@ -5,7 +5,6 @@ import jax.numpy as np
 from jax.examples import datasets
 from jax import random, grad
 from jax.experimental.ode import build_odeint
-from jax.flatten_util import ravel_pytree
 from jax.nn import log_softmax
 from jax.nn.initializers import glorot_normal, normal
 
@@ -67,12 +66,12 @@ def post_ode(out_ode):
 
 
 # set up ODE
-def dynamics(flat_y, t, *flat_params):
+def dynamics(flat_y, t, *params):
     """
     Dynamics of the ODEBlock.
     """
     y = np.reshape(flat_y, (-1, ode_dim))
-    dydt = dynamics_predict(ravel_ode_params(np.array(flat_params)), append_time(y, t))
+    dydt = dynamics_predict(params, append_time(y, t))
     return np.ravel(dydt)
 
 
@@ -117,13 +116,10 @@ def initialize(rng):
     k1, k2 = random.split(layer_rng)
     w_dyn, b_dyn = glorot_normal()(k1, (ode_dim + 1, ode_dim)), normal()(k2, (ode_dim,))
 
-    flat_ode_params, ravel_ode_params = ravel_pytree((w_dyn, b_dyn))
-
-    return rng, flat_ode_params, ravel_ode_params
+    return rng, (w_dyn, b_dyn)
 
 
-# define ravel
-_, _init_params, ravel_ode_params = initialize(rng)
+_, _init_params = initialize(rng)
 
 train_images, train_labels, test_images, test_labels = datasets.mnist()
 

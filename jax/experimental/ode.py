@@ -372,7 +372,10 @@ def vjp_odeint(ofunc, y0, t, *args, **kwargs):
 
     time_vjp_list = jax.ops.index_update(result[-2], -1, result[-4])
     vjp_times = np.hstack(time_vjp_list)[::-1]
-    return tuple([result[-5], vjp_times] + list(result[-3]) + [result[-1]])
+    dummy_hack = result[-3][:65*64].reshape(65, 64)
+    dummy_hack2 =  result[-3][-64:]
+    return (result[-5], vjp_times, dummy_hack, dummy_hack2, result[-1])
+    # return tuple([result[-5], vjp_times] + list(result[-3]) + [result[-1]])
 
   primals_out, _ = odeint(flat_func, y0, t, flat_args)
   if nfe:
