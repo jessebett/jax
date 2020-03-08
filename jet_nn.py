@@ -22,6 +22,7 @@ def sigmoid(z):
   """
   return 1./(1. + jnp.exp(-z))
 
+
 def repeated(f, n):
   def rfun(p):
     return reduce(lambda x, _: f(x), range(n), p)
@@ -60,7 +61,6 @@ def jvp_test_jet(f, primals, series, atol=1e-5):
 def softmax_cross_entropy(logits, labels):
   one_hot = hk.one_hot(labels, logits.shape[-1])
   return -jnp.sum(jax.nn.log_softmax(logits) * one_hot, axis=-1)
-  # return -logits[labels]
 
 
 rng = jax.random.PRNGKey(42)
@@ -94,10 +94,13 @@ def test_mlp_x():
 
   params = loss_obj.init(rng, images, labels)
 
-  flat_params, unravel = ravel_pytree(params)
-
-  loss = loss_obj.apply(unravel(flat_params), images, labels)
+  loss_obj.apply(params, images, labels)
   print("forward pass works")
+
+  jax.grad(loss_obj.apply)(params, images, labels)
+  print("gradient works")
+
+  flat_params, unravel = ravel_pytree(params)
 
   f = lambda images: loss_obj.apply(unravel(flat_params), images, labels)
   _ = jax.grad(f)(images)
@@ -126,10 +129,13 @@ def test_mlp1():
 
   params = loss_obj.init(rng, images, labels)
 
-  flat_params, unravel = ravel_pytree(params)
-
-  loss = loss_obj.apply(unravel(flat_params), images, labels)
+  loss_obj.apply(params, images, labels)
   print("forward pass works")
+
+  jax.grad(loss_obj.apply)(params, images, labels)
+  print("gradient works")
+
+  flat_params, unravel = ravel_pytree(params)
 
   f = lambda flat_params: loss_obj.apply(unravel(flat_params), images, labels)
   terms_in = [npr.randn(*flat_params.shape) for _ in range(order)]
@@ -159,10 +165,13 @@ def test_mlp2():
 
   params = loss_obj.init(rng, images, labels)
 
-  flat_params, unravel = ravel_pytree(params)
-
-  loss = loss_obj.apply(unravel(flat_params), images, labels)
+  loss_obj.apply(params, images, labels)
   print("forward pass works")
+
+  jax.grad(loss_obj.apply)(params, images, labels)
+  print("gradient works")
+
+  flat_params, unravel = ravel_pytree(params)
 
   f = lambda flat_params: loss_obj.apply(unravel(flat_params), images, labels)
   terms_in = [npr.randn(*flat_params.shape) for _ in range(order)]
@@ -194,10 +203,13 @@ def test_res1():
 
   params = loss_obj.init(rng, images, labels)
 
-  flat_params, unravel = ravel_pytree(params)
-
-  loss = loss_obj.apply(unravel(flat_params), images, labels)
+  loss_obj.apply(params, images, labels)
   print("forward pass works")
+
+  jax.grad(loss_obj.apply)(params, images, labels)
+  print("gradient works")
+
+  flat_params, unravel = ravel_pytree(params)
 
   f = lambda flat_params: loss_obj.apply(unravel(flat_params), images, labels)
   terms_in = [npr.randn(*flat_params.shape) for _ in range(order)]
@@ -264,4 +276,4 @@ def test_log():
 # test_mlp_x()
 # test_mlp1()
 # test_mlp2()
-# test_res1()
+test_res1()
