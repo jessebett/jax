@@ -366,8 +366,7 @@ def run():
         Update the params based on grad for current batch.
         """
         images, labels = batch
-        grad_fn = jax.grad(loss_obj.apply, has_aux=True)
-        grad_ = grad_fn(get_params(opt_state), state, None, images, labels)
+        grad_fn = lambda *args: jax.grad(loss_obj.apply, has_aux=True)(*args)[0]
         return opt_update(i, grad_fn(get_params(opt_state), state, None, images, labels), opt_state)
 
     def sep_losses(opt_state, state, batch):
