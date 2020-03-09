@@ -31,6 +31,9 @@ parser.add_argument('--test_freq', type=int, default=6000)
 parser.add_argument('--save_freq', type=int, default=6000)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
+parser.add_argument('--resnet', action="store_true")
+parser.add_argument('--count_nfe', action="store_true")
+parser.add_argument('--num_blocks', type=int, default=6)
 parse_args = parser.parse_args()
 
 
@@ -43,7 +46,9 @@ lam = parse_args.lam
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
-
+odenet = False if parse_args.resnet is True else True
+count_nfe = True if parse_args.count_nfe is True else False
+num_blocks = parse_args.num_blocks
 
 # some primitive functions
 def sigmoid(z):
@@ -270,6 +275,34 @@ class ODEBlock(hk.Module):
             return jnp.reshape(self.nodeint(jnp.ravel(x), self.ts, params)[-1], self.input_shape)
 
 
+class ResBlock(hk.Module):
+    """
+    Standard ResBlock.
+    """
+
+    def __init__(self, output_channels):
+        super(ResBlock, self).__init__()
+
+        def residual(x_f_x):
+            """
+            Residual connection.
+            """
+            x, f_x = x_f_x
+            return x + f_x
+        self._model = hk.Sequential([
+            lambda x: (x, x),  # copy the input for skip connections
+            SkipConnection(sigmoid),
+            SkipConnection(hk.Conv2D(output_channels=output_channels,
+                                     kernel_shape=3,
+                                     stride=1,
+                                     padding="SAME")),
+            residual
+        ])
+
+    def __call__(self, x):
+        return self._model(x)
+
+
 def _loss_fn(logits, labels):
     return jnp.mean(softmax_cross_entropy(logits, labels))
 
@@ -278,12 +311,17 @@ def _reg_loss_fn(reg):
     return jnp.mean(reg)
 
 
-def loss_fn(images, labels, count_nfe):
+def loss_fn(images, labels):
     """
     The loss function for training.
     """
     # TODO: this shape needs to be set manually
     ode_shape = (-1, 4, 4, 8)
+    if odenet:
+        block = [ODEBlock(ode_shape, reg=parse_args.reg, count_nfe=count_nfe)]
+    else:
+        # chain resblocks and add dummy regularization at end to match API for ODENet
+        block = [ResBlock(ode_shape[-1]) for _ in range(num_blocks)] + [lambda x: (0, x)]
     model = hk.Sequential([
         lambda x: x.astype(jnp.float32) / 255.,
         hk.Conv2D(output_channels=8,
@@ -293,7 +331,7 @@ def loss_fn(images, labels, count_nfe):
         hk.AvgPool(window_shape=(1, 11, 11, 1),
                    strides=(1, 1, 1, 1),
                    padding="VALID"),
-        ODEBlock(ode_shape, reg=parse_args.reg, count_nfe=count_nfe),
+        *block,
         SkipConnection(sigmoid),
         SkipConnection(hk.AvgPool(window_shape=(1, 3, 3, 1),
                                   strides=(1, 1, 1, 1),
@@ -309,13 +347,6 @@ def loss_fn(images, labels, count_nfe):
     hk.set_state("loss", loss_)
     hk.set_state("reg", reg_)
     return loss_ + lam * reg_
-
-
-def get_loss_fn(count_nfe):
-    """
-    Close around counting NFE.
-    """
-    return lambda images, labels: loss_fn(images, labels, count_nfe)
 
 
 def run():
@@ -343,7 +374,7 @@ def run():
     ds_train, ds_train_eval = ds_train.batch(parse_args.batch_size), ds_train.batch(parse_args.test_batch_size)
     ds_train, ds_train_eval = tfds.as_numpy(ds_train), tfds.as_numpy(ds_train_eval)
 
-    loss_obj = hk.transform_with_state(get_loss_fn(count_nfe=False))
+    loss_obj = hk.transform_with_state(loss_fn)
 
     # initialize
     _images, _labels = next(tfds.as_numpy(ds_test.take(1)))
@@ -383,7 +414,6 @@ def run():
             test_batch = next(ds_train_eval)
 
             test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, state, test_batch)
-
 
             sep_loss_aug_.append(test_batch_loss_aug_)
             sep_loss_.append(test_batch_loss_)
