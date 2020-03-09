@@ -346,6 +346,9 @@ def run():
     assert num_train % parse_args.batch_size == 0
     num_batches = num_train // parse_args.batch_size
 
+    # make sure we always save the model on the last iteration
+    assert num_batches * parse_args.nepochs % parse_args.save_freq == 0
+
     ds_train = ds_train.cache()
     ds_train = ds_train.repeat()
     ds_train = ds_train.shuffle(1000)
@@ -369,6 +372,7 @@ def run():
         grad_fn = lambda *args: jax.grad(loss_obj.apply, has_aux=True)(*args)[0]
         return opt_update(i, grad_fn(get_params(opt_state), state, None, images, labels), opt_state)
 
+    @jax.jit
     def sep_losses(opt_state, state, batch):
         """
         Convenience function for calculating losses separately.
@@ -380,7 +384,6 @@ def run():
         reg_ = state["~"]["reg"]
         return total_loss_, loss_, reg_
 
-    @jax.jit
     def evaluate_loss(opt_state, state, ds_train_eval):
         """
         Convenience function for evaluating loss over train set in smaller batches.
@@ -389,6 +392,7 @@ def run():
         sep_loss_aug_, sep_loss_, sep_loss_reg_ = [], [], []
 
         for test_batch_num in range(num_test_batches):
+            print("eval", test_batch_num)
             test_batch = next(ds_train_eval)
 
             test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, state, test_batch)
@@ -412,10 +416,10 @@ def run():
             opt_state = update(itr, opt_state, state, batch)
 
             if itr % parse_args.test_freq == 0:
-                acc_, loss_aug_, loss_, loss_reg_ = evaluate_loss(opt_state, state, ds_train_eval)
+                loss_aug_, loss_, loss_reg_ = evaluate_loss(opt_state, state, ds_train_eval)
 
-                print_str = 'Iter {:04d} | Accuracy {:.6f} | Total (Regularized) Loss {:.6f} | ' \
-                            'Loss {:.6f} | r {:.6f}'.format(itr, acc_, loss_aug_, loss_, loss_reg_)
+                print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
+                            'Loss {:.6f} | r {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_)
 
                 print(print_str)
                 print(print_str, file=sys.stderr)
