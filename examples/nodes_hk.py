@@ -29,7 +29,7 @@ parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--reg', type=str, choices=['r3'], default='none')
 parser.add_argument('--test_freq', type=int, default=6000)
 parser.add_argument('--save_freq', type=int, default=6000)
-parser.add_argument('--dirname', type=str, default='tmp15')
+parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parse_args = parser.parse_args()
 
