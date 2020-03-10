@@ -50,6 +50,7 @@ odenet = False if parse_args.resnet is True else True
 count_nfe = True if parse_args.count_nfe is True else False
 num_blocks = parse_args.num_blocks
 
+
 # some primitive functions
 def sigmoid(z):
   """
@@ -303,6 +304,14 @@ class ResBlock(hk.Module):
         return self._model(x)
 
 
+def _acc_fn(logits, labels):
+    """
+    Classification accuracy of the model.
+    """
+    predicted_class = jnp.argmax(logits, axis=1)
+    return jnp.mean(predicted_class == labels)
+
+
 def _loss_fn(logits, labels):
     return jnp.mean(softmax_cross_entropy(logits, labels))
 
@@ -344,8 +353,10 @@ def loss_fn(images, labels):
         hk.set_state("nfe", model.layers[6].nfe)
     loss_ = _loss_fn(logits, labels)
     reg_ = _reg_loss_fn(regs)
+    acc_ = _acc_fn(logits, labels)
     hk.set_state("loss", loss_)
     hk.set_state("reg", reg_)
+    hk.set_state("acc", acc_)
     return loss_ + lam * reg_
 
 
@@ -401,29 +412,34 @@ def run():
         total_loss_, state = loss_obj.apply(params, state, None, images, labels)
         loss_ = state["~"]["loss"]
         reg_ = state["~"]["reg"]
-        return total_loss_, loss_, reg_
+        acc_ = state["~"]["acc"]
+        return acc_, total_loss_, loss_, reg_
 
     def evaluate_loss(opt_state, state, ds_train_eval):
         """
         Convenience function for evaluating loss over train set in smaller batches.
         """
-        num_test_batches = num_train // parse_args.test_batch_size
-        sep_loss_aug_, sep_loss_, sep_loss_reg_ = [], [], []
+        test_batch_size = parse_args.test_batch_size if odenet else num_train
+        num_test_batches = num_train // test_batch_size
+        sep_acc_, sep_loss_aug_, sep_loss_, sep_loss_reg_ = [], [], [], []
 
         for test_batch_num in range(num_test_batches):
             test_batch = next(ds_train_eval)
 
-            test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, state, test_batch)
+            test_batch_acc_, test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = \
+                sep_losses(opt_state, state, test_batch)
 
+            sep_acc_.append(test_batch_acc_)
             sep_loss_aug_.append(test_batch_loss_aug_)
             sep_loss_.append(test_batch_loss_)
             sep_loss_reg_.append(test_batch_loss_reg_)
 
+        sep_acc_ = jnp.array(sep_acc_)
         sep_loss_aug_ = jnp.array(sep_loss_aug_)
         sep_loss_ = jnp.array(sep_loss_)
         sep_loss_reg_ = jnp.array(sep_loss_reg_)
 
-        return jnp.mean(sep_loss_aug_), jnp.mean(sep_loss_), jnp.mean(sep_loss_reg_)
+        return jnp.mean(sep_acc_), jnp.mean(sep_loss_aug_), jnp.mean(sep_loss_), jnp.mean(sep_loss_reg_)
 
     itr = 0
     for epoch in range(parse_args.nepochs):
@@ -434,10 +450,10 @@ def run():
             opt_state = update(itr, opt_state, state, batch)
 
             if itr % parse_args.test_freq == 0:
-                loss_aug_, loss_, loss_reg_ = evaluate_loss(opt_state, state, ds_train_eval)
+                acc_, loss_aug_, loss_, loss_reg_ = evaluate_loss(opt_state, state, ds_train_eval)
 
-                print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
-                            'Loss {:.6f} | r {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_)
+                print_str = 'Iter {:04d} | Accuracy {:.6f} | Total (Regularized) Loss {:.6f} | ' \
+                            'Loss {:.6f} | r {:.6f}'.format(itr, acc_, loss_aug_, loss_, loss_reg_)
 
                 print(print_str)
                 print(print_str, file=sys.stderr)
