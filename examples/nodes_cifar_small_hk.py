@@ -464,7 +464,10 @@ def run():
                 print(print_str, file=sys.stderr)
 
             if itr % parse_args.save_freq == 0:
-                param_filename = "%s/reg_%s_lam_%.4e_%d_fargs.pickle" % (dirname, reg, lam, itr)
+                if odenet:
+                    param_filename = "%s/reg_%s_lam_%.4e_%d_fargs.pickle" % (dirname, reg, lam, itr)
+                else:
+                    param_filename = "%s/reg_%s_lam_%.4e_num_blocks_%d_%d_fargs.pickle" % (dirname, reg, lam, num_blocks, itr)
                 fargs = get_params(opt_state)
                 outfile = open(param_filename, "wb")
                 pickle.dump(fargs, outfile)
