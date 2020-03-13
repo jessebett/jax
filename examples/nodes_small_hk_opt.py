@@ -1,0 +1,329 @@
+"""
+Pared down example to optimize.
+"""
+import collections
+
+import haiku as hk
+import numpy as onp
+import tensorflow_datasets as tfds
+from haiku.data_structures import to_immutable_dict
+from haiku.initializers import TruncatedNormal
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import optimizers
+from jax.experimental.ode import build_odeint, odeint
+from jax.interpreters.xla import DeviceArray
+
+# set up config
+
+reg = "r3"
+lam = 1
+seed = 0
+rng = jax.random.PRNGKey(seed)
+lr = 1e-2
+batch_size = 100
+
+
+# some primitive functions
+def sigmoid(z):
+  """
+  Defined using only numpy primitives (but probably less numerically stable).
+  """
+  return 1./(1. + jnp.exp(-z))
+
+
+def softmax_cross_entropy(logits, labels):
+  """
+  Cross-entropy loss applied to softmax.
+  """
+  one_hot = hk.one_hot(labels, logits.shape[-1])
+  return -jnp.sum(jax.nn.log_softmax(logits) * one_hot, axis=-1)
+
+
+def sol_recursive(f, z, t):
+  """
+  Recursively compute higher order derivatives of dynamics of ODE.
+  """
+  def g(z):
+    """
+    Closure to expand z.
+    """
+    return f(z, t)
+
+  (y0, [y1h]) = jax.jet(g, (z, ), ((jnp.ones_like(z), ), ))
+  (y0, [y1, y2h]) = jax.jet(g, (z, ), ((y0, y1h,), ))
+  (y0, [y1, y2, y3h]) = jax.jet(g, (z, ), ((y0, y1, y2h), ))
+
+  return (y0, [y1, y2])
+
+
+# set up modules
+class Flatten(hk.Module):
+    """
+    Flatten all dimensions except batch dimension.
+    """
+
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def __call__(self, x):
+        return jnp.reshape(x, (x.shape[0], -1))
+
+
+class SkipConnection(hk.Module):
+    """
+    A type of Skip Connection module.
+    """
+
+    def __init__(self, func):
+        super(SkipConnection, self).__init__()
+        self.func = func
+
+    def __call__(self, t_x):
+        # t could correspond to time (for ODE dynamics),
+        # or regularization (after the ODE block)
+        t, x = t_x
+        return (t, self.func(x))
+
+
+class EndSkipConnection(hk.Module):
+    """
+    Stop doing SkipConnections.
+    """
+
+    def __init__(self):
+        super(EndSkipConnection, self).__init__()
+
+    def __call__(self, t_x):
+        t, x = t_x
+        return x
+
+
+class ConcatConv2d(hk.Module):
+    """
+    Convolution with extra channel and skip connection for time
+    .
+    """
+
+    def __init__(self, **kwargs):
+        super(ConcatConv2d, self).__init__()
+        self._layer = hk.Conv2D(**kwargs)
+
+    def __call__(self, t_x):
+        t, x = t_x
+        tt = jnp.ones_like(x[:, :, :, :1]) * t
+        ttx = jnp.concatenate([tt, x], axis=-1)
+        return (t, self._layer(ttx))
+
+
+def _get_shapes(params):
+    """
+    Recursive method for finding the shapes.
+    """
+    if isinstance(params, DeviceArray):
+        return params.shape, params.dtype
+    else:
+        params_shapes = collections.defaultdict(dict)
+        for key in params:
+            params_shapes[key] = _get_shapes(params[key])
+        return params_shapes
+
+
+def get_shapes(params):
+    """
+    Returns DS w/ same shape as params, but with only the shapes.
+    """
+    return to_immutable_dict(_get_shapes(params))
+
+
+def _init_params(shapes, bundle_name=""):
+    """
+    Recursive function to initialize params based on shapes.
+    """
+    params = collections.defaultdict(dict)
+    for key in shapes:
+        fq_name = bundle_name + "/" + key
+        if isinstance(shapes[key], tuple):
+            if key == "w":
+                # note: initialization works for linear too
+                fan_in_shape = onp.prod(shapes[key][0][:-1])
+                stddev = 1. / onp.sqrt(fan_in_shape)
+                init = TruncatedNormal(stddev=stddev)
+            else:
+                init = jnp.zeros
+            # noinspection PyTypeChecker
+            params[key] = hk.get_parameter(name=fq_name,
+                                           shape=shapes[key][0],
+                                           dtype=shapes[key][1],
+                                           init=init)
+        else:
+            params[key] = _init_params(shapes[key], fq_name)
+    return params
+
+
+def init_params(shapes):
+    """
+    Initialize the parameters based on shapes.
+    """
+    return to_immutable_dict(_init_params(shapes))
+
+
+def aug_init(y):
+    """
+    Initialize the augmented dynamics.
+    """
+    return jnp.concatenate((jnp.ravel(y), jnp.zeros(y.shape[0])))
+
+
+def unpack_aug(yr, batch_size):
+    """
+    Unpack dynamics from augmentation.
+    """
+    return yr[:-batch_size], yr[-batch_size:]
+
+
+class ODEBlock(hk.Module):
+    """
+    Block using Neural ODE.
+    """
+
+    def __init__(self, input_shape, reg=None):
+        super(ODEBlock, self).__init__()
+        self.input_shape = input_shape
+        self.ode_dim = onp.prod(input_shape[1:])
+        self.reg = reg
+        output_channels = input_shape[-1]
+        model = hk.Sequential([
+            SkipConnection(lambda x: jnp.reshape(x, input_shape)),
+            SkipConnection(sigmoid),
+            ConcatConv2d(output_channels=output_channels,
+                         kernel_shape=3,
+                         stride=1,
+                         padding="SAME"),
+            EndSkipConnection(),
+            jnp.ravel
+        ])
+        dynamics = hk.transform(model)
+        self.ts = jnp.array([0., 1.])
+        _params = dynamics.init(rng, (self.ts[0], jnp.ravel(jnp.zeros((1, *input_shape[1:])))))
+        self._dynamics_shapes = get_shapes(_params)
+        if reg:
+            def reg_dynamics(y, t, params):
+                """
+                Dynamics of regularization for ODE integration.
+                """
+                if reg == "none":
+                    return jnp.zeros(self.batch_size)
+                else:
+                    # do r3 regularization
+                    y0, y_n = sol_recursive(lambda y, t: dynamics.apply(params, (t, y)), y, t)
+                    r = jnp.reshape(y_n[-1], (-1, jnp.prod(self.input_shape[1:])))
+                    return jnp.sum(r ** 2, axis=1)
+
+            def aug_dynamics(yr, t, params):
+                """
+                Dynamics augmented with regularization.
+                """
+                y, r = unpack_aug(yr, self.batch_size)
+                dydt = dynamics.apply(params, (t, y))
+                drdt = reg_dynamics(y, t, params)
+                return jnp.concatenate((dydt, drdt))
+
+            self.nodeint = build_odeint(aug_dynamics)
+        else:
+            self.nodeint = build_odeint(lambda x, t, params: dynamics.apply(params, (t, x)))
+
+    def __call__(self, x):
+        self.batch_size = x.shape[0]
+        params = init_params(self._dynamics_shapes)
+        if self.reg:
+            y1, r1 = unpack_aug(self.nodeint(aug_init(x), self.ts, params)[-1], self.batch_size)
+            return r1, jnp.reshape(y1, self.input_shape)
+        else:
+            return jnp.reshape(self.nodeint(jnp.ravel(x), self.ts, params)[-1], self.input_shape)
+
+
+def _acc_fn(logits, labels):
+    """
+    Classification accuracy of the model.
+    """
+    predicted_class = jnp.argmax(logits, axis=1)
+    return jnp.mean(predicted_class == labels)
+
+
+def _loss_fn(logits, labels):
+    return jnp.mean(softmax_cross_entropy(logits, labels))
+
+
+def _reg_loss_fn(reg):
+    return jnp.mean(reg)
+
+
+def loss_fn(images, labels):
+    """
+    The loss function for training.
+    """
+    # TODO: this shape needs to be set manually
+    ode_shape = (-1, 4, 4, 8)
+    model = hk.Sequential([
+        lambda x: x.astype(jnp.float32) / 255.,
+        hk.Conv2D(output_channels=8,
+                  kernel_shape=3,
+                  stride=2,
+                  padding=lambda x: (1, 1)),
+        hk.AvgPool(window_shape=(1, 11, 11, 1),
+                   strides=(1, 1, 1, 1),
+                   padding="VALID"),
+        ODEBlock(ode_shape, reg=reg),
+        SkipConnection(sigmoid),
+        SkipConnection(hk.AvgPool(window_shape=(1, 3, 3, 1),
+                                  strides=(1, 1, 1, 1),
+                                  padding="VALID")),
+        SkipConnection(Flatten()),
+        SkipConnection(hk.Linear(10))
+    ])
+    regs, logits = model(images)
+    loss_ = _loss_fn(logits, labels)
+    reg_ = _reg_loss_fn(regs)
+    acc_ = _acc_fn(logits, labels)
+    hk.set_state("loss", loss_)
+    hk.set_state("reg", reg_)
+    hk.set_state("acc", acc_)
+    return loss_ + lam * reg_
+
+
+(ds_train, ds_test), ds_info = tfds.load('mnist',
+                                         split=['train', 'test'],
+                                         shuffle_files=True,
+                                         as_supervised=True,
+                                         with_info=True)
+num_train = ds_info.splits['train'].num_examples
+
+ds_train = ds_train.cache()
+ds_train = ds_train.repeat()
+ds_train = ds_train.shuffle(1000)
+ds_train = ds_train.batch(batch_size)
+ds_train = tfds.as_numpy(ds_train)
+
+loss_obj = hk.transform_with_state(loss_fn)
+
+# initialize
+_images, _labels = next(tfds.as_numpy(ds_test.take(1)))
+opt_init_params, state = loss_obj.init(rng, jnp.expand_dims(_images, axis=0), _labels)
+opt_init, opt_update, get_params = optimizers.adam(step_size=lr)
+opt_state = opt_init(opt_init_params)
+
+
+@jax.jit
+def update(i, opt_state, state, batch,):
+    """
+    Update the params based on grad for current batch.
+    """
+    images, labels = batch
+    grad_fn = lambda *args: jax.grad(loss_obj.apply, has_aux=True)(*args)[0]
+    return opt_update(i, grad_fn(get_params(opt_state), state, None, images, labels), opt_state)
+
+
+batch = next(ds_train)
+opt_state = update(1, opt_state, state, batch)
