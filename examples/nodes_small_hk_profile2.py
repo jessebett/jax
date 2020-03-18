@@ -22,8 +22,8 @@ parser.add_argument('--nepochs', type=int, default=1)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=6000)
-parser.add_argument('--save_freq', type=int, default=6000)
+parser.add_argument('--test_freq', type=int, default=600)
+parser.add_argument('--save_freq', type=int, default=600)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resnet', action="store_true")
@@ -42,7 +42,8 @@ seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
-count_nfe = True if parse_args.count_nfe is True else False
+count_nfe = True
+# count_nfe = True if parse_args.count_nfe is True else False
 num_blocks = parse_args.num_blocks
 
 
