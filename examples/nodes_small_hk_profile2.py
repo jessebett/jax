@@ -8,7 +8,6 @@ import sys
 import time
 
 import haiku as hk
-import numpy as onp
 import tensorflow_datasets as tfds
 
 import jax
@@ -245,7 +244,7 @@ def initialization_data(input_shape, ode_shape):
     ode_shape = (1, ) + ode_shape[1:]
     data = {
         "pre_ode": jnp.zeros(input_shape),
-        "ode": (jnp.zeros(ode_shape), 0.),
+        "ode": (jnp.ravel(jnp.zeros(ode_shape)), 0.),
         "post_ode": jnp.zeros(ode_shape)
     }
     return data
@@ -259,7 +258,7 @@ def init_model():
 
     input_shape = (1, 28, 28, 1)
     ode_shape = (-1, 4, 4, 8)
-    ode_dim = onp.prod(ode_shape[1:])
+    ode_dim = jnp.prod(ode_shape[1:])
 
     initialization_data_ = initialization_data(input_shape, ode_shape)
 
@@ -291,8 +290,22 @@ def init_model():
             dydt = dynamics_wrap(y, t, params)
             drdt = reg_dynamics(y, t, params)
             return jnp.concatenate((dydt, drdt))
+
+        nfe_nodeint = jax.jit(lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params))
+
+        @jax.jit
+        def nfe_nodeint_vjp(cotangent, y0, t, params):
+            """
+            VJP of odeint unregularized (used to count NFE and profile).
+            """
+            def _flatten(out_ode, out_ode_r):
+                return jnp.concatenate((jnp.ravel(out_ode), out_ode_r))
+            cotangent = jnp.array([_flatten(*cotangent_) for cotangent_ in cotangent])
+            return vjp_odeint(aug_dynamics, aug_init(y0), t, params, nfe=True)[1](cotangent)[-1]
         nodeint = build_odeint(aug_dynamics)
     else:
+        nfe_nodeint = None
+        nfe_nodeint_vjp = None
         nodeint = build_odeint(dynamics_wrap)
 
     def ode(params, out_pre_ode):
@@ -330,7 +343,7 @@ def init_model():
             grad_partial_loss_ = jax.grad(partial_loss)(out_ode, _labels)
             # grad is 0 at t0 (since always equal)
             cotangent = jnp.stack((jnp.zeros_like(grad_partial_loss_), grad_partial_loss_), axis=0)
-            b_nfe = unreg_nodeint_vjp(cotangent, jnp.reshape(in_ode, (-1, )), ts, params["ode"])
+            b_nfe = unreg_nodeint_vjp(cotangent, in_ode, ts, params["ode"])
 
             return f_nfe, b_nfe
 
@@ -352,7 +365,9 @@ def init_model():
             "ode": dynamics_params,
             "post_ode": post_ode_params
         },
-        "nfe": nfe_fn
+        "nfe": nfe_fn,
+        "nfe_f": nfe_nodeint,
+        "nfe_b": nfe_nodeint_vjp
     }
 
     def forward(params, _images):
@@ -482,6 +497,10 @@ def run():
     update_times = []
     test_times = []
     save_times = []
+    ode_times = []
+    adjoint_times = []
+    f_nfes = []
+    b_nfes = []
     for epoch in range(parse_args.nepochs):
         for i in range(num_batches):
             iter_start = time.time()
@@ -490,6 +509,42 @@ def run():
             batch_end = time.time()
 
             itr += 1
+
+            # time the forward and backward pass and count nfe
+            model_ = model["model"]
+            _params = get_params(opt_state)
+            ts = jnp.array([0., 1.])
+            ode_shape = (-1, 4, 4, 8)
+            ode_dim = jnp.prod(ode_shape[1:])
+            _images, _labels = batch
+
+            in_ode = model_["pre_ode"](_params["pre_ode"], _images)
+            ode_start = time.time()
+            flat_out_ode, f_nfe = model["nfe_f"](in_ode, ts, _params["ode"])
+            ode_end = time.time()
+            ode_out = unpack_aug(flat_out_ode[-1], ode_dim)
+            ode_out = (jnp.reshape(ode_out[0], ode_shape), ode_out[1])
+
+            def partial_loss(_ode_out, targets):
+                """
+                Evaluates loss wrt output of ODEBlock. (for b-nfe calculations).
+                """
+                _out_ode, _out_ode_r = _ode_out
+                preds = model_["post_ode"](_params["post_ode"], _out_ode)
+                loss_ = _loss_fn(preds, targets)
+                reg_ = _reg_loss_fn(_out_ode_r)
+                return loss_ + lam * reg_
+
+            grad_partial_loss_ = jax.grad(partial_loss)(ode_out, _labels)
+            # grad is 0 at t0 (since it's not used in the next component)
+            cotangent = [(jnp.zeros_like(grad_partial_loss_[0]), jnp.zeros_like(grad_partial_loss_[1])),
+                         grad_partial_loss_]
+            adjoint_start = time.time()
+            b_nfe = model["nfe_b"](cotangent, in_ode, ts, _params["ode"])
+            adjoint_end = time.time()
+
+            f_nfes.append(f_nfe)
+            b_nfes.append(b_nfe)
 
             update_start = time.time()
             opt_state = update(itr, opt_state, batch)
@@ -504,10 +559,6 @@ def run():
 
                 print(print_str)
                 print(print_str, file=sys.stderr)
-
-                if count_nfe:
-                    f_nfe, b_nfe = model["nfe"](get_params(opt_state), *batch)
-                    print(f_nfe, b_nfe)
             test_end = time.time()
 
             save_start = time.time()
@@ -528,13 +579,19 @@ def run():
             update_times.append(update_end - update_start)
             test_times.append(test_end - test_start)
             save_times.append(save_end - save_start)
+            ode_times.append(ode_end - ode_start)
+            adjoint_times.append(adjoint_end - adjoint_start)
 
     times = {
         "iter": iter_times,
         "batch": batch_times,
         "update": update_times,
         "test": test_times,
-        "save": save_times
+        "save": save_times,
+        "ode": ode_times,
+        "adjoint": adjoint_times,
+        "f-nfe": f_nfes,
+        "b-nfe": b_nfes
     }
     outfile = open("%s/times.pickle" % dirname, "wb")
     pickle.dump(times, outfile)
