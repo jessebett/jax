@@ -207,7 +207,9 @@ class Dynamics(hk.Module):
         self.concat_conv = ConcatConv2d(output_channels=output_channels,
                                         kernel_shape=3,
                                         stride=1,
-                                        padding="SAME")
+                                        padding="SAME",
+                                        w_init=jnp.zeros,
+                                        b_init=jnp.zeros)
 
     def __call__(self, x, t):
         x = jnp.reshape(x, self.input_shape)
