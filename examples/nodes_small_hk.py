@@ -21,6 +21,8 @@ parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=1)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
+parser.add_argument('--atol', type=float, default=1e-3)
+parser.add_argument('--rtol', type=float, default=1e-3)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
 parser.add_argument('--test_freq', type=int, default=1)
 parser.add_argument('--save_freq', type=int, default=1)
@@ -44,6 +46,8 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 num_blocks = parse_args.num_blocks
+atol = parse_args.atol
+rtol = parse_args.rtol
 
 
 # some primitive functions
@@ -297,9 +301,9 @@ def init_model():
                 dydt = dynamics_wrap(y, t, params)
                 drdt = reg_dynamics(y, t, params)
                 return jnp.concatenate((dydt, drdt))
-            nodeint = build_odeint(aug_dynamics)
+            nodeint = build_odeint(aug_dynamics, atol=atol, rtol=rtol)
         else:
-            nodeint = build_odeint(dynamics_wrap)
+            nodeint = build_odeint(dynamics_wrap, atol=atol, rtol=rtol)
 
         def ode(params, out_pre_ode):
             """
