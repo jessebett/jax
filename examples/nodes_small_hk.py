@@ -425,6 +425,7 @@ def run():
     num_test_batches = meta["num_test_batches"]
 
     forward, model = init_model()
+    grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
 
     opt_init, opt_update, get_params = optimizers.adam(step_size=parse_args.lr)
     opt_state = opt_init(model["params"])
@@ -435,7 +436,6 @@ def run():
         Update the params based on grad for current batch.
         """
         images, labels = _batch
-        grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
         return opt_update(_itr, grad_fn(get_params(_opt_state), images, labels), _opt_state)
 
     @jax.jit
