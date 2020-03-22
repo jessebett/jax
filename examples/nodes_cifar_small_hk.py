@@ -320,14 +320,14 @@ def _reg_loss_fn(reg):
     return jnp.mean(reg)
 
 
-def loss_fn(images, labels):
+def loss_fn(images, labels, _odenet, _count_nfe):
     """
     The loss function for training.
     """
     # TODO: this shape needs to be set manually
     ode_shape = (-1, 4, 4, 8)
-    if odenet:
-        block = [ODEBlock(ode_shape, reg=parse_args.reg, count_nfe=count_nfe)]
+    if _odenet:
+        block = [ODEBlock(ode_shape, reg=parse_args.reg, count_nfe=_count_nfe)]
     else:
         # chain resblocks and add dummy regularization at end to match API for ODENet
         block = [ResBlock(ode_shape[-1]) for _ in range(num_blocks)] + [lambda x: (0, x)]
@@ -390,7 +390,7 @@ def run():
     ds_train, ds_train_eval = ds_train.batch(parse_args.batch_size), ds_train.batch(parse_args.test_batch_size)
     ds_train, ds_train_eval = tfds.as_numpy(ds_train), tfds.as_numpy(ds_train_eval)
 
-    loss_obj = hk.transform_with_state(loss_fn)
+    loss_obj = hk.transform_with_state(lambda images, labels: loss_fn(images, labels, odenet, count_nfe))
 
     # initialize
     _images, _labels = next(tfds.as_numpy(ds_test.take(1)))
