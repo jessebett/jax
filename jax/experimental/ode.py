@@ -261,7 +261,8 @@ def odeint(ofunc, y0, t, *args, **kwargs):
   # two function evaluations to pick initial step size
   func = lambda y, t: ofunc(y, t, *args)
   f0 = func(y0, t[0])
-  dt = initial_step_size(func, t[0], y0, 4, rtol, atol, f0)
+  dt = 1.0
+  # dt = initial_step_size(func, t[0], y0, 4, rtol, atol, f0)
   interp_coeff = np.array([y0] * 5)
 
   result = jax.lax.fori_loop(1,
