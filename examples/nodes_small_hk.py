@@ -136,7 +136,9 @@ class ResBlock(hk.Module):
         self.conv = hk.Conv2D(output_channels=output_channels,
                               kernel_shape=3,
                               stride=1,
-                              padding="SAME")
+                              padding="SAME",
+                              w_init=jnp.zeros,
+                              b_init=jnp.zeros)
 
     def __call__(self, x):
         f_x = sigmoid(x)
