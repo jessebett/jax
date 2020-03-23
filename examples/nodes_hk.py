@@ -24,7 +24,7 @@ parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--atol', type=float, default=1e-3)
 parser.add_argument('--rtol', type=float, default=1e-3)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=1)
+parser.add_argument('--test_freq', type=int, default=600)
 parser.add_argument('--save_freq', type=int, default=600)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
@@ -137,13 +137,13 @@ class ResBlock(hk.Module):
 
     def __init__(self, output_channels):
         super(ResBlock, self).__init__()
-        self.norm1 = LayerNorm()
+        # self.norm1 = LayerNorm()
         self.conv1 = hk.Conv2D(output_channels=output_channels,
                                kernel_shape=3,
                                stride=1,
                                padding=lambda _: (1, 1),
                                with_bias=False)
-        self.norm2 = LayerNorm()
+        # self.norm2 = LayerNorm()
         self.conv2 = hk.Conv2D(output_channels=output_channels,
                                kernel_shape=3,
                                stride=1,
@@ -152,11 +152,11 @@ class ResBlock(hk.Module):
                                with_bias=False)
 
     def __call__(self, x):
-        out = self.norm1(x)
-        out = jax.nn.relu(out)
+        # out = self.norm1(x)
+        out = sigmoid(x)
         out = self.conv1(out)
-        out = self.norm2(out)
-        out = jax.nn.relu(out)
+        # out = self.norm2(out)
+        out = sigmoid(out)
         out = self.conv2(out)
         return x + out
 
@@ -220,14 +220,14 @@ class PreODE(hk.Module):
                       kernel_shape=3,
                       stride=1,
                       padding="VALID"),
-            LayerNorm(),
-            jax.nn.relu,
+            # LayerNorm(),
+            sigmoid,
             hk.Conv2D(output_channels=64,
                       kernel_shape=4,
                       stride=2,
                       padding=lambda _: (1, 1)),
-            LayerNorm(),
-            jax.nn.relu,
+            # LayerNorm(),
+            sigmoid,
             hk.Conv2D(output_channels=64,
                       kernel_shape=4,
                       stride=2,
@@ -247,12 +247,12 @@ class Dynamics(hk.Module):
         super(Dynamics, self).__init__()
         self.input_shape = input_shape
         output_channels = input_shape[-1]
-        self.norm1 = LayerNorm()
+        # self.norm1 = LayerNorm()
         self.conv1 = ConcatConv2d(output_channels=output_channels,
                                   kernel_shape=3,
                                   stride=1,
                                   padding=lambda _: (1, 1))
-        self.norm2 = LayerNorm()
+        # self.norm2 = LayerNorm()
         self.conv2 = ConcatConv2d(output_channels=output_channels,
                                   kernel_shape=3,
                                   stride=1,
@@ -262,11 +262,11 @@ class Dynamics(hk.Module):
 
     def __call__(self, x, t):
         x = jnp.reshape(x, self.input_shape)
-        out = self.norm1(x)
-        out = jax.nn.relu(out)
+        # out = self.norm1(x)
+        out = sigmoid(x)
         out = self.conv1(out, t)
-        out = self.norm2(out)
-        out = jax.nn.relu(out)
+        # out = self.norm2(x)
+        out = sigmoid(out)
         out = self.conv2(out, t)
         out = jnp.ravel(out)
         return out
@@ -280,8 +280,8 @@ class PostODE(hk.Module):
     def __init__(self):
         super(PostODE, self).__init__()
         self.model = hk.Sequential([
-            LayerNorm(),
-            jax.nn.relu,
+            # LayerNorm(),
+            sigmoid,
             hk.AvgPool(window_shape=(1, 6, 6, 1),
                        strides=(1, 1, 1, 1),
                        padding="VALID"),
@@ -319,14 +319,14 @@ def init_model():
 
     initialization_data_ = initialization_data(input_shape, ode_shape)
 
-    pre_ode = hk.transform_with_state(wrap_module(PreODE))
-    pre_ode_params, pre_ode_state = pre_ode.init(rng, initialization_data_["pre_ode"])
-    pre_ode_fn = lambda params, x: pre_ode.apply(params, pre_ode_state, None, x)
+    pre_ode = hk.transform(wrap_module(PreODE))
+    pre_ode_params = pre_ode.init(rng, initialization_data_["pre_ode"])
+    pre_ode_fn = pre_ode.apply
 
     if odenet:
-        dynamics = hk.transform_with_state(wrap_module(Dynamics, ode_shape))
-        dynamics_params, dynamics_state = dynamics.init(rng, *initialization_data_["ode"])
-        dynamics_wrap = lambda x, t, params: dynamics.apply(params, dynamics_state, None, x, t)
+        dynamics = hk.transform(wrap_module(Dynamics, ode_shape))
+        dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
+        dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
         if reg:
             def reg_dynamics(y, t, params):
                 """
@@ -378,14 +378,14 @@ def init_model():
             nfe_fn = None
 
     else:
-        resnet = hk.transform_with_state(wrap_module(
+        resnet = hk.transform(wrap_module(
             lambda: hk.Sequential([ResBlock(ode_shape[-1]) for _ in range(num_blocks)])))
-        resnet_params, resnet_state = resnet.init(rng, initialization_data_["res"])
-        resnet_fn = lambda params, x: resnet.apply(params, resnet_state, None, x)
+        resnet_params = resnet.init(rng, initialization_data_["res"])
+        resnet_fn = resnet.apply
 
-    post_ode = hk.transform_with_state(wrap_module(PostODE))
-    post_ode_params, post_ode_state = post_ode.init(rng, initialization_data_["post_ode"])
-    post_ode_fn = lambda params, x: post_ode.apply(params, post_ode_state, None, x)
+    post_ode = hk.transform(wrap_module(PostODE))
+    post_ode_params = post_ode.init(rng, initialization_data_["post_ode"])
+    post_ode_fn = post_ode.apply
 
     # return a dictionary of the three components of the model
     model = {
