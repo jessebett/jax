@@ -13,12 +13,13 @@
 # limitations under the License.
 
 from functools import partial
+from typing import Callable, Dict, Type
 
 from absl import logging
 import numpy as onp
 
 from .. import core
-from ..abstract_arrays import ShapedArray, ConcreteArray, array_types, abstract_token
+from ..abstract_arrays import ShapedArray, ConcreteArray, array_types
 from . import partial_eval as pe
 from . import xla
 from .. import linear_util as lu
@@ -86,7 +87,7 @@ def _pvals_to_results_handler(nrep, npar, partitions, out_pvals):
     buffers = [[[None] * npar for _ in range(nrep)] for _ in range(nouts)]
     for raw_idx, tuple_buf in enumerate(out_bufs):
       r, p = onp.unravel_index(raw_idx, (nrep, npar))
-      for i, buf in enumerate(tuple_buf.destructure()):
+      for i, buf in enumerate(tuple_buf):
         buffers[i][r][p] = buf
     return [h(bufs) for h, bufs in zip(handlers, buffers)]
 
@@ -105,7 +106,7 @@ def _aval_to_result_handler(partition, aval):
   return result_handlers[type(aval)](partition, aval)
 
 
-result_handlers = {}
+result_handlers: Dict[Type[core.AbstractValue], Callable] = {}
 
 
 def _array_result_handler(partition, aval):
@@ -134,7 +135,7 @@ result_handlers[ConcreteArray] = _array_result_handler
 
 
 @lu.cache
-def _sharded_callable(fun, partitions, name, *abstract_args):
+def _sharded_callable(fun: lu.WrappedFun, partitions, name, *abstract_args):
   nrep = 1  # TODO generalize
 
   in_pvals = [pe.PartialVal((aval, core.unit)) for aval in abstract_args]
@@ -202,7 +203,8 @@ def _sharded_jit_translation_rule(c, axis_env, freevar_nodes,
 
 def _execute_spatially_partitioned(compiled, in_handler, out_handler, *args):
   input_bufs = in_handler(args)
-  out_bufs = compiled.ExecuteOnLocalDevices(list(input_bufs))
+  out_bufs = compiled.ExecuteOnLocalDevices(
+      list(input_bufs), tuple_arguments=False)
   return out_handler(out_bufs)
 
 
@@ -263,7 +265,7 @@ def jaxpr_partitions(jaxpr):
 ### sharded_call
 
 
-def _sharded_call_impl(fun, *args, **params):
+def _sharded_call_impl(fun: lu.WrappedFun, *args, **params):
   partitions = params.pop("partitions")
   name = params.pop("name")
   assert not params, params

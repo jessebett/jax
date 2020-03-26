@@ -16,13 +16,13 @@
 from functools import partial
 
 import numpy as onp
-import warnings
 import textwrap
 import operator
 from typing import Tuple, Union, cast
 
-from jax import jit, ops, vmap
+from jax import jit, vmap
 from .. import lax
+from .. import ops
 from .. import lax_linalg
 from .. import dtypes
 from .lax_numpy import _not_implemented
@@ -111,13 +111,6 @@ def matrix_rank(M, tol=None):
   return np.sum(S > tol)
 
 
-# TODO(pfau): make this work for complex types
-def _jvp_slogdet(g, ans, x):
-  jvp_sign = np.zeros(x.shape[:-2])
-  jvp_logdet = np.trace(solve(x, g), axis1=-1, axis2=-2)
-  return jvp_sign, jvp_logdet
-
-
 @_wraps(onp.linalg.slogdet)
 @custom_transforms
 @jit
@@ -144,6 +137,10 @@ def slogdet(a):
       is_zero, np.array(-np.inf, dtype=dtype),
       np.sum(np.log(np.abs(diag)), axis=-1))
   return sign, np.real(logdet)
+def _jvp_slogdet(g, ans, x):
+  jvp_sign = np.zeros(x.shape[:-2])
+  jvp_logdet = np.trace(solve(x, g), axis1=-1, axis2=-2)
+  return jvp_sign, jvp_logdet
 defjvp(slogdet, _jvp_slogdet)
 
 

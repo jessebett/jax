@@ -26,7 +26,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import functools
+from functools import partial
+import operator as op
 import time
 
 import jax
@@ -36,12 +37,16 @@ from jax import random, grad
 from jax.flatten_util import ravel_pytree
 import jax.lax
 import jax.numpy as np
-import jax.ops
-from jax.test_util import check_vjp
+from jax import lax
+from jax import ops
+from jax.util import safe_map, safe_zip
+from jax.flatten_util import ravel_pytree
+from jax.test_util import check_grads
+from jax.tree_util import tree_map
+from jax import linear_util as lu
 import numpy as onp
 import scipy.integrate as osp_integrate
 
-@jax.jit
 def interp_fit_dopri(y0, y1, k, dt):
   # Fit a polynomial to the results of a Runge-Kutta step.
   dps_c_mid = np.array([
@@ -51,67 +56,31 @@ def interp_fit_dopri(y0, y1, k, dt):
   y_mid = y0 + dt * np.dot(dps_c_mid, k)
   return np.array(fit_4th_order_polynomial(y0, y1, y_mid, k[0], k[-1], dt))
 
-
-@jax.jit
 def fit_4th_order_polynomial(y0, y1, y_mid, dy0, dy1, dt):
-  """Fit fourth order polynomial over function interval.
-
-  Args:
-      y0: function value at the start of the interval.
-      y1: function value at the end of the interval.
-      y_mid: function value at the mid-point of the interval.
-      dy0: derivative value at the start of the interval.
-      dy1: derivative value at the end of the interval.
-      dt: width of the interval.
-  Returns:
-      Coefficients `[a, b, c, d, e]` for the polynomial
-      p = a * x ** 4 + b * x ** 3 + c * x ** 2 + d * x + e
-  """
-  v = np.stack([dy0, dy1, y0, y1, y_mid])
-  a = np.dot(np.hstack([-2. * dt, 2. * dt, np.array([-8., -8., 16.])]), v)
-  b = np.dot(np.hstack([5. * dt, -3. * dt, np.array([18., 14., -32.])]), v)
-  c = np.dot(np.hstack([-4. * dt, dt, np.array([-11., -5., 16.])]), v)
+  a = -2.*dt*dy0 + 2.*dt*dy1 -  8.*y0 -  8.*y1 + 16.*y_mid
+  b =  5.*dt*dy0 - 3.*dt*dy1 + 18.*y0 + 14.*y1 - 32.*y_mid
+  c = -4.*dt*dy0 +    dt*dy1 - 11.*y0 -  5.*y1 + 16.*y_mid
   d = dt * dy0
   e = y0
   return a, b, c, d, e
 
-
-@functools.partial(jax.jit, static_argnums=(0,))
 def initial_step_size(fun, t0, y0, order, rtol, atol, f0):
-  """Empirically choose initial step size.
-
-  Args:
-    fun: Function to evaluate like `func(y, t)` to compute the time
-      derivative of `y`.
-    t0: initial time.
-    y0: initial value for the state.
-    order: order of interpolation
-    rtol: relative local error tolerance for solver.
-    atol: absolute local error tolerance for solver.
-    f0: initial value for the derivative, computed from `func(t0, y0)`.
-  Returns:
-    Initial step size for odeint algorithm.
-
-  Algorithm from:
-  E. Hairer, S. P. Norsett G. Wanner,
-  Solving Ordinary Differential Equations I: Nonstiff Problems, Sec. II.4.
-  """
+  # Algorithm from:
+  # E. Hairer, S. P. Norsett G. Wanner,
+  # Solving Ordinary Differential Equations I: Nonstiff Problems, Sec. II.4.
   scale = atol + np.abs(y0) * rtol
   d0 = np.linalg.norm(y0 / scale)
   d1 = np.linalg.norm(f0 / scale)
-  order_pow = (1. / (order + 1.))
 
-  h0 = np.where(np.any(np.asarray([d0 < 1e-5, d1 < 1e-5])),
-                1e-6,
-                0.01 * d0 / d1)
+  h0 = np.where((d0 < 1e-5) | (d1 < 1e-5), 1e-6, 0.01 * d0 / d1)
 
   y1 = y0 + h0 * f0
   f1 = fun(y1, t0 + h0)
   d2 = np.linalg.norm((f1 - f0) / scale) / h0
 
-  h1 = np.where(np.all(np.asarray([d1 <= 1e-15, d2 <= 1e-15])),
+  h1 = np.where((d1 <= 1e-15) & (d2 <= 1e-15),
                 np.maximum(1e-6, h0 * 1e-3),
-                (0.01 / np.max(d1 + d2))**order_pow)
+                (0.01 / np.max(d1 + d2)) ** (1. / (order + 1.)))
 
   return np.minimum(100. * h0, h1)
 
@@ -138,30 +107,27 @@ def runge_kutta_step(func, y0, f0, t0, dt, nfe):
   """
   # Dopri5 Butcher tableaux
   alpha = np.array([1 / 5, 3 / 10, 4 / 5, 8 / 9, 1., 1., 0])
-  beta = np.array(
-      [[1 / 5, 0, 0, 0, 0, 0, 0],
-       [3 / 40, 9 / 40, 0, 0, 0, 0, 0],
-       [44 / 45, -56 / 15, 32 / 9, 0, 0, 0, 0],
-       [19372 / 6561, -25360 / 2187, 64448 / 6561, -212 / 729, 0, 0, 0],
-       [9017 / 3168, -355 / 33, 46732 / 5247, 49 / 176, -5103 / 18656, 0, 0],
-       [35 / 384, 0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84, 0]])
-  c_sol = np.array([35 / 384, 0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84,
-                    0])
+  beta = np.array([
+      [1 / 5, 0, 0, 0, 0, 0, 0],
+      [3 / 40, 9 / 40, 0, 0, 0, 0, 0],
+      [44 / 45, -56 / 15, 32 / 9, 0, 0, 0, 0],
+      [19372 / 6561, -25360 / 2187, 64448 / 6561, -212 / 729, 0, 0, 0],
+      [9017 / 3168, -355 / 33, 46732 / 5247, 49 / 176, -5103 / 18656, 0, 0],
+      [35 / 384, 0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84, 0]
+  ])
+  c_sol = np.array([35 / 384, 0, 500 / 1113, 125 / 192, -2187 / 6784, 11 / 84, 0])
   c_error = np.array([35 / 384 - 1951 / 21600, 0, 500 / 1113 - 22642 / 50085,
                       125 / 192 - 451 / 720, -2187 / 6784 - -12231 / 42400,
                       11 / 84 - 649 / 6300, -1. / 60.])
 
-  def _fori_body_fun(i, val):
+  def body_fun(i, k):
     ti = t0 + dt * alpha[i-1]
-    yi = y0 + dt * np.dot(beta[i-1, :], val)
+    yi = y0 + dt * np.dot(beta[i-1, :], k)
     ft = func(yi, ti)
-    return jax.ops.index_update(val, jax.ops.index[i, :], ft)
+    return ops.index_update(k, jax.ops.index[i, :], ft)
 
-  k = jax.lax.fori_loop(
-      1,
-      7,
-      _fori_body_fun,
-      jax.ops.index_update(np.zeros((7, f0.shape[0])), jax.ops.index[0, :], f0))
+  k = ops.index_update(np.zeros((7, f0.shape[0])), ops.index[0, :], f0)
+  k = lax.fori_loop(1, 7, body_fun, k)
 
   nfe += 6
 
@@ -170,26 +136,16 @@ def runge_kutta_step(func, y0, f0, t0, dt, nfe):
   f1 = k[-1]
   return y1, f1, y1_error, k, nfe
 
-
-@jax.jit
 def error_ratio(error_estimate, rtol, atol, y0, y1):
   err_tol = atol + rtol * np.maximum(np.abs(y0), np.abs(y1))
   err_ratio = error_estimate / err_tol
   return np.mean(err_ratio ** 2)
 
-
-@jax.jit
-def optimal_step_size(last_step,
-                      mean_error_ratio,
-                      safety=0.9,
-                      ifactor=10.0,
-                      dfactor=0.2,
-                      order=5.0):
+def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
+                      dfactor=0.2, order=5.0):
   """Compute optimal Runge-Kutta stepsize."""
   mean_error_ratio = np.max(mean_error_ratio)
-  dfactor = np.where(mean_error_ratio < 1,
-                     1.0,
-                     dfactor)
+  dfactor = np.where(mean_error_ratio < 1, 1.0, dfactor)
 
   err_ratio = np.sqrt(mean_error_ratio)
   factor = np.maximum(1.0 / ifactor,
@@ -200,8 +156,7 @@ def optimal_step_size(last_step,
                   last_step / factor, )
 
 
-@functools.partial(jax.jit, static_argnums=(0,))
-def odeint(ofunc, y0, t, *args, **kwargs):
+def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
   """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
 
   Args:
@@ -215,7 +170,9 @@ def odeint(ofunc, y0, t, *args, **kwargs):
       'atol': Absolute local error tolerance for solver.
 
   Returns:
-    Integrated system values at each timepoint.
+    Values of the solution `y` (i.e. integrated system values) at each time
+    point in `t`, represented as an array (or pytree of arrays) with the same
+    shape/structure as `y0` except with a new leading axis of length `len(t)`.
   """
   rtol = kwargs.get('rtol', 1.4e-8)
   atol = kwargs.get('atol', 1.4e-8)
@@ -264,6 +221,9 @@ def odeint(ofunc, y0, t, *args, **kwargs):
   dt = 1.0
   # dt = initial_step_size(func, t[0], y0, 4, rtol, atol, f0)
   interp_coeff = np.array([y0] * 5)
+  init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff]
+  _, ys = lax.scan(scan_fun, init_carry, ts[1:])
+  return np.concatenate((y0[None], ys))
 
   result = jax.lax.fori_loop(1,
                              t.shape[0],
@@ -685,7 +645,8 @@ def _benchmark_odeint(fun, y0, tspace, *args):
   n_trials = 1
   for k in range(n_trials):
     start = time.time()
-    scipy_result = osp_integrate.odeint(fun, y0, tspace, args)
+    for _ in range(n_repeat):
+      scipy_result = osp_integrate.odeint(onp_fun, y0, tspace, args)
     end = time.time()
     # print('scipy odeint elapsed time ({} of {}): {}'.format(
     #     k+1, n_trials, end-start))
@@ -699,7 +660,6 @@ def _benchmark_odeint(fun, y0, tspace, *args):
     #     k+1, n_trials, end-start))
   print('norm(scipy result-jax result): {}'.format(
       np.linalg.norm(np.asarray(scipy_result) - jax_result)))
-
   return scipy_result, jax_result
 
 
@@ -820,6 +780,9 @@ def test_defvjp_all():
     print('JAX jacrev elapsed time ({} of {}): {}'.format(
         k+1, n_trials, end-start))
 
+def pend_check_grads():
+  def f(y0, ts, *args):
+    return odeint(partial(pend, np), y0, ts, *args)
 
 if __name__ == '__main__':
   from jax.config import config
