@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import optimizers
 from jax.experimental.ode import build_odeint, odeint
+from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=100)
@@ -77,9 +78,9 @@ def sol_recursive(f, z, t):
     """
     return f(z, t)
 
-  (y0, [y1h]) = jax.jet(g, (z, ), ((jnp.ones_like(z), ), ))
-  (y0, [y1, y2h]) = jax.jet(g, (z, ), ((y0, y1h,), ))
-  (y0, [y1, y2, y3h]) = jax.jet(g, (z, ), ((y0, y1, y2h), ))
+  (y0, [y1h]) = jet(g, (z, ), ((jnp.ones_like(z), ), ))
+  (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
+  (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
 
   return (y0, [y1, y2])
 
