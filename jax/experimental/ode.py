@@ -27,26 +27,15 @@ from __future__ import division
 from __future__ import print_function
 
 from functools import partial
-import operator as op
-import time
 
 import jax
-from jax.experimental import stax
-from jax.experimental.stax import Dense, Relu, Relu, LogSoftmax, Tanh
-from jax import random, grad
-from jax.flatten_util import ravel_pytree
 import jax.lax
 import jax.numpy as np
 from jax import lax
 from jax import ops
-from jax.util import safe_map, safe_zip
 from jax.flatten_util import ravel_pytree
-from jax.test_util import check_grads
-from jax.tree_util import tree_map
-from jax import linear_util as lu
-import numpy as onp
-import scipy.integrate as osp_integrate
 
+@jax.jit
 def interp_fit_dopri(y0, y1, k, dt):
   # Fit a polynomial to the results of a Runge-Kutta step.
   dps_c_mid = np.array([
@@ -56,6 +45,7 @@ def interp_fit_dopri(y0, y1, k, dt):
   y_mid = y0 + dt * np.dot(dps_c_mid, k)
   return np.array(fit_4th_order_polynomial(y0, y1, y_mid, k[0], k[-1], dt))
 
+@jax.jit
 def fit_4th_order_polynomial(y0, y1, y_mid, dy0, dy1, dt):
   a = -2.*dt*dy0 + 2.*dt*dy1 -  8.*y0 -  8.*y1 + 16.*y_mid
   b =  5.*dt*dy0 - 3.*dt*dy1 + 18.*y0 + 14.*y1 - 32.*y_mid
@@ -64,6 +54,8 @@ def fit_4th_order_polynomial(y0, y1, y_mid, dy0, dy1, dt):
   e = y0
   return a, b, c, d, e
 
+
+@partial(jax.jit, static_argnums=(0,))
 def initial_step_size(fun, t0, y0, order, rtol, atol, f0):
   # Algorithm from:
   # E. Hairer, S. P. Norsett G. Wanner,
@@ -85,7 +77,7 @@ def initial_step_size(fun, t0, y0, order, rtol, atol, f0):
   return np.minimum(100. * h0, h1)
 
 
-@functools.partial(jax.jit, static_argnums=(0,))
+@partial(jax.jit, static_argnums=(0,))
 def runge_kutta_step(func, y0, f0, t0, dt, nfe):
   """Take an arbitrary Runge-Kutta step and estimate error.
 
@@ -136,11 +128,13 @@ def runge_kutta_step(func, y0, f0, t0, dt, nfe):
   f1 = k[-1]
   return y1, f1, y1_error, k, nfe
 
+@jax.jit
 def error_ratio(error_estimate, rtol, atol, y0, y1):
   err_tol = atol + rtol * np.maximum(np.abs(y0), np.abs(y1))
   err_ratio = error_estimate / err_tol
   return np.mean(err_ratio ** 2)
 
+@jax.jit
 def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
                       dfactor=0.2, order=5.0):
   """Compute optimal Runge-Kutta stepsize."""
@@ -156,7 +150,8 @@ def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
                   last_step / factor, )
 
 
-def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
+@partial(jax.jit, static_argnums=(0,))
+def odeint(ofunc, y0, t, *args, **kwargs):
   """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
 
   Args:
@@ -177,13 +172,13 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
   rtol = kwargs.get('rtol', 1.4e-8)
   atol = kwargs.get('atol', 1.4e-8)
 
-  @functools.partial(jax.jit, static_argnums=(0,))
+  @partial(jax.jit, static_argnums=(0,))
   def _fori_body_fun(func, i, val):
       """Internal fori_loop body to interpolate an integral at each timestep."""
       t, cur_y, cur_f, cur_t, dt, last_t, interp_coeff, solution, nfe = val
       cur_y, cur_f, cur_t, dt, last_t, interp_coeff, nfe = jax.lax.while_loop(
           lambda x: x[2] < t[i],
-          functools.partial(_while_body_fun, func),
+          partial(_while_body_fun, func),
           (cur_y, cur_f, cur_t, dt, last_t, interp_coeff, nfe))
 
       relative_output_time = (t[i] - last_t) / (cur_t - last_t)
@@ -195,7 +190,7 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
                                    out_x),
               nfe)
 
-  @functools.partial(jax.jit, static_argnums=(0,))
+  @partial(jax.jit, static_argnums=(0,))
   def _while_body_fun(func, x):
       """Internal while_loop body to determine interpolation coefficients."""
       cur_y, cur_f, cur_t, dt, last_t, interp_coeff, nfe = x
@@ -221,13 +216,10 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
   dt = 1.0
   # dt = initial_step_size(func, t[0], y0, 4, rtol, atol, f0)
   interp_coeff = np.array([y0] * 5)
-  init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff]
-  _, ys = lax.scan(scan_fun, init_carry, ts[1:])
-  return np.concatenate((y0[None], ys))
 
   result = jax.lax.fori_loop(1,
                              t.shape[0],
-                             functools.partial(_fori_body_fun, func),
+                             partial(_fori_body_fun, func),
                              (t, y0, f0, t[0], dt, t[0], interp_coeff,
                               jax.ops.index_update(
                                   np.zeros((t.shape[0], y0.shape[0])),
@@ -371,428 +363,3 @@ def build_odeint(ofunc, rtol=1.4e-8, atol=1.4e-8):
   jax.defvjp_all(ct_odeint, v)
 
   return jax.jit(ct_odeint)
-
-
-def test_nodes_grad():
-  """Compare numerical and exact differentiation of a Neural ODE."""
-
-  @jax.jit
-  def total_loss_fun(pred_y_t_r, target):
-      """
-      Loss function.
-      """
-      pred, reg = pred_y_t_r[:, :, :dim], pred_y_t_r[:, :, dim + 1]
-      return loss_fun(pred, target) + lam * reg_loss(reg)
-
-  @jax.jit
-  def reg_loss(reg):
-      """
-      Regularization loss function.
-      """
-      return np.mean(reg)
-
-  @jax.jit
-  def loss_fun(pred, target):
-      """
-      Mean squared error.
-      """
-      return np.mean((pred - target) ** 2)
-
-  def nodes_predict(args):
-      """
-      Loss function of prediction.
-      """
-      true_ys, odeint_args = args[0], args[1:]
-      ys = ravel_batch_y_t_r_allr(nodes_odeint(*odeint_args))
-      return total_loss_fun(ys, true_ys)
-
-  dim = 3
-  batch_size = 5
-  batch_time = 2
-  lam = 1
-
-  REGS = ['r0', 'r1']
-  NUM_REGS = len(REGS)
-
-  reg = "r1"
-
-  rng = random.PRNGKey(0)
-  init_random_params, predict = stax.serial(
-      Dense(50), Tanh,
-      Dense(dim)
-  )
-
-  output_shape, init_params = init_random_params(rng, (-1, dim + 1))
-  assert output_shape == (-1, dim)
-
-  true_y0 = np.repeat(np.expand_dims(np.linspace(-.01, .01, batch_size), axis=1), dim, axis=1)  # (N, D)
-  true_y1 = np.concatenate((np.expand_dims(true_y0[:, 0] ** 2, axis=1),
-                            np.expand_dims(true_y0[:, 1] ** 3, axis=1),
-                            np.expand_dims(true_y0[:, 2] ** 4, axis=1)
-                            ), axis=1)
-  true_y = np.concatenate((np.expand_dims(true_y0, axis=0),
-                           np.expand_dims(true_y1, axis=0)),
-                          axis=0)  # (T, N, D)
-  t = np.array([0., 1.])  # (T)
-
-  r0 = np.zeros((batch_size, 1))
-
-  batch_y0_t = np.concatenate((true_y0,
-                               np.expand_dims(
-                                   np.repeat(t[0], batch_size),
-                                   axis=1)
-                               ),
-                              axis=1)
-
-  batch_y0_t_r0 = np.concatenate((batch_y0_t, r0), axis=1)
-
-  # parse_args.batch_size * (D + 2) |-> (parse_args.batch_size, D + 2)
-  _, ravel_batch_y0_t_r0 = ravel_pytree(batch_y0_t_r0)
-
-  allr0 = np.zeros((batch_size, NUM_REGS))
-  batch_y0_t_r0_allr0 = np.concatenate((batch_y0_t, r0, allr0), axis=1)
-
-  # parse_args.batch_size * (D + 2 + NUM_REGS) |-> (parse_args.batch_size, D + 2 + NUM_REGS)
-  flat_batch_y0_t_r0_allr0, ravel_batch_y0_t_r0_allr0 = ravel_pytree(batch_y0_t_r0_allr0)
-
-  r = np.zeros((batch_time, batch_size, 1))
-  batch_y_r = np.concatenate((true_y, r), axis=2)
-
-  # parse_args.batch_time * parse_args.batch_size * (D + 1) |-> (parse_args.batch_time, parse_args.batch_size, D + 1)
-  _, ravel_batch_y_r = ravel_pytree(batch_y_r)
-
-  batch_y_t_r = np.concatenate((true_y,
-                                np.expand_dims(
-                                    np.tile(t, (batch_size, 1)).T,
-                                    axis=2),
-                                r),
-                               axis=2)
-
-  # parse_args.batch_time * parse_args.batch_size * (D + 2) |-> (parse_args.batch_time, parse_args.batch_size, D + 2)
-  _, ravel_batch_y_t_r = ravel_pytree(batch_y_t_r)
-
-  allr = np.zeros((batch_time, batch_size, NUM_REGS))
-  batch_y_t_r_allr = np.concatenate((true_y,
-                                     np.expand_dims(
-                                         np.tile(t, (batch_size, 1)).T,
-                                         axis=2),
-                                     r,
-                                     allr),
-                                    axis=2)
-
-  # parse_args.batch_time * parse_args.batch_size * (D + 2 + NUM_REGS) |->
-  #                                                   (parse_args.batch_time, parse_args.batch_size, D + 2 + NUM_REGS)
-  _, ravel_batch_y_t_r_allr = ravel_pytree(batch_y_t_r_allr)
-
-  flat_params, ravel_params = ravel_pytree(init_params)
-  fargs = flat_params
-
-  @jax.jit
-  def reg_dynamics(y_t_r_allr, t, *args):
-      """
-      Time-augmented dynamics.
-      """
-
-      flat_params = args
-      params = ravel_params(np.array(flat_params))
-
-      # separate out state from augmented
-      y_t_r_allr = ravel_batch_y0_t_r0_allr0(y_t_r_allr)
-      y_t = y_t_r_allr[:, :dim + 1]
-      y = y_t[:, :-1]
-
-      predictions_y = predict(params, y_t)
-      predictions = np.concatenate((predictions_y,
-                                    np.ones((batch_size, 1))),
-                                   axis=1)
-
-      r0 = np.sum(y ** 2, axis=1) ** 0.5
-      r1 = np.sum(predictions_y ** 2, axis=1) ** 0.5
-      if reg == "r0":
-          regularization = r0
-      elif reg == "r1":
-          regularization = r1
-      else:
-          regularization = np.zeros(batch_size)
-
-      pred_reg = np.concatenate((predictions,
-                                 np.expand_dims(regularization, axis=1),
-                                 np.expand_dims(r0, axis=1),
-                                 np.expand_dims(r1, axis=1)),
-                                axis=1)
-      flat_pred_reg, _ = ravel_pytree(pred_reg)
-      return flat_pred_reg
-
-  nodes_odeint = build_odeint(reg_dynamics, atol=1e-12, rtol=1e-12)
-
-  numerical_grad = nd(nodes_predict, (true_y, flat_batch_y0_t_r0_allr0, t, *fargs))
-  exact_grad, ravel_grad = ravel_pytree(grad(nodes_predict)((true_y, flat_batch_y0_t_r0_allr0, t, *fargs))[1:])
-
-  exact_grad = ravel_grad(exact_grad)
-  numerical_grad = ravel_grad(numerical_grad)
-
-  tmp1 = exact_grad[0] - numerical_grad[0]
-  tmp2 = exact_grad[1] - numerical_grad[1]
-  tmp3 = np.array(exact_grad[2:]) - np.array(numerical_grad[2:])
-
-  # wrt y0
-  assert np.allclose(exact_grad[0], numerical_grad[0])
-
-  # wrt [t0, t1]
-  assert np.allclose(exact_grad[1], numerical_grad[1])
-
-  # wrt params (currently fails, but atol is still pretty good)
-  assert np.allclose(np.array(exact_grad[2:]), np.array(numerical_grad[2:]))
-
-
-def my_odeint_grad(fun):
-  """Calculate the Jacobian of an odeint."""
-  @jax.jit
-  def _gradfun(*args, **kwargs):
-    ys, pullback = vjp_odeint(fun, *args, **kwargs)
-    my_grad = pullback(np.ones_like(ys))
-    return my_grad
-  return _gradfun
-
-
-def my_odeint_jacrev(fun):
-  """Calculate the Jacobian of an odeint."""
-  @jax.jit
-  def _jacfun(*args, **kwargs):
-    ys, pullback = vjp_odeint(fun, *args, **kwargs)
-    my_jac = jax.vmap(pullback)(jax.api._std_basis(ys))
-    my_jac = jax.api.tree_map(
-        functools.partial(jax.api._unravel_array_into_pytree, ys, 0), my_jac)
-    my_jac = jax.api.tree_transpose(
-        jax.api.tree_structure(args), jax.api.tree_structure(ys), my_jac)
-    return my_jac
-  return _jacfun
-
-
-def nd(f, x, eps=1e-5):
-  flat_x, unravel = ravel_pytree(x)
-  dim = len(flat_x)
-  g = onp.zeros_like(flat_x)
-  for i in range(dim):
-    d = onp.zeros_like(flat_x)
-    d[i] = eps
-    g[i] = (f(unravel(flat_x + d)) - f(unravel(flat_x - d))) / (2.0 * eps)
-  return g
-
-
-def test_grad_vjp_odeint():
-  """Compare numerical and exact differentiation of a simple odeint."""
-
-  def f(y, t, arg1, arg2):
-    return -np.sqrt(t) - y + arg1 - np.mean((y + arg2)**2)
-
-  def onearg_odeint(args):
-    solution, _ = odeint(f, *args)
-    return np.sum(solution)
-
-  dim = 10
-  t0 = 0.1
-  t1 = 0.2
-  y0 = np.linspace(0.1, 0.9, dim)
-  arg1 = 0.1
-  arg2 = 0.2
-  wrap_args = (y0, np.array([t0, t1]), arg1, arg2)
-
-  numerical_grad = nd(onearg_odeint, wrap_args)
-  exact_grad = ravel_pytree(my_odeint_grad(f)(*wrap_args))[0]
-
-  assert np.allclose(numerical_grad, exact_grad)
-
-
-def plot_gradient_field(ax, func, xlimits, ylimits, numticks=30):
-    """Plot the gradient field of `func` on `ax`."""
-    x = np.linspace(*xlimits, num=numticks)
-    y = np.linspace(*ylimits, num=numticks)
-    x_mesh, y_mesh = np.meshgrid(x, y)
-    zs = jax.vmap(func)(y_mesh.ravel(), x_mesh.ravel())
-    z_mesh = zs.reshape(x_mesh.shape)
-    ax.quiver(x_mesh, y_mesh, np.ones(z_mesh.shape), z_mesh)
-    ax.set_xlim(xlimits)
-    ax.set_ylim(ylimits)
-
-
-@jax.jit
-def pend(y, t, *args):
-  """Simple pendulum system for odeint testing."""
-  del t
-  arg1, arg2 = args
-  theta, omega = y
-  dydt = np.array([omega, -arg1*omega - arg2*np.sin(theta)])
-  return dydt
-
-
-@jax.jit
-def swoop(y, t, arg1, arg2):
-  return np.array(y - np.sin(t) - np.cos(t) * arg1 + arg2)
-
-
-@jax.jit
-def decay(y, t, arg1, arg2):
-  return -np.sqrt(t) - y + arg1 - np.mean((y + arg2)**2)
-
-@jax.jit
-def simple(y, t):
-    return y
-
-
-def _benchmark_odeint(fun, y0, tspace, *args):
-  """Time performance of JAX odeint method against scipy.integrate.odeint."""
-  n_trials = 1
-  for k in range(n_trials):
-    start = time.time()
-    for _ in range(n_repeat):
-      scipy_result = osp_integrate.odeint(onp_fun, y0, tspace, args)
-    end = time.time()
-    # print('scipy odeint elapsed time ({} of {}): {}'.format(
-    #     k+1, n_trials, end-start))
-  for k in range(n_trials):
-    start = time.time()
-    with jax.disable_jit():
-        jax_result, _ = odeint(fun, np.array(y0), np.array(tspace), *args)
-    jax_result.block_until_ready()
-    end = time.time()
-    # print('JAX odeint elapsed time ({} of {}): {}'.format(
-    #     k+1, n_trials, end-start))
-  print('norm(scipy result-jax result): {}'.format(
-      np.linalg.norm(np.asarray(scipy_result) - jax_result)))
-  return scipy_result, jax_result
-
-
-def benchmark_odeint():
-    """
-    Time performance and correctness test of jax.odeint against scipy.odeint
-    on toy systems.
-    """
-    ts = np.array((0., 5.))
-    y0 = np.linspace(0.1, 0.9, 10)
-    big_y0 = np.ones(1)
-
-    _benchmark_odeint(simple, big_y0, ts)
-
-    # check pend()
-    for cond in (
-            (np.array((onp.pi - 0.1, 0.0)), ts, 0.25, 0.98),
-            (np.array((onp.pi * 0.1, 0.0)), ts, 0.1, 0.4),
-    ):
-        _benchmark_odeint(pend, *cond)
-
-    # check swoop
-    for cond in (
-            (y0, ts, 0.1, 0.2),
-            (big_y0, ts, 0.1, 0.3),
-    ):
-        _benchmark_odeint(swoop, *cond)
-
-    # check decay
-    # for cond in (
-    #         (y0, ts, 0.1, 0.2),
-    #         (big_y0, ts, 0.1, 0.3),
-    # ):
-    #     _benchmark_odeint(decay, *cond)
-    # decay hangs!
-
-
-def test_odeint_grad():
-  """Test the gradient behavior of various ODE integrations."""
-  def _test_odeint_grad(func, *args):
-
-    func_build = build_odeint(func)
-
-    def onearg_odeint(fargs):
-      return np.sum(func_build(*fargs))
-
-    numerical_grad = nd(onearg_odeint, args)
-    exact_grad, _ = ravel_pytree(grad(onearg_odeint)(args))
-    assert np.allclose(numerical_grad, exact_grad)
-
-  ts = np.array((0.1, 0.2))
-  y0 = np.linspace(0.1, 0.9, 10)
-  big_y0 = np.linspace(1.1, 10.9, 10)
-
-  # check pend()
-  for cond in (
-      (np.array((onp.pi - 0.1, 0.0)), ts, 0.25, 0.98),
-      (np.array((onp.pi * 0.1, 0.0)), ts, 0.1, 0.4),
-      ):
-    _test_odeint_grad(pend, *cond)
-
-  # check swoop
-  for cond in (
-      (y0, ts, 0.1, 0.2),
-      (big_y0, ts, 0.1, 0.3),
-      ):
-    _test_odeint_grad(swoop, *cond)
-
-  # check decay
-  for cond in (
-      (y0, ts, 0.1, 0.2),
-      (big_y0, ts, 0.1, 0.3),
-      ):
-    _test_odeint_grad(decay, *cond)
-
-
-def test_odeint_vjp():
-  """Use check_vjp to check odeint VJP calculations."""
-
-  # check pend()
-  y = np.array([np.pi - 0.1, 0.0])
-  t = np.linspace(0., 10., 11)
-  b = 0.25
-  c = 9.8
-  wrap_args = (y, t, b, c)
-  pend_odeint_wrap = lambda y, t, *args: odeint(pend, y, t, *args)[0]
-  pend_vjp_wrap = lambda y, t, *args: vjp_odeint(pend, y, t, *args)
-  check_vjp(pend_odeint_wrap, pend_vjp_wrap, wrap_args)
-
-  # check swoop()
-  y = np.array([0.1])
-  t = np.linspace(0., 10., 11)
-  arg1 = 0.1
-  arg2 = 0.2
-  wrap_args = (y, t, arg1, arg2)
-  swoop_odeint_wrap = lambda y, t, *args: odeint(swoop, y, t, *args)[0]
-  swoop_vjp_wrap = lambda y, t, *args: vjp_odeint(swoop, y, t, *args)
-  check_vjp(swoop_odeint_wrap, swoop_vjp_wrap, wrap_args)
-
-  # decay() check_vjp hangs!
-
-
-def test_defvjp_all():
-  """Use build_odeint to check odeint VJP calculations."""
-  n_trials = 5
-  swoop_build = build_odeint(swoop)
-  jacswoop = jax.jit(jax.jacrev(swoop_build))
-  y = np.array([0.1])
-  t = np.linspace(0., 2., 11)
-  arg1 = 0.1
-  arg2 = 0.2
-  wrap_args = (y, t, arg1, arg2)
-  for k in range(n_trials):
-    start = time.time()
-    rslt = jacswoop(*wrap_args)
-    rslt.block_until_ready()
-    end = time.time()
-    print('JAX jacrev elapsed time ({} of {}): {}'.format(
-        k+1, n_trials, end-start))
-
-def pend_check_grads():
-  def f(y0, ts, *args):
-    return odeint(partial(pend, np), y0, ts, *args)
-
-if __name__ == '__main__':
-  from jax.config import config
-  config.update("jax_enable_x64", True)
-  benchmark_odeint()
-
-  test_grad_vjp_odeint()
-  test_odeint_grad()
-
-  test_odeint_vjp()
-  test_defvjp_all()
-
-  test_nodes_grad()
