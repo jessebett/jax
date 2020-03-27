@@ -586,7 +586,7 @@ def run():
         "info": info,
         "args": parse_args
     }
-    outfile = open("%s/meta.pickle" % dirname, "wb")
+    outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "wb")
     pickle.dump(meta, outfile)
     outfile.close()
 
