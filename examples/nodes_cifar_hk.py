@@ -459,6 +459,38 @@ def init_data():
     # make sure we always save the model on the last iteration
     assert num_batches * parse_args.nepochs % parse_args.save_freq == 0
 
+    import tensorflow as tf
+
+    def preprocess(img, label):
+        """
+        Preprocess with data augmentation.
+        """
+        # random crop
+        img = tf.image.resize_with_crop_or_pad(img, 36, 36)
+        img = tf.image.random_crop(img, [32, 32, 3])
+
+        # random flip left and right
+        img = tf.image.random_flip_left_right(img)
+
+        # convert dtype
+        img = tf.image.convert_image_dtype(img, dtype=tf.float32)
+        label = tf.cast(label, tf.int32)
+
+        # normalize image
+        def _normalize_image(image, mean, stddev):
+            """Normalize the image to zero mean and unit variance."""
+            image -= tf.constant(mean, shape=[1, 1, 3], dtype=img.dtype)
+            image /= tf.constant(stddev, shape=[1, 1, 3], dtype=img.dtype)
+            return image
+        img = _normalize_image(img,
+                               mean=(0.4914, 0.4822, 0.4465),
+                               stddev=(0.2023, 0.1994, 0.2010))
+
+        return img, label
+
+    # process the dataset
+    ds_train = ds_train.map(preprocess, num_parallel_calls=10)
+
     ds_train = ds_train.cache()
     ds_train = ds_train.repeat()
     ds_train = ds_train.shuffle(1000)
