@@ -1,5 +1,5 @@
 """
-Profiling ODENets to see bottlenecks in performance. Reimplemented without using weird parameter searching.
+Neural ODEs in MNIST, implemented with Haiku.
 """
 import argparse
 import collections
