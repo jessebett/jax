@@ -9,30 +9,29 @@ import sys
 
 import haiku as hk
 import tensorflow_datasets as tfds
-from haiku.data_structures import to_immutable_dict
-from haiku.initializers import TruncatedNormal
-from jax import lax
-import tree
 
 import jax
+from jax import lax
 import jax.numpy as jnp
 from jax.experimental import optimizers
-from jax.interpreters.xla import DeviceArray
+from jax.experimental.ode import build_odeint, odeint
+from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_time', type=int, default=2)
 parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--test_batch_size', type=int, default=1000)
-parser.add_argument('--nepochs', type=int, default=350)
-parser.add_argument('--lr', type=float, default=1e-1)
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
+parser.add_argument('--atol', type=float, default=1e-3)
+parser.add_argument('--rtol', type=float, default=1e-3)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=1)
-parser.add_argument('--save_freq', type=int, default=5000)
+parser.add_argument('--test_freq', type=int, default=500)
+parser.add_argument('--save_freq', type=int, default=500)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resnet', action="store_true")
-parser.add_argument('--count_nfe', action="store_true")
+parser.add_argument('--no_count_nfe', action="store_true")
 parser.add_argument('--num_blocks', type=int, default=6)
 parse_args = parser.parse_args()
 
@@ -43,13 +42,14 @@ assert os.path.exists(parse_args.dirname)
 
 reg = parse_args.reg
 lam = parse_args.lam
-lam_w = 1e-4
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
-count_nfe = True if parse_args.count_nfe is True else False
+count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 num_blocks = parse_args.num_blocks
+atol = parse_args.atol
+rtol = parse_args.rtol
 
 
 # some primitive functions
@@ -57,22 +57,8 @@ def sigmoid(z):
   """
   Numerically stable sigmoid.
   """
-  return jnp.where(z >= 0, 1/(1 + jnp.exp(-z)), jnp.exp(z) / (1 + jnp.exp(z)))
-
-
-def tanh(z):
-  """
-  Numerically stable tanh.
-  """
-  return 2 * sigmoid(2 * z) - 1
-
-
-def softplus(z, threshold=20):
-  """
-  Numerically stable softplus.
-  """
-  return jax.nn.relu(z)
-  # return jnp.where(z >= threshold, z, jnp.log1p(jnp.exp(z)))
+  return 1/(1 + jnp.exp(-z))
+  # return jnp.where(z >= 0, 1/(1 + jnp.exp(-z)), jnp.exp(z) / (1 + jnp.exp(z)))
 
 
 def softmax_cross_entropy(logits, labels):
@@ -93,9 +79,9 @@ def sol_recursive(f, z, t):
     """
     return f(z, t)
 
-  (y0, [y1h]) = jax.jet(g, (z, ), ((jnp.ones_like(z), ), ))
-  (y0, [y1, y2h]) = jax.jet(g, (z, ), ((y0, y1h,), ))
-  (y0, [y1, y2, y3h]) = jax.jet(g, (z, ), ((y0, y1, y2h), ))
+  (y0, [y1h]) = jet(g, (z, ), ((jnp.ones_like(z), ), ))
+  (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
+  (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
 
   return (y0, [y1, y2])
 
@@ -113,115 +99,84 @@ class Flatten(hk.Module):
         return jnp.reshape(x, (x.shape[0], -1))
 
 
-class SkipConnection(hk.Module):
-    """
-    A type of Skip Connection module.
-    """
-
-    def __init__(self, func):
-        super(SkipConnection, self).__init__()
-        self.func = func
-
-    def __call__(self, t_x):
-        # t could correspond to time (for ODE dynamics),
-        # or regularization (after the ODE block)
-        t, x = t_x
-        return (t, self.func(x))
-
-
-class EndSkipConnection(hk.Module):
-    """
-    Stop doing SkipConnections.
-    """
-
-    def __init__(self):
-        super(EndSkipConnection, self).__init__()
-
-    def __call__(self, t_x):
-        t, x = t_x
-        return x
-
-
 class ConcatConv2d(hk.Module):
     """
-    Convolution with extra channel and skip connection for time
-    .
+    Convolution with extra channel and skip connection for time.
     """
 
     def __init__(self, **kwargs):
         super(ConcatConv2d, self).__init__()
         self._layer = hk.Conv2D(**kwargs)
 
-    def __call__(self, t_x):
-        t, x = t_x
+    def __call__(self, x, t):
         tt = jnp.ones_like(x[:, :, :, :1]) * t
         ttx = jnp.concatenate([tt, x], axis=-1)
-        return (t, self._layer(ttx))
+        return self._layer(ttx)
 
 
-def _get_shapes(params):
+class LayerNorm(hk.Module):
     """
-    Recursive method for finding the shapes.
+    Layer normalization.
     """
-    if isinstance(params, DeviceArray):
-        return params.shape, params.dtype
-    else:
-        params_shapes = collections.defaultdict(dict)
-        for key in params:
-            params_shapes[key] = _get_shapes(params[key])
-        return params_shapes
+
+    def __init__(self, ):
+        super(LayerNorm, self).__init__()
+        self._layer = hk.BatchNorm(create_scale=True,
+                                   create_offset=True,
+                                   axis=[1, 2, 3])
+
+    def __call__(self, x):
+        # for Layer Norm we always use test-time statistics
+        return self._layer(inputs=x,
+                           test_local_stats=True,
+                           is_training=True)
 
 
-def get_shapes(params):
+class ResBlock(hk.Module):
     """
-    Returns DS w/ same shape as params, but with only the shapes.
+    Standard ResBlock.
     """
-    return to_immutable_dict(_get_shapes(params))
 
+    def __init__(self, output_channels):
+        super(ResBlock, self).__init__()
+        # self.norm1 = LayerNorm()
+        self.conv1 = hk.Conv2D(output_channels=output_channels,
+                               kernel_shape=3,
+                               stride=1,
+                               padding=lambda _: (1, 1),
+                               with_bias=False)
+        # self.norm2 = LayerNorm()
+        self.conv2 = hk.Conv2D(output_channels=output_channels,
+                               kernel_shape=3,
+                               stride=1,
+                               padding=lambda _: (1, 1),
+                               w_init=jnp.zeros,
+                               with_bias=False)
 
-def _init_params(shapes, bundle_name=""):
-    """
-    Recursive function to initialize params based on shapes.
-    """
-    params = collections.defaultdict(dict)
-    for key in shapes:
-        fq_name = bundle_name + "/" + key
-        if isinstance(shapes[key], tuple):
-            if key == "w":
-                # note: initialization works for linear too
-                fan_in_shape = onp.prod(shapes[key][0][:-1])
-                stddev = 1. / onp.sqrt(fan_in_shape)
-                init = TruncatedNormal(stddev=stddev)
-            else:
-                init = jnp.zeros
-            # noinspection PyTypeChecker
-            params[key] = hk.get_parameter(name=fq_name,
-                                           shape=shapes[key][0],
-                                           dtype=shapes[key][1],
-                                           init=init)
-        else:
-            params[key] = _init_params(shapes[key], fq_name)
-    return params
-
-
-def init_params(shapes):
-    """
-    Initialize the parameters based on shapes.
-    """
-    return to_immutable_dict(_init_params(shapes))
+    def __call__(self, x):
+        # out = self.norm1(x)
+        out = sigmoid(x)
+        out = self.conv1(out)
+        # out = self.norm2(out)
+        out = sigmoid(out)
+        out = self.conv2(out)
+        return x + out
 
 
 def aug_init(y):
     """
-    Initialize the augmented dynamics.
+    Flatten the dynamics and append regularization dynamics.
+    We need to flatten the dynamics first since they may be convolutional
+    (has width, height, and channels).
     """
     return jnp.concatenate((jnp.ravel(y), jnp.zeros(y.shape[0])))
 
 
-def unpack_aug(yr, batch_size):
+def unpack_aug(yr, ode_dim):
     """
-    Unpack dynamics from augmentation.
+    Unpack the dynamics according to the structure in aug_init.
     """
+    batch_size = yr.size // (ode_dim + 1)
     return yr[:-batch_size], yr[-batch_size:]
 
 
@@ -241,227 +196,281 @@ def _reg_loss_fn(reg):
     return jnp.mean(reg)
 
 
-class BottleNeckBlockV1Softplus(hk.Module):
-  """
-  Bottleneck Block for a ResNet implementation using softplus.
-  """
+def wrap_module(module, *module_args):
+    """
+    Wrap the module in a function to be transformed.
+    """
+    def wrap(*args):
+        """
+        Wrapping of module.
+        """
+        model = module(*module_args)
+        return model(*args)
+    return wrap
 
-  def __init__(self,
-               channels,
-               stride,
-               use_projection,
-               bn_config,
-               name):
-    super(BottleNeckBlockV1Softplus, self).__init__(name=name)
-    self._channels = channels
-    self._stride = stride
-    self._use_projection = use_projection
-    self._bn_config = bn_config
 
-    batchnorm_args = {"create_scale": True, "create_offset": True}
-    batchnorm_args.update(bn_config)
+class PreODE(hk.Module):
+    """
+    Module applied before the ODE layer.
+    """
 
-    if self._use_projection:
-      self._proj_conv = hk.Conv2D(
-          output_channels=channels,
-          kernel_shape=1,
-          stride=stride,
-          with_bias=False,
-          padding="SAME",
-          name="shortcut_conv")
-      self._proj_batchnorm = hk.BatchNorm(
-          name="shortcut_batchnorm", **batchnorm_args)
+    def __init__(self):
+        super(PreODE, self).__init__()
+        self.model = hk.Sequential([
+            lambda x: x.astype(jnp.float32) / 255.,
+            hk.Conv2D(output_channels=64,
+                      kernel_shape=3,
+                      stride=1,
+                      padding="VALID"),
+            # LayerNorm(),
+            sigmoid,
+            hk.Conv2D(output_channels=64,
+                      kernel_shape=4,
+                      stride=2,
+                      padding=lambda _: (1, 1)),
+            # LayerNorm(),
+            sigmoid,
+            hk.Conv2D(output_channels=64,
+                      kernel_shape=4,
+                      stride=2,
+                      padding=lambda _: (1, 1))
+        ])
 
-    self._layers = []
-    conv_0 = hk.Conv2D(
-        output_channels=channels // 4,
-        kernel_shape=1,
-        stride=1,
-        with_bias=False,
-        padding="SAME",
-        name="conv_0")
-    self._layers.append(
-        [conv_0,
-         hk.BatchNorm(name="batchnorm_0", **batchnorm_args)])
+    def __call__(self, x):
+        return self.model(x)
 
-    conv_1 = hk.Conv2D(
-        output_channels=channels // 4,
-        kernel_shape=3,
-        stride=stride,
-        with_bias=False,
-        padding="SAME",
-        name="conv_1")
-    self._layers.append(
-        [conv_1,
-         hk.BatchNorm(name="batchnorm_1", **batchnorm_args)])
 
-    conv_2 = hk.Conv2D(
-        output_channels=channels,
-        kernel_shape=1,
-        stride=1,
-        with_bias=False,
-        padding="SAME",
-        name="conv_2")
-    batchnorm_2 = hk.BatchNorm(
-        name="batchnorm_2", scale_init=jnp.zeros, **batchnorm_args)
-    self._layers.append([conv_2, batchnorm_2])
+class Dynamics(hk.Module):
+    """
+    Dynamics of the ODENet.
+    """
 
-  def __call__(self, inputs, is_training):
-    if self._use_projection:
-      shortcut = self._proj_conv(inputs)
-      shortcut = self._proj_batchnorm(shortcut, is_training=is_training)
+    def __init__(self, input_shape):
+        super(Dynamics, self).__init__()
+        self.input_shape = input_shape
+        output_channels = input_shape[-1]
+        # self.norm1 = LayerNorm()
+        self.conv1 = ConcatConv2d(output_channels=output_channels,
+                                  kernel_shape=3,
+                                  stride=1,
+                                  padding=lambda _: (1, 1))
+        # self.norm2 = LayerNorm()
+        self.conv2 = ConcatConv2d(output_channels=output_channels,
+                                  kernel_shape=3,
+                                  stride=1,
+                                  padding=lambda _: (1, 1),
+                                  w_init=jnp.zeros,
+                                  b_init=jnp.zeros)
+
+    def __call__(self, x, t):
+        x = jnp.reshape(x, self.input_shape)
+        # out = self.norm1(x)
+        out = sigmoid(x)
+        out = self.conv1(out, t)
+        # out = self.norm2(x)
+        out = sigmoid(out)
+        out = self.conv2(out, t)
+        out = jnp.ravel(out)
+        return out
+
+
+class PostODE(hk.Module):
+    """
+    Module applied after the ODE layer.
+    """
+
+    def __init__(self):
+        super(PostODE, self).__init__()
+        self.model = hk.Sequential([
+            # LayerNorm(),
+            sigmoid,
+            hk.AvgPool(window_shape=(1, 6, 6, 1),
+                       strides=(1, 1, 1, 1),
+                       padding="VALID"),
+            Flatten(),
+            hk.Linear(10)
+        ])
+
+    def __call__(self, x):
+        return self.model(x)
+
+
+def initialization_data(input_shape, ode_shape):
+    """
+    Data for initializing the modules.
+    """
+    ode_shape = (1, ) + ode_shape[1:]
+    data = {
+        "pre_ode": jnp.zeros(input_shape),
+        "ode": (jnp.ravel(jnp.zeros(ode_shape)), 0.),
+        "res": jnp.zeros(ode_shape),
+        "post_ode": jnp.zeros(ode_shape)
+    }
+    return data
+
+
+def init_model():
+    """
+    Instantiates transformed submodules of model and their parameters.
+    """
+    ts = jnp.array([0., 1.])
+
+    input_shape = (1, 32, 32, 3)
+    ode_shape = (-1, 7, 7, 64)
+    ode_dim = jnp.prod(ode_shape[1:])
+
+    initialization_data_ = initialization_data(input_shape, ode_shape)
+
+    pre_ode = hk.transform(wrap_module(PreODE))
+    pre_ode_params = pre_ode.init(rng, initialization_data_["pre_ode"])
+    pre_ode_fn = pre_ode.apply
+
+    if odenet:
+        dynamics = hk.transform(wrap_module(Dynamics, ode_shape))
+        dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
+        dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
+        if reg:
+            def reg_dynamics(y, t, params):
+                """
+                Dynamics of regularization for ODE integration.
+                """
+                batch_size = y.size // ode_dim
+                if reg == "none":
+                    return jnp.zeros(batch_size)
+                else:
+                    # do r3 regularization
+                    y0, y_n = sol_recursive(lambda _y, _t: dynamics_wrap(_y, _t, params), y, t)
+                    r = jnp.reshape(y_n[-1], (-1, ode_dim))
+                    return jnp.sum(r ** 2, axis=1)
+
+            def aug_dynamics(yr, t, params):
+                """
+                Dynamics augmented with regularization.
+                """
+                y, r = unpack_aug(yr, ode_dim)
+                dydt = dynamics_wrap(y, t, params)
+                drdt = reg_dynamics(y, t, params)
+                return jnp.concatenate((dydt, drdt))
+            nodeint = build_odeint(aug_dynamics, atol=atol, rtol=rtol)
+        else:
+            nodeint = build_odeint(dynamics_wrap, atol=atol, rtol=rtol)
+
+        def ode(params, out_pre_ode):
+            """
+            Apply the ODE block.
+            """
+            flat_out_ode = nodeint(aug_init(out_pre_ode), ts, params)[-1]
+            out_ode, out_ode_r = unpack_aug(flat_out_ode, ode_dim)
+            out_ode = jnp.reshape(out_ode, ode_shape)
+            return out_ode, out_ode_r
+
+        if count_nfe:
+            unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params)
+
+            @jax.jit
+            def nfe_fn(params, _images, _labels):
+                """
+                Function to return NFE.
+                """
+                in_ode = jnp.ravel(pre_ode.apply(params["pre_ode"], _images))
+                _, f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
+                return f_nfe
+
+        else:
+            nfe_fn = None
+
     else:
-      shortcut = inputs
+        resnet = hk.transform(wrap_module(
+            lambda: hk.Sequential([ResBlock(ode_shape[-1]) for _ in range(num_blocks)])))
+        resnet_params = resnet.init(rng, initialization_data_["res"])
+        resnet_fn = resnet.apply
 
-    net = inputs
-    for i, [conv_layer, batchnorm_layer] in enumerate(self._layers):
-      net = conv_layer(net)
-      net = batchnorm_layer(net, is_training=is_training)
-      net = softplus(net) if i < 2 else net  # Don't apply relu on last layer
+    post_ode = hk.transform(wrap_module(PostODE))
+    post_ode_params = post_ode.init(rng, initialization_data_["post_ode"])
+    post_ode_fn = post_ode.apply
 
-    return softplus(net + shortcut)
+    # return a dictionary of the three components of the model
+    model = {
+        "model": {
+            "pre_ode": pre_ode_fn,
+            "post_ode": post_ode_fn
+        },
+        "params": {
+            "pre_ode": pre_ode_params,
+            "post_ode": post_ode_params
+        }
+    }
 
+    if odenet:
+        model["model"]["ode"] = ode
+        model["params"]["ode"] = dynamics_params
+        model["nfe"] = nfe_fn
+    else:
+        model["model"]["res"] = resnet_fn
+        model["params"]["res"] = resnet_params
 
-class BlockGroup(hk.Module):
-  """
-  Higher level block for ResNet implementation using custom Bottleneck with softplus.
-  """
+    def forward(params, _images):
+        """
+        Forward pass of the model.
+        """
+        model_ = model["model"]
+        out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
+        if odenet:
+            out_ode, regs = model_["ode"](params["ode"], out_pre_ode)
+        else:
+            out_ode = model_["res"](params["res"], out_pre_ode)
+            regs = jnp.zeros(_images.shape[0])
+        logits = model_["post_ode"](params["post_ode"], out_ode)
 
-  def __init__(self,
-               channels,
-               num_blocks,
-               stride,
-               bn_config,
-               name):
-    super(BlockGroup, self).__init__(name=name)
-    self._channels = channels
-    self._num_blocks = num_blocks
-    self._stride = stride
-    self._bn_config = bn_config
+        return logits, regs
 
-    self._blocks = []
-    for id_block in range(num_blocks):
-      self._blocks.append(
-          BottleNeckBlockV1Softplus(
-              channels=channels,
-              stride=stride if id_block == 0 else 1,
-              use_projection=(id_block == 0),
-              bn_config=bn_config,
-              name="block_%d" % id_block))
-
-  def __call__(self, inputs, is_training):
-    net = inputs
-    for block in self._blocks:
-      net = block(net, is_training=is_training)
-    return net
-
-
-class ResNet(hk.Module):
-    """
-    ResNet on CIFAR.
-    Uses softplus instead of Relu for ODEs and higher-order derivatives.
-    """
-
-    def __init__(self,
-                 blocks_per_group_list,
-                 num_classes,
-                 channels_per_group_list=(64, 128, 256, 512)):
-        super(ResNet, self).__init__(name="ResNet")
-        self._bn_config = {"decay_rate": 0.9, "eps": 1e-5}
-
-        # Number of blocks in each group for ResNet.
-        if len(blocks_per_group_list) != 4:
-          raise ValueError(
-              "`blocks_per_group_list` must be of length 4 not {}".format(
-                  len(blocks_per_group_list)))
-        self._blocks_per_group_list = blocks_per_group_list
-
-        # Number of channels in each group for ResNet.
-        if len(channels_per_group_list) != 4:
-          raise ValueError(
-              "`channels_per_group_list` must be of length 4 not {}".format(
-                  len(channels_per_group_list)))
-        self._channels_per_group_list = channels_per_group_list
-
-        self._initial_conv = hk.Conv2D(output_channels=64,
-                                       kernel_shape=3,
-                                       stride=1,
-                                       padding=lambda x: (1, 1),
-                                       with_bias=False,
-                                       name="initial_conv")
-
-        self._initial_batchnorm = hk.BatchNorm(create_scale=True,
-                                               create_offset=True,
-                                               **self._bn_config,
-                                               name="initial_batchnorm")
-
-        self._block_groups = []
-        strides = [1, 2, 2, 2]
-        for i in range(4):
-          self._block_groups.append(
-              BlockGroup(
-                  channels=self._channels_per_group_list[i],
-                  num_blocks=self._blocks_per_group_list[i],
-                  stride=strides[i],
-                  bn_config=self._bn_config,
-                  name="block_group_%d" % i))
-
-        self._logits = hk.Linear(output_size=num_classes, w_init=jnp.zeros, name="logits")
-
-    def __call__(self, inputs, is_training):
-        net = inputs
-        net = self._initial_conv(net)
-        net = self._initial_batchnorm(net, is_training=is_training)
-        net = softplus(net)
-
-        for block_group in self._block_groups:
-            net = block_group(net, is_training)
-
-        net = jnp.mean(net, axis=[1, 2])
-
-        return self._logits(net)
+    return forward, model
 
 
-def loss_fn(images, labels, _odenet, _count_nfe, is_training):
+def loss_fn(forward, params, images, labels):
     """
     The loss function for training.
     """
-    model = ResNet(blocks_per_group_list=[2, 2, 2, 2],
-                   num_classes=10)
-    logits = model(images, is_training=is_training)
-    if count_nfe:
-        hk.set_state("nfe", 0)
+    logits, regs = forward(params, images)
     loss_ = _loss_fn(logits, labels)
-    reg_ = _reg_loss_fn(0)
-    acc_ = _acc_fn(logits, labels)
-    hk.set_state("loss", loss_)
-    hk.set_state("reg", reg_)
-    hk.set_state("acc", acc_)
+    reg_ = _reg_loss_fn(regs)
     return loss_ + lam * reg_
 
 
-loss_obj = hk.transform_with_state(lambda images, labels, is_training: loss_fn(images,
-                                                                               labels,
-                                                                               odenet,
-                                                                               count_nfe,
-                                                                               is_training))
-
-
-def l2_loss(params):
+def init_data():
     """
-    L2 regularization.
+    Initialize data.
     """
-    return 0.5 * sum(jnp.sum(jnp.square(p)) for p in params)
+    (ds_train,), ds_info = tfds.load('cifar10',
+                                     split=['train'],
+                                     shuffle_files=True,
+                                     as_supervised=True,
+                                     with_info=True)
 
+    num_train = ds_info.splits['train'].num_examples
 
-def loss_obj_decay(params, state, images, labels):
-    """
-    Top level loss objective with weight decay.
-    """
-    total_loss_, state = loss_obj.apply(params, state, None, images, labels, is_training=True)
-    l2_params = [p for ((mod_name, _), p) in tree.flatten_with_path(params) if 'batchnorm' not in mod_name]
-    l2_loss_ = lam_w * l2_loss(l2_params)
-    return total_loss_ + l2_loss_
+    assert num_train % parse_args.batch_size == 0
+    num_batches = num_train // parse_args.batch_size
+
+    test_batch_size = parse_args.test_batch_size if odenet else 10000
+    assert num_train % test_batch_size == 0
+    num_test_batches = num_train // test_batch_size
+
+    # make sure we always save the model on the last iteration
+    assert num_batches * parse_args.nepochs % parse_args.save_freq == 0
+
+    ds_train = ds_train.cache()
+    ds_train = ds_train.repeat()
+    ds_train = ds_train.shuffle(1000)
+    ds_train, ds_train_eval = ds_train.batch(parse_args.batch_size), ds_train.batch(test_batch_size)
+    ds_train, ds_train_eval = tfds.as_numpy(ds_train), tfds.as_numpy(ds_train_eval)
+
+    meta = {
+        "num_batches": num_batches,
+        "num_test_batches": num_test_batches
+    }
+
+    return ds_train, ds_train_eval, meta
 
 
 def run():
@@ -471,74 +480,61 @@ def run():
     print("Reg: %s\tLambda %.4e" % (reg, lam))
     print("Reg: %s\tLambda %.4e" % (reg, lam), file=sys.stderr)
 
-    (ds_train, ds_test), ds_info = tfds.load('cifar10',
-                                             split=['train', 'test'],
-                                             shuffle_files=True,
-                                             as_supervised=True,
-                                             with_info=True)
-    num_train = ds_info.splits['train'].num_examples
-    assert num_train % parse_args.batch_size == 0
-    num_batches = num_train // parse_args.batch_size
+    ds_train, ds_train_eval, meta = init_data()
+    num_batches = meta["num_batches"]
+    num_test_batches = meta["num_test_batches"]
 
-    # make sure we always save and report the model on the last iteration
-    assert num_batches * parse_args.nepochs % parse_args.save_freq == 0
-    assert num_batches * parse_args.nepochs % parse_args.test_freq == 0
-
-    ds_train = ds_train.cache()
-    ds_train = ds_train.repeat()
-    ds_train = ds_train.shuffle(1000)
-    ds_train, ds_train_eval = ds_train.batch(parse_args.batch_size), ds_train.batch(parse_args.test_batch_size)
-    ds_train, ds_train_eval = tfds.as_numpy(ds_train), tfds.as_numpy(ds_train_eval)
-
-    # initialize
-    _images, _labels = next(tfds.as_numpy(ds_test.take(1)))
-    _images = _images.astype(jnp.float32)
-    opt_init_params, state = loss_obj.init(rng, jnp.expand_dims(_images, axis=0), _labels, is_training=True)
+    forward, model = init_model()
+    grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
 
     def lr_schedule(train_itr):
         _epoch = train_itr // num_batches
         id = lambda x: x
-        return lax.cond(_epoch < 150, 1e-1, id, 0, lambda x: lax.cond(_epoch < 250, 1e-2, id, 1e-3, id))
+        return lax.cond(_epoch < 60, 1e-1, id, 0,
+                        lambda _: lax.cond(_epoch < 100, 1e-2, id, 0,
+                                           lambda _: lax.cond(_epoch < 140, 1e-3, id, 1e-4, id)))
 
     opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
-    opt_state = opt_init(opt_init_params)
+    opt_state = opt_init(model["params"])
 
     @jax.jit
-    def update(i, opt_state, state, batch,):
+    def update(_itr, _opt_state, _batch):
         """
         Update the params based on grad for current batch.
         """
-        images, labels = batch
-        grad_fn = jax.grad(loss_obj_decay)
-        return opt_update(i, grad_fn(get_params(opt_state), state, images, labels), opt_state)
+        images, labels = _batch
+        return opt_update(_itr, grad_fn(get_params(_opt_state), images, labels), _opt_state)
 
     @jax.jit
-    def sep_losses(opt_state, state, batch):
+    def sep_losses(_opt_state, _batch):
         """
         Convenience function for calculating losses separately.
         """
-        params = get_params(opt_state)
-        images, labels = batch
-        total_loss_, state = loss_obj.apply(params, state, None, images, labels, is_training=False)
-        loss_ = state["~"]["loss"]
-        reg_ = state["~"]["reg"]
-        acc_ = state["~"]["acc"]
+        params = get_params(_opt_state)
+        images, labels = _batch
+        logits, regs = forward(params, images)
+        loss_ = _loss_fn(logits, labels)
+        reg_ = _reg_loss_fn(regs)
+        total_loss_ = loss_ + lam * reg_
+        acc_ = _acc_fn(logits, labels)
         return acc_, total_loss_, loss_, reg_
 
-    def evaluate_loss(opt_state, state, ds_train_eval):
+    def evaluate_loss(opt_state, ds_train_eval):
         """
         Convenience function for evaluating loss over train set in smaller batches.
         """
-        test_batch_size = parse_args.test_batch_size if odenet else num_train
-        num_test_batches = num_train // test_batch_size
-        sep_acc_, sep_loss_aug_, sep_loss_, sep_loss_reg_ = [], [], [], []
+        sep_acc_, sep_loss_aug_, sep_loss_, sep_loss_reg_, nfe = [], [], [], [], []
 
         for test_batch_num in range(num_test_batches):
             test_batch = next(ds_train_eval)
-            test_batch = test_batch[0].astype(jnp.float32), test_batch[1]
 
             test_batch_acc_, test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = \
-                sep_losses(opt_state, state, test_batch)
+                sep_losses(opt_state, test_batch)
+
+            if count_nfe:
+                nfe.append(model["nfe"](get_params(opt_state), *test_batch))
+            else:
+                nfe.append(0)
 
             sep_acc_.append(test_batch_acc_)
             sep_loss_aug_.append(test_batch_loss_aug_)
@@ -549,26 +545,33 @@ def run():
         sep_loss_aug_ = jnp.array(sep_loss_aug_)
         sep_loss_ = jnp.array(sep_loss_)
         sep_loss_reg_ = jnp.array(sep_loss_reg_)
+        nfe = jnp.array(nfe)
 
-        return jnp.mean(sep_acc_), jnp.mean(sep_loss_aug_), jnp.mean(sep_loss_), jnp.mean(sep_loss_reg_)
+        return jnp.mean(sep_acc_), jnp.mean(sep_loss_aug_), jnp.mean(sep_loss_), jnp.mean(sep_loss_reg_), jnp.mean(nfe)
 
     itr = 0
+    info = collections.defaultdict(dict)
     for epoch in range(parse_args.nepochs):
         for i in range(num_batches):
             batch = next(ds_train)
-            batch = batch[0].astype(jnp.float32), batch[1]
+
             itr += 1
 
-            opt_state = update(itr, opt_state, state, batch)
+            opt_state = update(itr, opt_state, batch)
 
             if itr % parse_args.test_freq == 0:
-                acc_, loss_aug_, loss_, loss_reg_ = evaluate_loss(opt_state, state, ds_train_eval)
+                acc_, loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, ds_train_eval)
 
                 print_str = 'Iter {:04d} | Accuracy {:.6f} | Total (Regularized) Loss {:.6f} | ' \
-                            'Loss {:.6f} | r {:.6f}'.format(itr, acc_, loss_aug_, loss_, loss_reg_)
+                            'Loss {:.6f} | r {:.6f} | NFE {:.6f}'.format(itr, acc_, loss_aug_, loss_, loss_reg_, nfe_)
 
                 print(print_str)
-                print(print_str, file=sys.stderr)
+
+                info[itr]["acc"] = acc_
+                info[itr]["loss_aug"] = loss_aug_
+                info[itr]["loss"] = loss_
+                info[itr]["loss_reg"] = loss_reg_
+                info[itr]["nfe"] = nfe_
 
             if itr % parse_args.save_freq == 0:
                 if odenet:
@@ -579,6 +582,13 @@ def run():
                 outfile = open(param_filename, "wb")
                 pickle.dump(fargs, outfile)
                 outfile.close()
+    meta = {
+        "info": info,
+        "args": parse_args
+    }
+    outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "wb")
+    pickle.dump(meta, outfile)
+    outfile.close()
 
 
 if __name__ == "__main__":
