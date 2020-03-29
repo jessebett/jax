@@ -20,7 +20,7 @@ from jax.experimental.jet import jet
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--test_batch_size', type=int, default=1000)
-parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--nepochs', type=int, default=350)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--atol', type=float, default=1e-3)
@@ -579,9 +579,9 @@ def run():
         """
         _epoch = train_itr // num_batches
         id = lambda x: x
-        return lax.cond(_epoch < 60, 1e-1, id, 0,
-                        lambda _: lax.cond(_epoch < 100, 1e-2, id, 0,
-                                           lambda _: lax.cond(_epoch < 140, 1e-3, id, 1e-4, id)))
+        return lax.cond(_epoch < 150, 1e-1, id, 0,
+                        lambda _: lax.cond(_epoch < 250, 1e-2, id, 0,
+                                           lambda _: lax.cond(_epoch < 350, 1e-3, id, 1e-3, id)))
 
     opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
     opt_state = opt_init(model["params"])
