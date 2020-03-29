@@ -13,6 +13,7 @@ import tensorflow_datasets as tfds
 import jax
 from jax import lax
 import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
 from jax.experimental.ode import build_odeint, odeint
 from jax.experimental.jet import jet
@@ -23,11 +24,12 @@ parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=350)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
+parser.add_argument('--lam_w', type=float, default=5e-4)
 parser.add_argument('--atol', type=float, default=1e-3)
 parser.add_argument('--rtol', type=float, default=1e-3)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=500)
-parser.add_argument('--save_freq', type=int, default=500)
+parser.add_argument('--test_freq', type=int, default=5000)
+parser.add_argument('--save_freq', type=int, default=5000)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resnet', action="store_true")
@@ -42,6 +44,7 @@ assert os.path.exists(parse_args.dirname)
 
 reg = parse_args.reg
 lam = parse_args.lam
+lam_w = parse_args.lam_w
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
@@ -256,6 +259,11 @@ def _loss_fn(logits, labels):
 
 def _reg_loss_fn(reg):
     return jnp.mean(reg)
+
+
+def _weight_fn(params):
+    flat_params, _ = ravel_pytree(params)
+    return 0.5 * jnp.sum(jnp.square(flat_params))
 
 
 def wrap_module(module, *module_args, **module_kwargs):
@@ -488,7 +496,8 @@ def loss_fn(forward, params, state, images, labels, is_training):
     logits, regs, state = forward(params, state, images, is_training=is_training)
     loss_ = _loss_fn(logits, labels)
     reg_ = _reg_loss_fn(regs)
-    return loss_ + lam * reg_, state
+    weight_ = _weight_fn(params)
+    return loss_ + lam * reg_ + lam_w * weight_, state
 
 
 def init_data():
