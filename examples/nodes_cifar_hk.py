@@ -61,6 +61,15 @@ def sigmoid(z):
   # return jnp.where(z >= 0, 1/(1 + jnp.exp(-z)), jnp.exp(z) / (1 + jnp.exp(z)))
 
 
+# TODO: fix this
+def softplus(z, threshold=20):
+  """
+  Numerically stable softplus.
+  """
+  return jax.nn.relu(z)
+  # return jnp.where(z >= threshold, z, jnp.log1p(jnp.exp(z)))
+
+
 def softmax_cross_entropy(logits, labels):
   """
   Cross-entropy loss applied to softmax.
@@ -136,16 +145,17 @@ class ResBlock(hk.Module):
     """
     Standard ResBlock.
     """
+    expansion = 1
 
-    def __init__(self, output_channels):
+    def __init__(self, in_channels, output_channels, bn_config, stride=1):
         super(ResBlock, self).__init__()
-        # self.norm1 = LayerNorm()
+        self.bn1 = hk.BatchNorm(**bn_config)
         self.conv1 = hk.Conv2D(output_channels=output_channels,
                                kernel_shape=3,
-                               stride=1,
+                               stride=stride,
                                padding=lambda _: (1, 1),
                                with_bias=False)
-        # self.norm2 = LayerNorm()
+        self.bn2 = hk.BatchNorm(**bn_config)
         self.conv2 = hk.Conv2D(output_channels=output_channels,
                                kernel_shape=3,
                                stride=1,
@@ -153,14 +163,66 @@ class ResBlock(hk.Module):
                                w_init=jnp.zeros,
                                with_bias=False)
 
-    def __call__(self, x):
-        # out = self.norm1(x)
-        out = sigmoid(x)
+        if stride != 1 or in_channels != self.expansion * output_channels:
+            self.has_shortcut = True
+            self.shortcut = hk.Sequential([
+                hk.Conv2D(output_channels=self.expansion * output_channels,
+                          kernel_shape=1,
+                          stride=stride,
+                          padding="VALID",
+                          with_bias=False)
+            ])
+        else:
+            self.has_shortcut = False
+
+    def __call__(self, x, is_training):
+        out = self.bn1(x, is_training=is_training)
+        out = softplus(out)
+        shortcut = self.shortcut(out) if self.has_shortcut else x
         out = self.conv1(out)
-        # out = self.norm2(out)
-        out = sigmoid(out)
+        out = self.bn2(out, is_training=is_training)
+        out = softplus(out)
         out = self.conv2(out)
-        return x + out
+        out += shortcut
+        return out
+
+
+class ResNet(hk.Module):
+    """
+    For chaining together residual blocks.
+    hk.Sequential doesn't work since it doesn't allow is_training.
+    """
+    def __init__(self,
+                 block_nums,
+                 bn_config=None,
+                 channels_per_group=(64, 128, 256, 512)):
+        super(ResNet, self).__init__()
+        bn_config = dict(bn_config or {})
+        bn_config.setdefault("decay_rate", 0.9)
+        bn_config.setdefault("eps", 1e-5)
+        bn_config.setdefault("create_scale", True)
+        bn_config.setdefault("create_offset", True)
+
+        assert len(block_nums) == 4
+        assert len(channels_per_group) == 4
+
+        self._block_groups = []
+        strides = (1, 2, 2, 2)
+        for i in range(4):
+            block_group = []
+            for j in range(block_nums[i]):
+                block_group.append(ResBlock(in_channels=64,
+                                            output_channels=channels_per_group[i],
+                                            bn_config=bn_config,
+                                            stride=(1 if j else strides[i])))
+            self._block_groups.append(block_group)
+
+    def __call__(self, x, is_training):
+        for block_group in self._block_groups:
+            for block in block_group:
+                x = block(x, is_training)
+
+        return x
 
 
 def aug_init(y):
@@ -196,44 +258,32 @@ def _reg_loss_fn(reg):
     return jnp.mean(reg)
 
 
-def wrap_module(module, *module_args):
+def wrap_module(module, *module_args, **module_kwargs):
     """
     Wrap the module in a function to be transformed.
     """
-    def wrap(*args):
+    def wrap(*args, **kwargs):
         """
         Wrapping of module.
         """
-        model = module(*module_args)
-        return model(*args)
+        model = module(*module_args, **module_kwargs)
+        return model(*args, **kwargs)
     return wrap
 
 
 class PreODE(hk.Module):
     """
     Module applied before the ODE layer.
+    From pre-activation resnet.
     """
-
     def __init__(self):
         super(PreODE, self).__init__()
         self.model = hk.Sequential([
-            lambda x: x.astype(jnp.float32) / 255.,
             hk.Conv2D(output_channels=64,
                       kernel_shape=3,
                       stride=1,
-                      padding="VALID"),
-            # LayerNorm(),
-            sigmoid,
-            hk.Conv2D(output_channels=64,
-                      kernel_shape=4,
-                      stride=2,
-                      padding=lambda _: (1, 1)),
-            # LayerNorm(),
-            sigmoid,
-            hk.Conv2D(output_channels=64,
-                      kernel_shape=4,
-                      stride=2,
-                      padding=lambda _: (1, 1))
+                      padding=lambda _: (1, 1),
+                      with_bias=False),
         ])
 
     def __call__(self, x):
@@ -282,9 +332,7 @@ class PostODE(hk.Module):
     def __init__(self):
         super(PostODE, self).__init__()
         self.model = hk.Sequential([
-            # LayerNorm(),
-            sigmoid,
-            hk.AvgPool(window_shape=(1, 6, 6, 1),
+            hk.AvgPool(window_shape=(1, 4, 4, 1),
                        strides=(1, 1, 1, 1),
                        padding="VALID"),
             Flatten(),
@@ -295,16 +343,17 @@ class PostODE(hk.Module):
         return self.model(x)
 
 
-def initialization_data(input_shape, ode_shape):
+def initialization_data(input_shape, in_ode_shape, out_ode_shape):
     """
     Data for initializing the modules.
     """
-    ode_shape = (1, ) + ode_shape[1:]
+    in_ode_shape = (1, ) + in_ode_shape[1:]
+    out_ode_shape = (1, ) + out_ode_shape[1:]
     data = {
         "pre_ode": jnp.zeros(input_shape),
-        "ode": (jnp.ravel(jnp.zeros(ode_shape)), 0.),
-        "res": jnp.zeros(ode_shape),
-        "post_ode": jnp.zeros(ode_shape)
+        "ode": (jnp.ravel(jnp.zeros(in_ode_shape)), 0.),
+        "res": jnp.zeros(in_ode_shape),
+        "post_ode": jnp.zeros(out_ode_shape)
     }
     return data
 
@@ -316,16 +365,18 @@ def init_model():
     ts = jnp.array([0., 1.])
 
     input_shape = (1, 32, 32, 3)
-    ode_shape = (-1, 7, 7, 64)
-    ode_dim = jnp.prod(ode_shape[1:])
+    in_ode_shape = (-1, 32, 32, 64)
+    out_ode_shape = (-1, 4, 4, 512)
+    ode_dim = jnp.prod(in_ode_shape[1:])
 
-    initialization_data_ = initialization_data(input_shape, ode_shape)
+    initialization_data_ = initialization_data(input_shape, in_ode_shape, out_ode_shape)
 
     pre_ode = hk.transform(wrap_module(PreODE))
     pre_ode_params = pre_ode.init(rng, initialization_data_["pre_ode"])
     pre_ode_fn = pre_ode.apply
 
     if odenet:
+        # TODO: how to do analagous multiple blocks
         dynamics = hk.transform(wrap_module(Dynamics, ode_shape))
         dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
         dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
@@ -380,10 +431,12 @@ def init_model():
             nfe_fn = None
 
     else:
-        resnet = hk.transform(wrap_module(
-            lambda: hk.Sequential([ResBlock(ode_shape[-1]) for _ in range(num_blocks)])))
-        resnet_params = resnet.init(rng, initialization_data_["res"])
-        resnet_fn = resnet.apply
+        # instantiate series of resblocks
+        block_nums = [2, 2, 2, 2]
+        # TODO: pass in type of resblock?
+        resnet = hk.transform_with_state(wrap_module(ResNet, block_nums))
+        resnet_params, resnet_state = resnet.init(rng, initialization_data_["res"], is_training=True)
+        resnet_fn = lambda params, state, x, is_training: resnet.apply(params, state, None, x, is_training=is_training)
 
     post_ode = hk.transform(wrap_module(PostODE))
     post_ode_params = post_ode.init(rng, initialization_data_["post_ode"])
@@ -398,7 +451,8 @@ def init_model():
         "params": {
             "pre_ode": pre_ode_params,
             "post_ode": post_ode_params
-        }
+        },
+        "state": odenet_state if odenet else resnet_state
     }
 
     if odenet:
@@ -409,7 +463,7 @@ def init_model():
         model["model"]["res"] = resnet_fn
         model["params"]["res"] = resnet_params
 
-    def forward(params, _images):
+    def forward(params, state, _images, is_training):
         """
         Forward pass of the model.
         """
@@ -418,23 +472,23 @@ def init_model():
         if odenet:
             out_ode, regs = model_["ode"](params["ode"], out_pre_ode)
         else:
-            out_ode = model_["res"](params["res"], out_pre_ode)
+            out_ode, state = model_["res"](params["res"], state, out_pre_ode, is_training=is_training)
             regs = jnp.zeros(_images.shape[0])
         logits = model_["post_ode"](params["post_ode"], out_ode)
 
-        return logits, regs
+        return logits, regs, state
 
     return forward, model
 
 
-def loss_fn(forward, params, images, labels):
+def loss_fn(forward, params, state, images, labels, is_training):
     """
     The loss function for training.
     """
-    logits, regs = forward(params, images)
+    logits, regs, state = forward(params, state, images, is_training=is_training)
     loss_ = _loss_fn(logits, labels)
     reg_ = _reg_loss_fn(regs)
-    return loss_ + lam * reg_
+    return loss_ + lam * reg_, state
 
 
 def init_data():
@@ -517,9 +571,12 @@ def run():
     num_test_batches = meta["num_test_batches"]
 
     forward, model = init_model()
-    grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
+    grad_fn = jax.grad(lambda *args: loss_fn(forward, *args, is_training=True), has_aux=True)
 
     def lr_schedule(train_itr):
+        """
+        Learning rate schedule. Implemented in lax.
+        """
         _epoch = train_itr // num_batches
         id = lambda x: x
         return lax.cond(_epoch < 60, 1e-1, id, 0,
@@ -528,30 +585,32 @@ def run():
 
     opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
     opt_state = opt_init(model["params"])
+    state = model["state"]
 
     @jax.jit
-    def update(_itr, _opt_state, _batch):
+    def update(_itr, _opt_state, _state, _batch):
         """
         Update the params based on grad for current batch.
         """
         images, labels = _batch
-        return opt_update(_itr, grad_fn(get_params(_opt_state), images, labels), _opt_state)
+        grad_, _state = grad_fn(get_params(_opt_state), _state, images, labels)
+        return opt_update(_itr, grad_, _opt_state), _state
 
     @jax.jit
-    def sep_losses(_opt_state, _batch):
+    def sep_losses(_opt_state, _state, _batch):
         """
         Convenience function for calculating losses separately.
         """
         params = get_params(_opt_state)
         images, labels = _batch
-        logits, regs = forward(params, images)
+        logits, regs, _ = forward(params, _state, images, is_training=False)
         loss_ = _loss_fn(logits, labels)
         reg_ = _reg_loss_fn(regs)
         total_loss_ = loss_ + lam * reg_
         acc_ = _acc_fn(logits, labels)
         return acc_, total_loss_, loss_, reg_
 
-    def evaluate_loss(opt_state, ds_train_eval):
+    def evaluate_loss(opt_state, state, ds_train_eval):
         """
         Convenience function for evaluating loss over train set in smaller batches.
         """
@@ -561,7 +620,7 @@ def run():
             test_batch = next(ds_train_eval)
 
             test_batch_acc_, test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = \
-                sep_losses(opt_state, test_batch)
+                sep_losses(opt_state, state, test_batch)
 
             if count_nfe:
                 nfe.append(model["nfe"](get_params(opt_state), *test_batch))
@@ -589,10 +648,10 @@ def run():
 
             itr += 1
 
-            opt_state = update(itr, opt_state, batch)
+            opt_state, state = update(itr, opt_state, state, batch)
 
             if itr % parse_args.test_freq == 0:
-                acc_, loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, ds_train_eval)
+                acc_, loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, state, ds_train_eval)
 
                 print_str = 'Iter {:04d} | Accuracy {:.6f} | Total (Regularized) Loss {:.6f} | ' \
                             'Loss {:.6f} | r {:.6f} | NFE {:.6f}'.format(itr, acc_, loss_aug_, loss_, loss_reg_, nfe_)
