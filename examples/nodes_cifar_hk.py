@@ -21,7 +21,7 @@ from jax.experimental.jet import jet
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--test_batch_size', type=int, default=1000)
-parser.add_argument('--nepochs', type=int, default=350)
+parser.add_argument('--nepochs', type=int, default=200)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=0)
@@ -56,6 +56,7 @@ rtol = parse_args.rtol
 
 
 # some primitive functions
+# TODO: implement primitives to allow numerical stability
 def sigmoid(z):
   """
   Numerically stable sigmoid.
@@ -299,6 +300,21 @@ class PreODE(hk.Module):
         return self.model(x)
 
 
+class ConcatConv2D(hk.Module):
+    """
+    Convolution with extra channel and skip connection for time.
+    """
+
+    def __init__(self, **kwargs):
+        super(ConcatConv2D, self).__init__()
+        self._layer = hk.Conv2D(**kwargs)
+
+    def __call__(self, x, t):
+        tt = jnp.ones_like(x[:, :, :, :1]) * t
+        ttx = jnp.concatenate([tt, x], axis=-1)
+        return self._layer(ttx)
+
+
 class Dynamics(hk.Module):
     """
     Dynamics of the ODENet.
@@ -308,28 +324,28 @@ class Dynamics(hk.Module):
         super(Dynamics, self).__init__()
         self.input_shape = input_shape
         output_channels = input_shape[-1]
-        # self.norm1 = LayerNorm()
-        self.conv1 = ConcatConv2d(output_channels=output_channels,
+        self.conv1 = ConcatConv2D(output_channels=output_channels,
                                   kernel_shape=3,
                                   stride=1,
-                                  padding=lambda _: (1, 1))
-        # self.norm2 = LayerNorm()
-        self.conv2 = ConcatConv2d(output_channels=output_channels,
+                                  padding=lambda _: (1, 1),
+                                  with_bias=False)
+        self.conv2 = ConcatConv2D(output_channels=output_channels,
                                   kernel_shape=3,
                                   stride=1,
                                   padding=lambda _: (1, 1),
                                   w_init=jnp.zeros,
-                                  b_init=jnp.zeros)
+                                  with_bias=False)
 
     def __call__(self, x, t):
         x = jnp.reshape(x, self.input_shape)
-        # out = self.norm1(x)
-        out = sigmoid(x)
+
+        out = softplus(x)
         out = self.conv1(out, t)
-        # out = self.norm2(x)
-        out = sigmoid(out)
+        out = softplus(out)
         out = self.conv2(out, t)
+
         out = jnp.ravel(out)
+
         return out
 
 
@@ -362,7 +378,7 @@ def initialization_data(input_shape, in_ode_shape, out_ode_shape):
         "pre_ode": jnp.zeros(input_shape),
         "ode": (jnp.ravel(jnp.zeros(in_ode_shape)), 0.),
         "res": jnp.zeros(in_ode_shape),
-        "post_ode": jnp.zeros(out_ode_shape)
+        "post_ode": jnp.zeros(in_ode_shape) if odenet else jnp.zeros(out_ode_shape)
     }
     return data
 
@@ -386,7 +402,7 @@ def init_model():
 
     if odenet:
         # TODO: how to do analagous multiple blocks
-        dynamics = hk.transform(wrap_module(Dynamics, ode_shape))
+        dynamics = hk.transform(wrap_module(Dynamics, in_ode_shape))
         dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
         dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
         if reg:
@@ -421,7 +437,7 @@ def init_model():
             """
             flat_out_ode = nodeint(aug_init(out_pre_ode), ts, params)[-1]
             out_ode, out_ode_r = unpack_aug(flat_out_ode, ode_dim)
-            out_ode = jnp.reshape(out_ode, ode_shape)
+            out_ode = jnp.reshape(out_ode, in_ode_shape)
             return out_ode, out_ode_r
 
         if count_nfe:
@@ -461,7 +477,7 @@ def init_model():
             "pre_ode": pre_ode_params,
             "post_ode": post_ode_params
         },
-        "state": odenet_state if odenet else resnet_state
+        "state": None if odenet else resnet_state
     }
 
     if odenet:
@@ -589,9 +605,9 @@ def run():
         """
         _epoch = train_itr // num_batches
         id = lambda x: x
-        return lax.cond(_epoch < 150, 1e-1, id, 0,
-                        lambda _: lax.cond(_epoch < 250, 1e-2, id, 0,
-                                           lambda _: lax.cond(_epoch < 350, 1e-3, id, 1e-3, id)))
+        return lax.cond(_epoch < 75, 1e-1, id, 0,
+                        lambda _: lax.cond(_epoch < 125, 1e-2, id, 0,
+                                           lambda _: lax.cond(_epoch < 175, 1e-3, id, 1e-3, id)))
 
     opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
     opt_state = opt_init(model["params"])
