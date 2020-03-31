@@ -684,6 +684,10 @@ def run():
 
                 print(print_str)
 
+                outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
+                outfile.write(print_str + "\n")
+                outfile.close()
+
                 info[itr]["acc"] = acc_
                 info[itr]["loss_aug"] = loss_aug_
                 info[itr]["loss"] = loss_
