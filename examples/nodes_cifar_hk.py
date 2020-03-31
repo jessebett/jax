@@ -24,7 +24,7 @@ parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=350)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
-parser.add_argument('--lam_w', type=float, default=5e-4)
+parser.add_argument('--lam_w', type=float, default=0)
 parser.add_argument('--atol', type=float, default=1e-3)
 parser.add_argument('--rtol', type=float, default=1e-3)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
@@ -133,6 +133,7 @@ class LayerNorm(hk.Module):
 
     def __init__(self, ):
         super(LayerNorm, self).__init__()
+        # TODO: need to make a new general GroupNorm module
         self._layer = hk.BatchNorm(create_scale=True,
                                    create_offset=True,
                                    axis=[1, 2, 3])
