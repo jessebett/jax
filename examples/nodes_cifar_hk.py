@@ -378,7 +378,7 @@ def initialization_data(input_shape, in_ode_shape, out_ode_shape):
         "pre_ode": jnp.zeros(input_shape),
         "ode": (jnp.ravel(jnp.zeros(in_ode_shape)), 0.),
         "res": jnp.zeros(in_ode_shape),
-        "post_ode": jnp.zeros(in_ode_shape) if odenet else jnp.zeros(out_ode_shape)
+        "post_ode": jnp.zeros(in_ode_shape) if odenet or True else jnp.zeros(out_ode_shape)
     }
     return data
 
