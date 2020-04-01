@@ -223,9 +223,9 @@ class ResNet(hk.Module):
             self._block_groups.append(block_group)
 
     def __call__(self, x, is_training):
-        for block_group in self._block_groups:
-            for block in block_group:
-                x = block(x, is_training)
+        # for block_group in self._block_groups:
+        #     for block in block_group:
+        #         x = block(x, is_training)
 
         return x
 
