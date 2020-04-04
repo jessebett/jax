@@ -282,7 +282,7 @@ def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
                       np.minimum(err_ratio**(1.0 / order) / safety, 1.0 / dfactor))
   return np.where(mean_error_ratio == 0, last_step * ifactor, last_step / factor)
 
-def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf, method="dopri5"):
+def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, init_step=-1., mxstep=np.inf, method="dopri5"):
   """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
 
   Args:
@@ -301,18 +301,18 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf, method="
     point in `t`, represented as an array (or pytree of arrays) with the same
     shape/structure as `y0` except with a new leading axis of length `len(t)`.
   """
-  return _odeint_wrapper(func, rtol, atol, mxstep, method, y0, t, *args)
+  return _odeint_wrapper(func, rtol, atol, init_step, mxstep, method, y0, t, *args)
 
-@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
-def _odeint_wrapper(func, rtol, atol, mxstep, method, y0, ts, *args):
+@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
+def _odeint_wrapper(func, rtol, atol, init_step, mxstep, method, y0, ts, *args):
   y0, unravel = ravel_pytree(y0)
   func = ravel_first_arg(func, unravel)
   _odeint = methods[method]
-  out, nfe = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
+  out, nfe = _odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args)
   return jax.vmap(unravel)(out), nfe
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
-def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
+def _dopri5_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
 
   def scan_fun(carry, target_t):
@@ -342,16 +342,17 @@ def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
     return carry, y_target
 
   f0 = func_(y0, ts[0])
-  dt = initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0)
+  dt, init_nfe = lax.cond(init_step <= 0,
+                          None, lambda _: (initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0), 2),
+                          None, lambda _: (init_step, 1))
   interp_coeff = np.array([y0] * 5)
-  init_nfe = 2
   init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff, init_nfe]
   carry, ys = lax.scan(scan_fun, init_carry, ts[1:])
   nfe = carry[-1]
   return np.concatenate((y0[None], ys)), nfe
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
-def _adams_odeint(func, rtol, atol, mxstep, y0, ts, *args):
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
+def _adams_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
 
   def scan_fun(carry, target_t):
@@ -373,7 +374,9 @@ def _adams_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   t0 = ts[0]
   f0 = func_(y0, t0)
   ode_dim = f0.shape[0]
-  dt = initial_step_size(func_, t0, y0, 2, rtol, atol, f0)
+  dt, init_nfe = lax.cond(init_step <= 0,
+                          None, lambda _: (initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0), 2),
+                          None, lambda _: (init_step, 1))
 
   prev_f = np.empty((_ADAMS_MAX_ORDER + 1, ode_dim))
   prev_f = jax.ops.index_update(prev_f, 0, f0)
@@ -401,11 +404,11 @@ def _adams_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   nfe = carry[-1]
   return np.concatenate((y0[None], ys)), nfe
 
-def _odeint_fwd(_odeint, func, rtol, atol, mxstep, y0, ts, *args):
-  ys, nfe = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
+def _odeint_fwd(_odeint, func, rtol, atol, init_step, mxstep, y0, ts, *args):
+  ys, nfe = _odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args)
   return (ys, nfe), (ys, ts, args)
 
-def _odeint_rev(method, func, rtol, atol, mxstep, res, g):
+def _odeint_rev(method, func, rtol, atol, init_step, mxstep, res, g):
   ys, ts, args = res
   g, _ = g
 
@@ -427,7 +430,7 @@ def _odeint_rev(method, func, rtol, atol, mxstep, res, g):
     # Run augmented system backwards to previous observation
     _, y_bar, t0_bar, args_bar = odeint(
         aug_dynamics, (ys[i], y_bar, t0_bar, args_bar), np.array([ts[i - 1], ts[i]]),
-        *args, rtol=rtol, atol=atol, mxstep=mxstep, method=method)[0]
+        *args, rtol=rtol, atol=atol, init_step=init_step, mxstep=mxstep, method=method)[0]
     y_bar, t0_bar, args_bar = tree_map(op.itemgetter(1), (y_bar, t0_bar, args_bar))
     # Add gradient from current output
     y_bar = y_bar + g[i - 1]
@@ -568,7 +571,8 @@ def sin_test(**kwargs):
 
 if __name__ == '__main__':
   kwargs = {
-    "method": "dopri5",
+    "method": "adams",
+    "init_step": 0.1,
     "atol": 1e-3,
     "rtol": 1e-3
   }
