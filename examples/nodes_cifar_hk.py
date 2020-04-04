@@ -20,7 +20,7 @@ from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=100)
-parser.add_argument('--test_batch_size', type=int, default=1000)
+parser.add_argument('--test_batch_size', type=int, default=10000)
 parser.add_argument('--nepochs', type=int, default=200)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
@@ -30,7 +30,7 @@ parser.add_argument('--rtol', type=float, default=1e-3)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--init_step', type=float, default=-1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=5000)
+parser.add_argument('--test_freq', type=int, default=1)
 parser.add_argument('--save_freq', type=int, default=5000)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
@@ -75,7 +75,8 @@ def softplus(z, threshold=20):
   """
   Numerically stable softplus.
   """
-  return jax.nn.relu(z)
+  return sigmoid(z)
+  # return jax.nn.relu(z)
   # return jnp.where(z >= threshold, z, jnp.log1p(jnp.exp(z)))
 
 
@@ -241,7 +242,7 @@ def aug_init(y):
     We need to flatten the dynamics first since they may be convolutional
     (has width, height, and channels).
     """
-    return jnp.concatenate((jnp.ravel(y), jnp.zeros(y.shape[0])))
+    return y, jnp.zeros(y.shape[0])
 
 
 def unpack_aug(yr, ode_dim):
@@ -349,8 +350,6 @@ class Dynamics(hk.Module):
         out = softplus(out)
         out = self.conv2(out, t)
 
-        out = jnp.ravel(out)
-
         return out
 
 
@@ -381,7 +380,7 @@ def initialization_data(input_shape, in_ode_shape, out_ode_shape):
     out_ode_shape = (1, ) + out_ode_shape[1:]
     data = {
         "pre_ode": jnp.zeros(input_shape),
-        "ode": (jnp.ravel(jnp.zeros(in_ode_shape)), 0.),
+        "ode": (jnp.zeros(in_ode_shape), 0.),
         "res": jnp.zeros(in_ode_shape),
         "post_ode": jnp.zeros(in_ode_shape) if odenet or True else jnp.zeros(out_ode_shape)
     }
@@ -397,7 +396,6 @@ def init_model():
     input_shape = (1, 32, 32, 3)
     in_ode_shape = (-1, 32, 32, 64)
     out_ode_shape = (-1, 4, 4, 512)
-    ode_dim = jnp.prod(in_ode_shape[1:])
 
     initialization_data_ = initialization_data(input_shape, in_ode_shape, out_ode_shape)
 
@@ -415,47 +413,47 @@ def init_model():
                 """
                 Dynamics of regularization for ODE integration.
                 """
-                batch_size = y.size // ode_dim
                 if reg == "none":
-                    return jnp.zeros(batch_size)
+                    return jnp.zeros(y.shape[0])
                 else:
                     # do r3 regularization
                     y0, y_n = sol_recursive(lambda _y, _t: dynamics_wrap(_y, _t, params), y, t)
-                    r = jnp.reshape(y_n[-1], (-1, ode_dim))
-                    return jnp.sum(r ** 2, axis=1)
+                    r = y_n[-1]
+                    return jnp.sum(r ** 2, axis=[axis_ for axis_ in range(1, r.ndim)])
 
             def aug_dynamics(yr, t, params):
                 """
                 Dynamics augmented with regularization.
                 """
-                y, r = unpack_aug(yr, ode_dim)
+                y, r = yr
                 dydt = dynamics_wrap(y, t, params)
                 drdt = reg_dynamics(y, t, params)
-                return jnp.concatenate((dydt, drdt))
-            nodeint = lambda y0, t, params: odeint(aug_dynamics, y0, t, params, **ode_kwargs)
+                return dydt, drdt
+            nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, y0, t, params, **ode_kwargs)[0],
+                               (0, None, None), 1)
         else:
-            nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)
+            nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0],
+                               (0, None, None), 1)
 
         def ode(params, out_pre_ode):
             """
             Apply the ODE block.
             """
-            flat_out_ode = nodeint(aug_init(out_pre_ode), ts, params)[0][-1]
-            out_ode, out_ode_r = unpack_aug(flat_out_ode, ode_dim)
-            out_ode = jnp.reshape(out_ode, in_ode_shape)
-            return out_ode, out_ode_r
+            out_ode, out_ode_r = nodeint(aug_init(out_pre_ode), ts, params)
+            return out_ode[-1], out_ode_r[-1]
 
         if count_nfe:
-            unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)
+            unreg_nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
+                                     (0, None, None))
 
             @jax.jit
             def nfe_fn(params, _images, _labels):
                 """
                 Function to return NFE.
                 """
-                in_ode = jnp.ravel(pre_ode.apply(params["pre_ode"], _images))
-                _, f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
-                return f_nfe
+                in_ode = pre_ode.apply(params["pre_ode"], _images)
+                f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
+                return jnp.mean(f_nfe)
 
         else:
             nfe_fn = None
