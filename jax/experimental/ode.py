@@ -22,20 +22,40 @@ stepsize integration methods.
 Adjoint algorithm based on Appendix C of https://arxiv.org/pdf/1806.07366.pdf
 """
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 from functools import partial
+import operator as op
+import time
 
 import jax
-import jax.lax
 import jax.numpy as np
 from jax import lax
 from jax import ops
+from jax.util import safe_map, safe_zip
 from jax.flatten_util import ravel_pytree
+from jax.test_util import check_grads
+from jax.tree_util import tree_map
+from jax import linear_util as lu
+import numpy as onp
+import scipy.integrate as osp_integrate
+import scipy
 
-@jax.jit
+map = safe_map
+zip = safe_zip
+
+_ADAMS_MAX_ORDER = 12
+
+
+def ravel_first_arg(f, unravel):
+  return ravel_first_arg_(lu.wrap_init(f), unravel).call_wrapped
+
+@lu.transformation
+def ravel_first_arg_(unravel, y_flat, *args):
+  y = unravel(y_flat)
+  ans = yield (y,) + args, {}
+  ans_flat, _ = ravel_pytree(ans)
+  yield ans_flat
+
 def interp_fit_dopri(y0, y1, k, dt):
   # Fit a polynomial to the results of a Runge-Kutta step.
   dps_c_mid = np.array([
@@ -45,7 +65,6 @@ def interp_fit_dopri(y0, y1, k, dt):
   y_mid = y0 + dt * np.dot(dps_c_mid, k)
   return np.array(fit_4th_order_polynomial(y0, y1, y_mid, k[0], k[-1], dt))
 
-@jax.jit
 def fit_4th_order_polynomial(y0, y1, y_mid, dy0, dy1, dt):
   a = -2.*dt*dy0 + 2.*dt*dy1 -  8.*y0 -  8.*y1 + 16.*y_mid
   b =  5.*dt*dy0 - 3.*dt*dy1 + 18.*y0 + 14.*y1 - 32.*y_mid
@@ -54,8 +73,6 @@ def fit_4th_order_polynomial(y0, y1, y_mid, dy0, dy1, dt):
   e = y0
   return a, b, c, d, e
 
-
-@partial(jax.jit, static_argnums=(0,))
 def initial_step_size(fun, t0, y0, order, rtol, atol, f0):
   # Algorithm from:
   # E. Hairer, S. P. Norsett G. Wanner,
@@ -76,27 +93,7 @@ def initial_step_size(fun, t0, y0, order, rtol, atol, f0):
 
   return np.minimum(100. * h0, h1)
 
-
-@partial(jax.jit, static_argnums=(0,))
-def runge_kutta_step(func, y0, f0, t0, dt, nfe):
-  """Take an arbitrary Runge-Kutta step and estimate error.
-
-  Args:
-      func: Function to evaluate like `func(y, t)` to compute the time
-        derivative of `y`.
-      y0: initial value for the state.
-      f0: initial value for the derivative, computed from `func(t0, y0)`.
-      t0: initial time.
-      dt: time step.
-      alpha, beta, c: Butcher tableau describing how to take the Runge-Kutta
-        step.
-
-  Returns:
-      y1: estimated function at t1 = t0 + dt
-      f1: derivative of the state at t1
-      y1_error: estimated error at t1
-      k: list of Runge-Kutta coefficients `k` used for calculating these terms.
-  """
+def runge_kutta_step(func, y0, f0, t0, dt):
   # Dopri5 Butcher tableaux
   alpha = np.array([1 / 5, 3 / 10, 4 / 5, 8 / 9, 1., 1., 0])
   beta = np.array([
@@ -121,20 +118,159 @@ def runge_kutta_step(func, y0, f0, t0, dt, nfe):
   k = ops.index_update(np.zeros((7, f0.shape[0])), ops.index[0, :], f0)
   k = lax.fori_loop(1, 7, body_fun, k)
 
-  nfe += 6
-
   y1 = dt * np.dot(c_sol, k) + y0
   y1_error = dt * np.dot(c_error, k)
   f1 = k[-1]
-  return y1, f1, y1_error, k, nfe
+  return y1, f1, y1_error, k
 
-@jax.jit
+def _g_and_explicit_phi(prev_t, next_t, implicit_phi, k):
+  curr_t = prev_t[0]
+  dt = next_t - prev_t[0]
+
+  beta = 1.
+
+  explicit_phi = np.zeros_like(implicit_phi)
+  explicit_phi = jax.ops.index_update(explicit_phi, 0, implicit_phi[0])
+
+  c = 1 / np.arange(1, _ADAMS_MAX_ORDER + 2)
+
+  g = np.zeros(_ADAMS_MAX_ORDER + 1)
+  g = jax.ops.index_update(g, 0, 1)
+
+  def body_fun(i, val):
+    beta, explicit_phi, c, g = val
+
+    beta = (next_t - prev_t[i - 1]) / (curr_t - prev_t[i]) * beta
+    explicit_phi = jax.ops.index_update(explicit_phi, i, implicit_phi[i] * beta)
+
+    idxs = np.arange(_ADAMS_MAX_ORDER + 1)
+    c_q = np.where(idxs < k - i + 1, c, 0)   # c[:k - i + 1]
+    c_q_1 = np.where(idxs < k + 1 - i + 1, np.where(idxs >= 1, c, 0), 0)  # c[1:k + 1 - i + 1]
+    # shift so that it lines up with diff1
+    c_q_1 = jax.ops.index_update(c_q_1, jax.ops.index[:-1], c_q_1[1:])
+    # c[:k - i + 1] - c[1:k + 1 - i + 1]
+    c = lax.cond(i == 1, None, lambda _: c_q - c_q_1, None, lambda _: c_q - c_q_1 * dt / (next_t - prev_t[i - 1]))
+    g = jax.ops.index_update(g, i, c[0])
+
+    val = beta, explicit_phi, c, g
+    return val
+
+  beta, explicit_phi, c, g = lax.fori_loop(1, k, body_fun, (beta, explicit_phi, c, g))
+
+  # do the c and g update for i = k
+  c = jax.ops.index_update(c, jax.ops.index[:1], c[:1] - c[1:2] * dt / (next_t - prev_t[k - 1]))
+  g = jax.ops.index_update(g, k, c[0])
+
+  return g, explicit_phi
+
+def _compute_implicit_phi(explicit_phi, f_n, phi_order, k):
+  k = lax.min(phi_order + 1, k)
+  implicit_phi = np.zeros_like(explicit_phi)
+  implicit_phi = jax.ops.index_update(implicit_phi, 0, f_n)
+  def body_fun(i, val):
+    implicit_phi = val
+    implicit_phi = jax.ops.index_update(implicit_phi, i, implicit_phi[i - 1] - explicit_phi[i - 1])
+    return implicit_phi
+  implicit_phi = lax.fori_loop(1, k, body_fun, implicit_phi)
+  return implicit_phi
+
+def adaptive_adams_step(func, y0, prev_f, prev_t, next_t, prev_phi, order, target_t, rtol, atol):
+  gamma_star = np.array([
+    1, -1 / 2, -1 / 12, -1 / 24, -19 / 720, -3 / 160, -863 / 60480, -275 / 24192, -33953 / 3628800, -0.00789255,
+    -0.00678585, -0.00592406, -0.00523669, -0.0046775, -0.00421495, -0.0038269
+  ])
+  next_t = lax.min(next_t, target_t)  # TODO: integrate as far as possible and interpolate
+  dt = next_t - prev_t[0]
+
+  # explicit predictor step
+  g, phi = _g_and_explicit_phi(prev_t, next_t, prev_phi, order)
+
+  # compute y0 + dt * np.dot(phi[:max(1, order - 1)].T, g[:max(1, order - 1)])
+  p_next = y0 + dt * np.dot(np.where(np.arange(_ADAMS_MAX_ORDER) < lax.max(1, order - 1), phi.T, 0),
+                            np.where(np.arange(_ADAMS_MAX_ORDER + 1) < lax.max(1, order - 1), g, 0)[:-1])
+
+  # update phi to implicit
+  next_f0 = func(p_next, next_t)
+  implicit_phi_p = _compute_implicit_phi(phi, next_f0, order, order + 1)
+
+  # Implicit corrector step.
+  y_next = p_next + dt * g[order - 1] * implicit_phi_p[order - 1]
+
+  def compute_error_estimate(order):
+    return dt * (g[order] - g[order - 1]) * implicit_phi_p[order]
+
+  # Error estimation.
+  local_error = compute_error_estimate(order)
+  tolerance = error_tolerance(rtol, atol, y0, y_next)
+  error_k = error_ratio_tol(local_error, tolerance)
+
+  def accept(tpl):
+    prev_t, prev_f = tpl
+    next_f0 = func(y_next, next_t)
+    implicit_phi = _compute_implicit_phi(phi, next_f0, order, order + 2)
+    next_order = \
+      lax.cond(
+        len(prev_t) <= 4 or order < 3,
+          None,
+          lambda _: lax.min(order + 1, lax.min(3, _ADAMS_MAX_ORDER)),
+          (error_ratio_tol(compute_error_estimate(order - 1), tolerance),
+          error_ratio_tol(compute_error_estimate(order - 2), tolerance)),
+          lambda errs:
+          lax.cond(
+            np.min(errs[0] + errs[1]) < np.max(error_k),
+              None,
+              lambda _: order - 1,
+              None,
+              lambda _:
+              lax.cond(
+                order < _ADAMS_MAX_ORDER,
+                  error_ratio_tol(dt * gamma_star[order] * implicit_phi_p[order], tolerance),
+                  lambda error_kp1:
+                  lax.cond(
+                    np.max(error_kp1) < np.max(error_k),
+                      None,
+                      lambda _: order + 1,
+                      None,
+                      lambda _: order
+                  ),
+                  None,
+                  lambda _: order
+              )
+          )
+      )
+
+    # Keep step size constant if increasing order. Else use adaptive step size.
+    dt_next = lax.cond(next_order > order,
+                       None, lambda _: dt,
+                       None, lambda _: optimal_step_size(dt, error_k, order=next_order))
+
+    # shift right and insert at 0
+
+    prev_f = jax.ops.index_update(prev_f, jax.ops.index[1:], prev_f[:-1])
+    prev_f = jax.ops.index_update(prev_f, 0, next_f0)
+
+    prev_t = jax.ops.index_update(prev_t, jax.ops.index[1:], prev_t[:-1])
+    prev_t = jax.ops.index_update(prev_t, 0, next_t)
+
+    return p_next, prev_f, prev_t, next_t + dt_next, implicit_phi, next_order, 2
+
+  def reject(_):
+    dt_next = optimal_step_size(dt, error_k, order=order)
+    return y0, prev_f, prev_t, prev_t[0] + dt_next, prev_phi, order, 1
+
+  # TODO: why is scoping only needed for some of the variables? and in only one of the cases?
+  return lax.cond(error_k <= 1, (prev_t, prev_f), accept, None, reject)
+
 def error_ratio(error_estimate, rtol, atol, y0, y1):
-  err_tol = atol + rtol * np.maximum(np.abs(y0), np.abs(y1))
-  err_ratio = error_estimate / err_tol
+  return error_ratio_tol(error_estimate, error_tolerance(rtol, atol, y0, y1))
+
+def error_tolerance(rtol, atol, y0, y1):
+  return atol + rtol * np.maximum(np.abs(y0), np.abs(y1))
+
+def error_ratio_tol(error_estimate, error_tolerance):
+  err_ratio = error_estimate / error_tolerance
   return np.mean(err_ratio ** 2)
 
-@jax.jit
 def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
                       dfactor=0.2, order=5.0):
   """Compute optimal Runge-Kutta stepsize."""
@@ -143,223 +279,302 @@ def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
 
   err_ratio = np.sqrt(mean_error_ratio)
   factor = np.maximum(1.0 / ifactor,
-                      np.minimum(err_ratio ** (1.0 / order) / safety,
-                                 1.0 / dfactor))
-  return np.where(mean_error_ratio == 0,
-                  last_step * ifactor,
-                  last_step / factor, )
+                      np.minimum(err_ratio**(1.0 / order) / safety, 1.0 / dfactor))
+  return np.where(mean_error_ratio == 0, last_step * ifactor, last_step / factor)
 
-
-@partial(jax.jit, static_argnums=(0,))
-def odeint(ofunc, y0, t, *args, **kwargs):
+def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf, method="dopri5"):
   """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
 
   Args:
-    ofunc: Function to evaluate `yt = ofunc(y, t, *args)` that
-      returns the time derivative of `y`.
-    y0: initial value for the state.
-    t: Timespan for `ofunc` evaluation like `np.linspace(0., 10., 101)`.
-    *args: Additional arguments to `ofunc` beyond y0 and t.
-    **kwargs: Two relevant keyword arguments:
-      'rtol': Relative local error tolerance for solver.
-      'atol': Absolute local error tolerance for solver.
+    func: function to evaluate the time derivative of the solution `y` at time
+      `t` as `func(y, t, *args)`, producing the same shape/structure as `y0`.
+    y0: array or pytree of arrays representing the initial value for the state.
+    t: array of float times for evaluation, like `np.linspace(0., 10., 101)`,
+      in which the values must be strictly increasing.
+    *args: tuple of additional arguments for `func`.
+    rtol: float, relative local error tolerance for solver (optional).
+    atol: float, absolute local error tolerance for solver (optional).
+    mxstep: int, maximum number of steps to take for each timepoint (optional).
 
   Returns:
     Values of the solution `y` (i.e. integrated system values) at each time
     point in `t`, represented as an array (or pytree of arrays) with the same
     shape/structure as `y0` except with a new leading axis of length `len(t)`.
   """
-  rtol = kwargs.get('rtol', 1.4e-8)
-  atol = kwargs.get('atol', 1.4e-8)
+  return _odeint_wrapper(func, rtol, atol, mxstep, method, y0, t, *args)
 
-  @partial(jax.jit, static_argnums=(0,))
-  def _fori_body_fun(func, i, val):
-      """Internal fori_loop body to interpolate an integral at each timestep."""
-      t, cur_y, cur_f, cur_t, dt, last_t, interp_coeff, solution, nfe = val
-      cur_y, cur_f, cur_t, dt, last_t, interp_coeff, nfe = jax.lax.while_loop(
-          lambda x: x[2] < t[i],
-          partial(_while_body_fun, func),
-          (cur_y, cur_f, cur_t, dt, last_t, interp_coeff, nfe))
+@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
+def _odeint_wrapper(func, rtol, atol, mxstep, method, y0, ts, *args):
+  y0, unravel = ravel_pytree(y0)
+  func = ravel_first_arg(func, unravel)
+  _odeint = methods[method]
+  out, nfe = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
+  return jax.vmap(unravel)(out), nfe
 
-      relative_output_time = (t[i] - last_t) / (cur_t - last_t)
-      out_x = np.polyval(interp_coeff, relative_output_time)
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
+def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
+  func_ = lambda y, t: func(y, t, *args)
 
-      return (t, cur_y, cur_f, cur_t, dt, last_t, interp_coeff,
-              jax.ops.index_update(solution,
-                                   jax.ops.index[i, :],
-                                   out_x),
-              nfe)
+  def scan_fun(carry, target_t):
 
-  @partial(jax.jit, static_argnums=(0,))
-  def _while_body_fun(func, x):
-      """Internal while_loop body to determine interpolation coefficients."""
-      cur_y, cur_f, cur_t, dt, last_t, interp_coeff, nfe = x
-      next_t = cur_t + dt
-      next_y, next_f, next_y_error, k, nfe = runge_kutta_step(
-          func, cur_y, cur_f, cur_t, dt, nfe)
-      error_ratios = error_ratio(next_y_error, rtol, atol, cur_y, next_y)
-      new_interp_coeff = interp_fit_dopri(cur_y, next_y, k, dt)
+    def cond_fun(state):
+      i, _, _, t, _, _, _ = state
+      return (t < target_t) & (i < mxstep)
+
+    def body_fun(state):
+      i, y, f, t, dt, last_t, interp_coeff = state
+      next_y, next_f, next_y_error, k = runge_kutta_step(func_, y, f, t, dt)
+      next_t = t + dt
+      error_ratios = error_ratio(next_y_error, rtol, atol, y, next_y)
+      new_interp_coeff = interp_fit_dopri(y, next_y, k, dt)
       dt = optimal_step_size(dt, error_ratios)
 
-      new_rav, unravel = ravel_pytree(
-          (next_y, next_f, next_t, dt, cur_t, new_interp_coeff))
-      old_rav, _ = ravel_pytree(
-          (cur_y, cur_f, cur_t, dt, last_t, interp_coeff))
+      new = [i + 1, next_y, next_f, next_t, dt,      t, new_interp_coeff]
+      old = [i + 1,      y,      f,      t, dt, last_t,     interp_coeff]
+      return map(partial(np.where, np.all(error_ratios <= 1.)), new, old)
 
-      return unravel(np.where(np.all(error_ratios <= 1.),
-                              new_rav,
-                              old_rav)) + (nfe,)
+    nfe = carry[-1]
+    n_steps, *carry_ = lax.while_loop(cond_fun, body_fun, [0] + carry[:-1])
+    carry = carry_ + [nfe + 6 * n_steps]
+    _, _, t, _, last_t, interp_coeff = carry[:-1]
+    relative_output_time = (target_t - last_t) / (t - last_t)
+    y_target = np.polyval(interp_coeff, relative_output_time)
+    return carry, y_target
 
-  # two function evaluations to pick initial step size
-  func = lambda y, t: ofunc(y, t, *args)
-  f0 = func(y0, t[0])
-  dt = 1.0
-  # dt = initial_step_size(func, t[0], y0, 4, rtol, atol, f0)
+  f0 = func_(y0, ts[0])
+  dt = initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0)
   interp_coeff = np.array([y0] * 5)
+  init_nfe = 2
+  init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff, init_nfe]
+  carry, ys = lax.scan(scan_fun, init_carry, ts[1:])
+  nfe = carry[-1]
+  return np.concatenate((y0[None], ys)), nfe
 
-  result = jax.lax.fori_loop(1,
-                             t.shape[0],
-                             partial(_fori_body_fun, func),
-                             (t, y0, f0, t[0], dt, t[0], interp_coeff,
-                              jax.ops.index_update(
-                                  np.zeros((t.shape[0], y0.shape[0])),
-                                  jax.ops.index[0, :],
-                                  y0),
-                              np.float64(2)))
-  solution = result[-2]
-  nfe = result[-1]
-  return solution, nfe
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
+def _adams_odeint(func, rtol, atol, mxstep, y0, ts, *args):
+  func_ = lambda y, t: func(y, t, *args)
 
+  def scan_fun(carry, target_t):
 
-def vjp_odeint(ofunc, y0, t, *args, **kwargs):
-  """Return a function that calculates `vjp(odeint(func(y, t, *args))`.
+    def cond_fun(state):
+      i, _, _, prev_t, _, _, _, _ = state
+      return (prev_t[0] < target_t) & (i < mxstep)
 
-  Args:
-    ofunc: Function `ydot = ofunc(y, t, *args)` to compute the time
-      derivative of `y`.
-    y0: initial value for the state.
-    t: Timespan for `ofunc` evaluation like `np.linspace(0., 10., 101)`.
-    *args: Additional arguments to `ofunc` beyond y0 and t.
-    **kwargs: Two relevant keyword arguments:
-      'rtol': Relative local error tolerance for solver.
-      'atol': Absolute local error tolerance for solver.
+    def body_fun(state):
+      i, y, prev_f, prev_t, next_t, prev_phi, order, nfe = state
+      y, prev_f, prev_t, next_t, prev_phi, order, cur_nfe = \
+        adaptive_adams_step(func_, y, prev_f, prev_t, next_t, prev_phi, order, target_t, rtol, atol)
+      return [i + 1, y, prev_f, prev_t, next_t, prev_phi, order, nfe + cur_nfe]
 
-  Returns:
-    VJP function `vjp = vjp_all(g)` where `yt = ofunc(y, t, *args)`
-    and g is used for VJP calculation. To evaluate the gradient w/ the VJP,
-    supply `g = np.ones_like(yt)`. To evaluate the reverse Jacobian do a vmap
-    over the standard basis of yt.
-  """
-  rtol = kwargs.get('rtol', 1.4e-8)
-  atol = kwargs.get('atol', 1.4e-8)
-  nfe = kwargs.get('nfe', False)
+    _, *carry = lax.while_loop(cond_fun, body_fun, [0] + carry)
+    y_target, *_ = carry
+    return carry, y_target
 
-  flat_args, unravel_args = ravel_pytree(args)
-  flat_func = lambda y, t, flat_args: ofunc(y, t, *unravel_args(flat_args))
+  t0 = ts[0]
+  f0 = func_(y0, t0)
+  ode_dim = f0.shape[0]
+  dt = initial_step_size(func_, t0, y0, 2, rtol, atol, f0)
 
-  @jax.jit
-  def aug_dynamics(augmented_state, t, flat_args):
-      """Original system augmented with vjp_y, vjp_t and vjp_args."""
-      state_len = int(np.floor_divide(
-          augmented_state.shape[0] - flat_args.shape[0] - 1, 2))
-      y = augmented_state[:state_len]
-      adjoint = augmented_state[state_len:2*state_len]
-      dy_dt, vjpfun = jax.vjp(flat_func, y, t, flat_args)
-      return np.hstack([np.ravel(dy_dt), np.hstack(vjpfun(-adjoint))])
+  prev_f = np.empty((_ADAMS_MAX_ORDER + 1, ode_dim))
+  prev_f = jax.ops.index_update(prev_f, 0, f0)
 
-  rev_aug_dynamics = lambda y, t, flat_args: -aug_dynamics(y, -t, flat_args)
+  prev_t = np.empty(_ADAMS_MAX_ORDER + 1)
+  prev_t = jax.ops.index_update(prev_t, 0, t0)
 
-  @jax.jit
-  def _fori_body_fun(i, val):
-    """fori_loop function for VJP calculation."""
-    rev_yt, rev_t, rev_tarray, rev_gi, vjp_y, vjp_t0, vjp_args, time_vjp_list, nfe = val
-    this_yt = rev_yt[i, :]
-    this_t = rev_t[i]
-    this_tarray = rev_tarray[i, :]
-    this_gi = rev_gi[i, :]
-    # this is g[i-1, :] when g has been reversed
-    this_gim1 = rev_gi[i+1, :]
-    state_len = this_yt.shape[0]
-    vjp_cur_t = np.dot(flat_func(this_yt, this_t, flat_args), this_gi)
-    vjp_t0 = vjp_t0 - vjp_cur_t
-    # Run augmented system backwards to the previous observation.
-    aug_y0 = np.hstack((this_yt, vjp_y, vjp_t0, vjp_args))
-    aug_ans, cur_nfe = odeint(rev_aug_dynamics,
-                              aug_y0,
-                              this_tarray,
-                              flat_args,
-                              rtol=rtol,
-                              atol=atol)
-    vjp_y = aug_ans[1][state_len:2*state_len] + this_gim1
-    vjp_t0 = aug_ans[1][2*state_len]
-    vjp_args = aug_ans[1][2*state_len+1:]
-    time_vjp_list = jax.ops.index_update(time_vjp_list, i, vjp_cur_t)
-    nfe += cur_nfe
-    return rev_yt, rev_t, rev_tarray, rev_gi, vjp_y, vjp_t0, vjp_args, time_vjp_list, nfe
+  prev_phi = np.empty((_ADAMS_MAX_ORDER, ode_dim))
+  prev_phi = jax.ops.index_update(prev_phi, 0, f0)
 
-  @jax.jit
-  def vjp_all(g, yt, t):
-    """Calculate the VJP g * Jac(odeint(ofunc(yt, t, *args), t)."""
-    rev_yt = yt[-1::-1, :]
-    rev_t = t[-1::-1]
-    rev_tarray = -np.array([t[-1:0:-1], t[-2::-1]]).T
-    rev_gi = g[-1::-1, :]
+  next_t = t0 + dt
+  init_order = 1
 
-    vjp_y = g[-1, :]
-    vjp_t0 = 0.
-    vjp_args = np.zeros_like(flat_args)
-    time_vjp_list = np.zeros_like(t)
+  init_nfe = 2
 
-    result = jax.lax.fori_loop(0,
-                               rev_t.shape[0]-1,
-                               _fori_body_fun,
-                               (rev_yt,
-                                rev_t,
-                                rev_tarray,
-                                rev_gi,
-                                vjp_y,
-                                vjp_t0,
-                                vjp_args,
-                                time_vjp_list,
-                                np.float64(0)))
+  init_carry = [y0,
+                prev_f,
+                prev_t,
+                next_t,
+                prev_phi,
+                init_order,
+                init_nfe]
 
-    time_vjp_list = jax.ops.index_update(result[-2], -1, result[-4])
-    vjp_times = np.hstack(time_vjp_list)[::-1]
-    vjp_args = unravel_args(result[-3])
-    return (result[-5], vjp_times, *vjp_args, result[-1])
+  carry, ys = lax.scan(scan_fun, init_carry, ts[1:])
+  nfe = carry[-1]
+  return np.concatenate((y0[None], ys)), nfe
 
-  primals_out, _ = odeint(flat_func, y0, t, flat_args)
-  if nfe:
-    vjp_fun = lambda g: vjp_all(g, primals_out, t)
-  else:
-    vjp_fun = lambda g: vjp_all(g, primals_out, t)[:-1]
+def _odeint_fwd(_odeint, func, rtol, atol, mxstep, y0, ts, *args):
+  ys, nfe = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
+  return (ys, nfe), (ys, ts, args)
 
-  return primals_out, vjp_fun
+def _odeint_rev(method, func, rtol, atol, mxstep, res, g):
+  ys, ts, args = res
+  g, _ = g
 
+  def aug_dynamics(augmented_state, t, *args):
+    """Original system augmented with vjp_y, vjp_t and vjp_args."""
+    y, y_bar, *_ = augmented_state
+    y_dot, vjpfun = jax.vjp(func, y, -t, *args)
+    return (-y_dot, *vjpfun(y_bar))
 
-def build_odeint(ofunc, rtol=1.4e-8, atol=1.4e-8):
-  """Return `f(y0, t, args) = odeint(ofunc(y, t, *args), y0, t, args)`.
+  y_bar = g[-1]
+  ts_bar = []
+  t0_bar = 0.
 
-  Given the function ofunc(y, t, *args), return the jitted function
-  `f(y0, t, args) = odeint(ofunc(y, t, *args), y0, t, args)` with
-  the VJP of `f` defined using `vjp_odeint`, where:
+  def scan_fun(carry, i):
+    y_bar, t0_bar, args_bar = carry
+    # Compute effect of moving measurement time
+    t_bar = np.dot(func(ys[i], ts[i], *args), g[i])
+    t0_bar = t0_bar - t_bar
+    # Run augmented system backwards to previous observation
+    _, y_bar, t0_bar, args_bar = odeint(
+        aug_dynamics, (ys[i], y_bar, t0_bar, args_bar), np.array([ts[i - 1], ts[i]]),
+        *args, rtol=rtol, atol=atol, mxstep=mxstep, method=method)[0]
+    y_bar, t0_bar, args_bar = tree_map(op.itemgetter(1), (y_bar, t0_bar, args_bar))
+    # Add gradient from current output
+    y_bar = y_bar + g[i - 1]
+    return (y_bar, t0_bar, args_bar), t_bar
 
-    `y0` is the initial condition of the ODE integration,
-    `t` is the time course of the integration, and
-    `*args` are all other arguments to `ofunc`.
+  init_carry = (g[-1], 0., tree_map(np.zeros_like, args))
+  (y_bar, t0_bar, args_bar), rev_ts_bar = lax.scan(
+      scan_fun, init_carry, np.arange(len(ts) - 1, 0, -1))
+  ts_bar = np.concatenate([np.array([t0_bar]), rev_ts_bar[::-1]])
+  return (y_bar, ts_bar, *args_bar)
 
-  Args:
-    ofunc: The function to be wrapped into an ODE integration.
-    rtol: relative local error tolerance for solver.
-    atol: absolute local error tolerance for solver.
+methods = {
+  "dopri5": _dopri5_odeint,
+  "adams": _adams_odeint
+}
+_dopri5_odeint.defvjp(partial(_odeint_fwd, _dopri5_odeint), partial(_odeint_rev, "dopri5"))
+_adams_odeint.defvjp(partial(_odeint_fwd, _adams_odeint), partial(_odeint_rev, "adams"))
 
-  Returns:
-    `f(y0, t, args) = odeint(ofunc(y, t, *args), y0, t, args)`
-  """
-  ct_odeint = jax.custom_transforms(
-      lambda y0, t, *args: odeint(ofunc, y0, t, *args, rtol=rtol, atol=atol)[0])
+def pend(np, y, _, m, g):
+  theta, omega = y
+  return [omega, -m * omega - g * np.sin(theta)]
 
-  v = lambda y0, t, *args: vjp_odeint(ofunc, y0, t, *args, rtol=rtol, atol=atol)
-  jax.defvjp_all(ct_odeint, v)
+def benchmark_odeint(fun, y0, tspace, *args, **kwargs):
+  """Time performance of JAX odeint method against scipy.integrate.odeint."""
+  n_trials = 10
+  n_repeat = 100
+  y0, tspace = onp.array(y0), onp.array(tspace)
+  onp_fun = partial(fun, onp)
+  scipy_times = []
+  for k in range(n_trials):
+    start = time.time()
+    for _ in range(n_repeat):
+      scipy_result = osp_integrate.odeint(onp_fun, y0, tspace, args)
+    end = time.time()
+    print('scipy odeint elapsed time ({} of {}): {}'.format(k+1, n_trials, end-start))
+    scipy_times.append(end - start)
+  scipy_result, infodict = osp_integrate.odeint(onp_fun, y0, tspace, args,
+                                                full_output=True,
+                                                rtol=kwargs["rtol"],
+                                                atol=kwargs["atol"])
+  sc_nfe = infodict["nfe"][-1]
+  y0, tspace = np.array(y0), np.array(tspace)
+  jax_fun = partial(fun, np)
+  jax_times = []
+  for k in range(n_trials):
+    start = time.time()
+    for _ in range(n_repeat):
+      jax_result, jax_nfe = odeint(jax_fun, y0, tspace, *args, **kwargs)
+    jax_result.block_until_ready()
+    end = time.time()
+    print('JAX odeint elapsed time ({} of {}): {}'.format(k+1, n_trials, end-start))
+    jax_times.append(end - start)
+  print('(avg scipy time) / (avg jax time) = {}'.format(
+      onp.mean(scipy_times[1:]) / onp.mean(jax_times[1:])))
+  print('norm(scipy result-jax result): {}'.format(
+      np.linalg.norm(np.asarray(scipy_result) - jax_result)))
+  print("jax nfe, scipy nfe", jax_nfe, sc_nfe)
+  return scipy_result, jax_result
 
-  return jax.jit(ct_odeint)
+def pend_benchmark_odeint(**kwargs):
+  _, _ = benchmark_odeint(pend, [np.pi - 0.1, 0.0], np.linspace(0., 10., 2),
+                          0.25, 9.8, **kwargs)
+
+def pend_check_grads(method):
+  def f(y0, ts, *args):
+    return odeint(partial(pend, np), y0, ts, *args, method=method)[0]
+
+  y0 = [np.pi - 0.1, 0.0]
+  ts = np.linspace(0., 1., 11)
+  args = (0.25, 9.8)
+
+  check_grads(f, (y0, ts, *args), modes=["rev"], order=2,
+              atol=1e-1, rtol=1e-1)
+
+def _max_abs(tensor):
+    return np.max(np.abs(tensor))
+
+def _rel_error(true, estimate):
+    return _max_abs((true - estimate) / true)
+
+def const_test(**kwargs):
+  a = 0.2
+  b = 3.
+  f = lambda y, t: a + (y - (a * t + b)) ** 5
+  exact = lambda t: a * t + b
+
+  t_points = np.linspace(1, 8, 2)
+  sol = exact(t_points)
+  y0 = sol[0]
+  ys, nfe = odeint(f, y0, t_points, **kwargs)
+  sc_ys, infodict = osp_integrate.odeint(f, onp.array(y0), onp.array(t_points),
+                                         full_output=True,
+                                         rtol=kwargs["rtol"],
+                                         atol=kwargs["atol"])
+  sc_nfe = infodict["nfe"][-1]
+  print("Constant\t(abs, rel, nfe, sc_nfe)\t%.4e, %.4e, %d, %d" % (_max_abs(sol - ys), _rel_error(sol, ys), nfe, sc_nfe))
+
+def linear_test(**kwargs):
+  dim = 10
+  rng = jax.random.PRNGKey(0)
+  U = jax.random.normal(rng, (dim, dim)) * 0.1
+  A = 2 * U - (U + U.T)
+  initial_val = np.ones((dim, 1))
+
+  f = lambda np, y, t: np.dot(A, y)
+  def exact(t):
+    ans = []
+    for t_i in t:
+        ans.append(np.matmul(scipy.linalg.expm(A * t_i), initial_val))
+    return np.stack([np.array(ans_) for ans_ in ans]).reshape(len(t), dim)
+
+  t_points = np.linspace(1, 8, 2)
+  sol = exact(t_points)
+  y0 = sol[0]
+  ys, nfe = odeint(partial(f, np), y0, t_points, **kwargs)
+  sc_ys, infodict = osp_integrate.odeint(partial(f, onp), onp.array(y0), onp.array(t_points),
+                                         full_output=True,
+                                         rtol=kwargs["rtol"],
+                                         atol=kwargs["atol"])
+  sc_nfe = infodict["nfe"][-1]
+  print("Linear\t\t(abs, rel, nfe, sc_nfe)\t%.4e, %.4e, %d, %d" % (_max_abs(sol - ys), _rel_error(sol, ys), nfe, sc_nfe))
+
+def sin_test(**kwargs):
+  f = lambda np, y, t: 2 * y / t + t**4 * np.sin(2 * t) - t**2 + 4 * t**3
+  exact = lambda t: -0.5 * t**4 * np.cos(2 * t) + 0.5 * t**3 * np.sin(2 * t) + 0.25 * t**2 * np.cos(2 * t) - \
+                    t**3 + 2 * t**4 + (np.pi - 0.25) * t**2
+
+  t_points = np.linspace(1, 8, 2)
+  sol = exact(t_points)
+  y0 = sol[0]
+  ys, nfe = odeint(partial(f, np), y0, t_points, **kwargs)
+  sc_ys, infodict = osp_integrate.odeint(partial(f, onp), onp.array(y0), onp.array(t_points),
+                                         full_output=True,
+                                         rtol=kwargs["rtol"],
+                                         atol=kwargs["atol"])
+  sc_nfe = infodict["nfe"][-1]
+  print("Sine\t\t(abs, rel, nfe, sc_nfe)\t%.4e, %.4e, %d, %d" % (_max_abs(sol - ys), _rel_error(sol, ys), nfe, sc_nfe))
+
+if __name__ == '__main__':
+  kwargs = {
+    "method": "dopri5",
+    "atol": 1e-3,
+    "rtol": 1e-3
+  }
+  const_test(**kwargs)
+  linear_test(**kwargs)
+  sin_test(**kwargs)
+  pend_benchmark_odeint(**kwargs)
+  pend_check_grads(kwargs["method"])
+  print("method\t\t", kwargs["method"])
