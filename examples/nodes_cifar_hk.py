@@ -15,7 +15,7 @@ from jax import lax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import build_odeint, odeint
+from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
@@ -27,6 +27,8 @@ parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=0)
 parser.add_argument('--atol', type=float, default=1e-3)
 parser.add_argument('--rtol', type=float, default=1e-3)
+parser.add_argument('--method', type=str, default="dopri5")
+parser.add_argument('--init_step', type=float, default=-1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
 parser.add_argument('--test_freq', type=int, default=5000)
 parser.add_argument('--save_freq', type=int, default=5000)
@@ -51,9 +53,12 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 num_blocks = parse_args.num_blocks
-atol = parse_args.atol
-rtol = parse_args.rtol
-
+ode_kwargs = {
+    "atol": parse_args.atol,
+    "rtol": parse_args.rtol,
+    "method": parse_args.method,
+    "init_step": parse_args.init_step
+}
 
 # some primitive functions
 # TODO: implement primitives to allow numerical stability
@@ -427,21 +432,21 @@ def init_model():
                 dydt = dynamics_wrap(y, t, params)
                 drdt = reg_dynamics(y, t, params)
                 return jnp.concatenate((dydt, drdt))
-            nodeint = build_odeint(aug_dynamics, atol=atol, rtol=rtol)
+            nodeint = lambda y0, t, params: odeint(aug_dynamics, y0, t, params, **ode_kwargs)
         else:
-            nodeint = build_odeint(dynamics_wrap, atol=atol, rtol=rtol)
+            nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)
 
         def ode(params, out_pre_ode):
             """
             Apply the ODE block.
             """
-            flat_out_ode = nodeint(aug_init(out_pre_ode), ts, params)[-1]
+            flat_out_ode = nodeint(aug_init(out_pre_ode), ts, params)[0][-1]
             out_ode, out_ode_r = unpack_aug(flat_out_ode, ode_dim)
             out_ode = jnp.reshape(out_ode, in_ode_shape)
             return out_ode, out_ode_r
 
         if count_nfe:
-            unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params)
+            unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)
 
             @jax.jit
             def nfe_fn(params, _images, _labels):
