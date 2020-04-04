@@ -226,6 +226,24 @@ class JaxprTrace(Trace):
       return out_tracers
     return out, todo
 
+  def process_custom_jvp_call(self, prim, fun, jvp, tracers):
+    # We form jaxprs using JaxprTraces for two distinct purposes: to stage
+    # program representations completely out of the JAX system (e.g. for XLA
+    # using jit or pmap), and to build a representation of a function that may
+    # require further JAX transformations (e.g. in "initial-style" higher-order
+    # primitives, like for control flow). In particular, in the latter case we
+    # need custom differentiation rules to stick around, but in the former we do
+    # not. This method call should only be reachable in the former case, and so
+    # we check that the former case is indicated (with a StagingJaxprTrace) and
+    # then drop the differentiation rules.
+    assert self.master.trace_type is StagingJaxprTrace
+    return fun.call_wrapped(*tracers)
+
+  def process_custom_vjp_call(self, prim, fun, fwd, bwd, tracers, out_trees):
+    # See comment in the above process_custom_jvp_call method.
+    assert self.master.trace_type is StagingJaxprTrace
+    return fun.call_wrapped(*tracers)
+
 # This subclass is used just for its type tag, which switches the behavior of
 # process_call to stage out into the jaxpr any call primitives encountered
 # (rather than doing partial evaluation into the call).
@@ -254,8 +272,8 @@ custom_partial_eval_rules: Dict[core.Primitive, Callable] = {}
 call_partial_eval_rules: Dict[core.Primitive, Callable] = {}
 
 
-def partial_eval(f, trace, pvs):
-  f = trace_to_subjaxpr(f, trace.master, False)
+def partial_eval(f, trace, pvs, instantiate=False):
+  f = trace_to_subjaxpr(f, trace.master, instantiate)
   return partial_eval_wrapper(f, tuple(pvs))
 
 
@@ -271,7 +289,7 @@ def partial_eval_wrapper(avals, *consts):
 def abstract_eval_fun(fun, *avals, **params):
   pvals_in = [PartialVal((a, unit)) for a in avals]
   _, pvals_out, _ = trace_to_jaxpr(lu.wrap_init(fun, params), pvals_in,
-                                  instantiate=True)
+                                  instantiate=True, stage_out=True)
   avals_out, _ = unzip2(pvals_out)
   for aval_out in avals_out:
     assert isinstance(aval_out, AbstractValue)  # instantiate=True
@@ -285,8 +303,8 @@ class JaxprTracer(Tracer):
     assert isinstance(pval, PartialVal)
     pv, const = pval
     if isinstance(const, Tracer) and const._trace.level >= trace.level:
-      core.escaped_tracer_error(
-        "Tracer from a higher level: {} in trace {}".format(const, trace))
+      raise core.escaped_tracer_error(
+          "Tracer from a higher level: {} in trace {}".format(const, trace))
     self._trace = trace
     self.pval = pval
     self.recipe = recipe
@@ -349,8 +367,8 @@ def partial_val_aval(pv, const):
     raise TypeError(pv)
 
 def trace_to_jaxpr(fun: lu.WrappedFun, pvals: Sequence[PartialVal],
-                   instantiate=False, stage_out_calls=False, bottom=False):
-  trace_type = StagingJaxprTrace if stage_out_calls else JaxprTrace
+                   instantiate=False, stage_out=False, bottom=False):
+  trace_type = StagingJaxprTrace if stage_out else JaxprTrace
   with new_master(trace_type, bottom=bottom) as master:
     fun = trace_to_subjaxpr(fun, master, instantiate)
     jaxpr, (out_pvals, consts, env) = fun.call_wrapped(pvals)
@@ -452,7 +470,8 @@ def tracers_to_jaxpr(in_tracers, out_tracers):
         processed_eqn_ids.add(recipe.eqn_id)
     elif isinstance(recipe, LambdaBinding):
       if not any(t is in_tracer for in_tracer in in_tracers):
-        core.escaped_tracer_error("Tracer not among input tracers {}".format(t))
+        raise core.escaped_tracer_error(
+            "Tracer not among input tracers {}".format(t))
       assert in_tracers, "Lambda binding with no args"
     elif isinstance(recipe, FreeVar):
       env[getvar(t)] = recipe.val
@@ -557,11 +576,7 @@ def _remat_partial_eval(trace, _, f, tracers, params):
   # Using the instantiated tracers, run call_bind like JaxprTrace.process_call.
   in_pvs, in_consts = unzip2(t.pval for t in instantiated_tracers)
   fun, aux = partial_eval(f, trace, in_pvs)
-  if concrete:
-    # TODO(mattjj): remove `remat_context` when confident no accidental FLOPs
-    with remat_context():
-      out_flat = remat_call_p.bind(fun, *in_consts, **params)
-  else:
+  with core.initial_style_staging():
     out_flat = remat_call_p.bind(fun, *in_consts, **params)
   out_pvs, jaxpr, env = aux()
   env = map(trace.full_raise, env)
@@ -643,23 +658,6 @@ def _reconstruct_pval(pval1, const2, unknown):
       return PartialVal((None, pv1.val))
     else:
       return PartialVal((None, const2))
-
-# TODO(mattjj): for https://github.com/google/jax/pull/1749 we allowed
-# standard_abstract_eval to perform concrete evaluation (i.e. FLOPs), but we
-# don't think it should happen except for in a remat context
-@contextlib.contextmanager
-def remat_context():
-  try:
-    prev_state = _thread_local_state.remat
-    _thread_local_state.remat = True
-    yield
-  finally:
-    _thread_local_state.remat = prev_state
-
-class _ThreadLocalState(threading.local):
-  def __init__(self):
-    self.remat = False
-_thread_local_state = _ThreadLocalState()
 
 
 def move_binders_to_front(typed_jaxpr, to_move):

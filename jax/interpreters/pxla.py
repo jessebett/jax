@@ -46,11 +46,10 @@ _map = safe_map
 
 def identity(x): return x
 
-def shard_args(backend, devices, assignments, axis_size, args):
+def shard_args(devices, assignments, axis_size, args):
   """Shard each argument data array along its leading axis.
 
   Args:
-    backend: the platform to be used
     devices: list of Devices mapping replica index to a physical device.
     assignments: list of integers with the same length as `devices` mapping
       replica index to an index along the leading axis (i.e. a shard).
@@ -125,6 +124,8 @@ def shard_aval(size, aval):
 shard_aval_handlers: Dict[Type[core.AbstractValue], Callable[[int, Any], Any]] = {}
 shard_aval_handlers[core.AbstractUnit] = lambda size, x: x
 def _shard_abstract_array(size, x):
+  if not x.shape:
+    raise ValueError("Scalar cannot be split across {} shards.".format(size))
   if x.shape[0] != size:
     raise ValueError("Axis size {} does not match leading dimension of "
                      "shape {}".format(size, x.shape))
@@ -248,6 +249,43 @@ parallel_pure_rules: Dict[core.Primitive, Callable] = {}
 
 
 def axis_index(axis_name):
+  """Return the index along the pmapped axis ``axis_name``.
+
+  Args:
+    axis_name: hashable Python object used to name the pmapped axis (see the
+      ``pmap`` docstring for more details).
+
+  Returns:
+    An integer representing the index.
+
+  For example, with 8 XLA devices available:
+
+  >>> from functools import partial
+  >>> @partial(pmap, axis_name='i')
+  ... def f(_):
+  ...   return lax.axis_index('i')
+  ...
+  >>> f(np.zeros(4))
+  ShardedDeviceArray([0, 1, 2, 3], dtype=int32)
+  >>> f(np.zeros(8))
+  ShardedDeviceArray([0, 1, 2, 3, 4, 5, 6, 7], dtype=int32)
+  >>> @partial(pmap, axis_name='i')
+  ... @partial(pmap, axis_name='j')
+  ... def f(_):
+  ...   return lax.axis_index('i'), lax.axis_index('j')
+  ...
+  >>> x, y = f(np.zeros((4, 2)))
+  >>> print(x)
+  [[0 0]
+   [1 1]
+   [2 2]
+   [3 3]]
+  >>> print(y)
+  [[0 1]
+   [0 1]
+   [0 1]
+   [0 1]]
+  """
   dynamic_axis_env = _thread_local_state.dynamic_axis_env
   frame = dynamic_axis_env[axis_name]
   sizes = dynamic_axis_env.sizes[:dynamic_axis_env.index(frame)+1]
@@ -459,7 +497,7 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
   # We add a dummy first invar, to carry the trace details to `dynamic_fun`
   pval = pe.PartialVal([core.abstract_unit, core.unit])  # dummy value for axis env
   jaxpr, out_pvals, consts = pe.trace_to_jaxpr(
-      dynamic_fun, [pval] + pvals, instantiate=False, stage_out_calls=True, bottom=True)
+      dynamic_fun, [pval] + pvals, instantiate=False, stage_out=True, bottom=True)
   jaxpr.invars = jaxpr.invars[1:]  # ignore dummy
 
   out_pvs, out_consts = unzip2(out_pvals)
@@ -535,21 +573,22 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
                        % (num_global_replicas, len(devices)))
 
   device_assignment = tuple(d.id for d in devices)
-  compiled = built.Compile(
-      compile_options=xb.get_compile_options(
+  compile_options = xb.get_compile_options(
           num_replicas=num_global_replicas,
           num_partitions=1,
-          device_assignment=device_assignment),
-      backend=xb.get_backend(backend))
+          device_assignment=device_assignment)
+  compile_options.tuple_arguments = tuple_args
+  compiled = built.Compile(compile_options=compile_options,
+                           backend=xb.get_backend(backend))
 
-  handle_args = partial(shard_args, backend, compiled.local_devices(),
+  handle_args = partial(shard_args, compiled.local_devices(),
                         assign_shards_to_replicas(num_local_replicas, axis_size),
                         axis_size)
   handle_outs = _pvals_to_results_handler(axis_size, num_local_replicas,
                                           out_pvals, compiled.local_devices(),
                                           backend)
-  return partial(execute_replicated, compiled, backend, handle_args, handle_outs,
-                 tuple_args)
+  return partial(execute_replicated, compiled, backend, handle_args,
+                 handle_outs)
 
 multi_host_supported_collectives: Set[core.Primitive] = set()
 
@@ -630,11 +669,9 @@ def _pval_to_result_handler(axis_size, nrep, pval, devices, backend):
   else:
     return aval_to_result_handler(axis_size, nrep, pv)
 
-def execute_replicated(compiled, backend, in_handler, out_handler, tuple_args,
-                       *args):
+def execute_replicated(compiled, backend, in_handler, out_handler, *args):
   input_bufs = in_handler(args)
-  out_bufs = compiled.ExecuteOnLocalDevices(
-      list(input_bufs), tuple_arguments=tuple_args)
+  out_bufs = compiled.ExecuteOnLocalDevices(list(input_bufs))
   return out_handler(out_bufs)
 
 
@@ -666,7 +703,7 @@ def _pmap_translation_rule(c, axis_env,
       c, call_jaxpr, backend, new_env, (),
       extend_name_stack(name_stack, wrap_name(name, 'pmap')), *in_nodes_sharded)
   out_avals = [v.aval for v in call_jaxpr.outvars]
-  outs = [_xla_unshard(c, aval, new_env, shard)
+  outs = [_xla_unshard(c, aval, new_env, shard, backend=backend)
           for aval, shard in zip(out_avals, sharded_outs)]
   return c.Tuple(*outs)
 
@@ -686,17 +723,30 @@ def _xla_shard(c, aval, axis_env, x):
     raise TypeError((aval, c.GetShape(x)))
 
 # TODO(b/110096942): more efficient gather
-def _xla_unshard(c, aval, axis_env, x):
+def _xla_unshard(c, aval, axis_env, x, backend):
   if aval is core.abstract_unit:
     return x
   elif isinstance(aval, ShapedArray):
-    dims = list(c.GetShape(x).dimensions())
-    padded = c.Broadcast(c.Constant(onp.array(0, aval.dtype)),
-                          [axis_env.sizes[-1]] + dims)
+    # TODO(mattjj): remove this logic when AllReduce PRED supported on CPU / GPU
+    convert_bool = (onp.issubdtype(aval.dtype, onp.bool_)
+                    and xb.get_backend(backend).platform in ('cpu', 'gpu'))
+    if convert_bool:
+      x = c.ConvertElementType(x, xb.dtype_to_etype(onp.float32))
+
+    xla_shape = c.GetShape(x)
+    dims = list(xla_shape.dimensions())
+    padded = c.Broadcast(c.Constant(onp.array(0, xla_shape.numpy_dtype())),
+                         [axis_env.sizes[-1]] + dims)
     zero = c.Constant(onp.zeros((), dtype=onp.uint32))
     idxs = [_unravel_index(c, axis_env)] + [zero] * len(dims)
     padded = c.DynamicUpdateSlice(padded, c.Reshape(x, None, [1] + dims), idxs)
-    return c.CrossReplicaSum(padded, xla.axis_groups(axis_env, axis_env.names[-1]))
+    out = c.CrossReplicaSum(padded, xla.axis_groups(axis_env, axis_env.names[-1]))
+
+    # TODO(mattjj): remove this logic when AllReduce PRED supported on CPU / GPU
+    if convert_bool:
+      nonzero = c.Ne(out, c.Constant(onp.array(0, dtype=onp.float32)))
+      out = c.ConvertElementType(nonzero, xb.dtype_to_etype(onp.bool_))
+    return out
   else:
     raise TypeError((aval, c.GetShape(x)))
 
