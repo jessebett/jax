@@ -28,6 +28,7 @@ parser.add_argument('--lam_w', type=float, default=0)
 parser.add_argument('--atol', type=float, default=1e-3)
 parser.add_argument('--rtol', type=float, default=1e-3)
 parser.add_argument('--method', type=str, default="dopri5")
+parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=-1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
 parser.add_argument('--test_freq', type=int, default=1)
@@ -52,6 +53,7 @@ rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
+vmap = False if parse_args.no_vmap is True else True
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
@@ -501,11 +503,17 @@ def init_model():
                 dydt = dynamics_wrap(y, t, params)
                 drdt = reg_dynamics(y, t, params)
                 return dydt, drdt
-            nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, y0, t, params, **ode_kwargs)[0],
-                               (0, None, None), 1)
+            if vmap:
+                nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, y0, t, params, **ode_kwargs)[0],
+                                   (0, None, None), 1)
+            else:
+                nodeint = lambda y0, t, params: odeint(aug_dynamics, y0, t, params, **ode_kwargs)[0]
         else:
-            nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0],
-                               (0, None, None), 1)
+            if vmap:
+                nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0],
+                                   (0, None, None), 1)
+            else:
+                nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0]
 
         def ode(params, out_pre_ode):
             """
@@ -515,8 +523,11 @@ def init_model():
             return out_ode[-1], out_ode_r[-1]
 
         if count_nfe:
-            unreg_nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
-                                     (0, None, None))
+            if vmap:
+                unreg_nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
+                                         (0, None, None))
+            else:
+                unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
 
             @jax.jit
             def nfe_fn(params, state, _images, _labels):
