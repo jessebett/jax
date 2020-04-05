@@ -706,7 +706,7 @@ def run():
         """
         _epoch = train_itr // num_batches
         id = lambda x: x
-        return lax.cond(_epoch < 75, 1e-1, id, 0,
+        return lax.cond(_epoch < 75, 1e-2, id, 0,
                         lambda _: lax.cond(_epoch < 125, 1e-2, id, 0,
                                            lambda _: lax.cond(_epoch < 175, 1e-3, id, 1e-3, id)))
 
