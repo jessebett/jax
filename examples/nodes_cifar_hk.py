@@ -75,9 +75,7 @@ def softplus(z, threshold=20):
   """
   Numerically stable softplus.
   """
-  return sigmoid(z)
-  # return jax.nn.relu(z)
-  # return jnp.where(z >= threshold, z, jnp.log1p(jnp.exp(z)))
+  return jnp.where(z >= threshold, z, jnp.log1p(jnp.exp(z)))
 
 
 def softmax_cross_entropy(logits, labels):
@@ -188,11 +186,11 @@ class ResBlock(hk.Module):
 
     def __call__(self, x, is_training):
         out = self.bn1(x, is_training=is_training)
-        out = softplus(out)
+        out = jax.nn.relu(out)
         shortcut = self.shortcut(out) if self.has_shortcut else x
         out = self.conv1(out)
         out = self.bn2(out, is_training=is_training)
-        out = softplus(out)
+        out = jax.nn.relu(out)
         out = self.conv2(out)
         out += shortcut
         return out
@@ -243,14 +241,6 @@ def aug_init(y):
     (has width, height, and channels).
     """
     return y, jnp.zeros(y.shape[0])
-
-
-def unpack_aug(yr, ode_dim):
-    """
-    Unpack the dynamics according to the structure in aug_init.
-    """
-    batch_size = yr.size // (ode_dim + 1)
-    return yr[:-batch_size], yr[-batch_size:]
 
 
 def _acc_fn(logits, labels):
@@ -306,6 +296,44 @@ class PreODE(hk.Module):
         return self.model(x)
 
 
+class PreODERes(hk.Module):
+    """
+    PreODE and beginngin of resnet.
+    """
+    def __init__(self,
+                 block_nums,
+                 bn_config=None,
+                 channels_per_group=(64, 128, 256)):
+        super(PreODERes, self).__init__()
+        self.model = PreODE()
+        bn_config = dict(bn_config or {})
+        bn_config.setdefault("decay_rate", 0.9)
+        bn_config.setdefault("eps", 1e-5)
+        bn_config.setdefault("create_scale", True)
+        bn_config.setdefault("create_offset", True)
+
+        assert len(block_nums) == 3
+        assert len(channels_per_group) == 3
+
+        self._block_groups = []
+        strides = (1, 2, 2)
+        for i in range(3):
+            block_group = []
+            for j in range(block_nums[i]):
+                block_group.append(ResBlock(in_channels=64,
+                                            output_channels=channels_per_group[i],
+                                            bn_config=bn_config,
+                                            stride=(1 if j else strides[i])))
+            self._block_groups.append(block_group)
+
+    def __call__(self, x, is_training):
+        x = self.model(x)
+        for block_group in self._block_groups:
+            for block in block_group:
+                x = block(x, is_training)
+        return x
+
+
 class ConcatConv2D(hk.Module):
     """
     Convolution with extra channel and skip connection for time.
@@ -343,11 +371,12 @@ class Dynamics(hk.Module):
                                   with_bias=False)
 
     def __call__(self, x, t):
+        # vmapping means x will be a single batch element, so need to expand dims at 0
         x = jnp.reshape(x, self.input_shape)
 
-        out = softplus(x)
+        out = sigmoid(x)
         out = self.conv1(out, t)
-        out = softplus(out)
+        out = sigmoid(out)
         out = self.conv2(out, t)
 
         return out
@@ -372,6 +401,44 @@ class PostODE(hk.Module):
         return self.model(x)
 
 
+class PostODERes(hk.Module):
+    """
+    Module applied after the ODE layer, including last bit of resnet.
+    """
+    def __init__(self,
+                 block_nums,
+                 bn_config=None,
+                 channels_per_group=(512, )):
+        super(PostODERes, self).__init__()
+        self.model = PostODE()
+        bn_config = dict(bn_config or {})
+        bn_config.setdefault("decay_rate", 0.9)
+        bn_config.setdefault("eps", 1e-5)
+        bn_config.setdefault("create_scale", True)
+        bn_config.setdefault("create_offset", True)
+
+        assert len(block_nums) == 1
+        assert len(channels_per_group) == 1
+
+        self._block_groups = []
+        strides = (2, )
+        for i in range(1):
+            block_group = []
+            for j in range(block_nums[i]):
+                block_group.append(ResBlock(in_channels=64,
+                                            output_channels=channels_per_group[i],
+                                            bn_config=bn_config,
+                                            stride=(1 if j else strides[i])))
+            self._block_groups.append(block_group)
+
+    def __call__(self, x, is_training):
+        for block_group in self._block_groups:
+            for block in block_group:
+                x = block(x, is_training)
+        x = self.model(x)
+        return x
+
+
 def initialization_data(input_shape, in_ode_shape, out_ode_shape):
     """
     Data for initializing the modules.
@@ -394,14 +461,19 @@ def init_model():
     ts = jnp.array([0., 1.])
 
     input_shape = (1, 32, 32, 3)
-    in_ode_shape = (-1, 32, 32, 64)
+    in_ode_shape = (-1, 8, 8, 256)
     out_ode_shape = (-1, 4, 4, 512)
 
     initialization_data_ = initialization_data(input_shape, in_ode_shape, out_ode_shape)
 
-    pre_ode = hk.transform(wrap_module(PreODE))
-    pre_ode_params = pre_ode.init(rng, initialization_data_["pre_ode"])
-    pre_ode_fn = pre_ode.apply
+    if odenet:
+        pre_ode = hk.transform_with_state(wrap_module(PreODERes, [2, 2, 1]))
+        pre_ode_params, pre_ode_state = pre_ode.init(rng, initialization_data_["pre_ode"], is_training=True)
+        pre_ode_fn = lambda params, state, x, is_training: pre_ode.apply(params, state, None, x, is_training=is_training)
+    else:
+        pre_ode = hk.transform(wrap_module(PreODE))
+        pre_ode_params = pre_ode.init(rng, initialization_data_["pre_ode"])
+        pre_ode_fn = pre_ode.apply
 
     if odenet:
         # TODO: how to do analagous multiple blocks
@@ -447,11 +519,11 @@ def init_model():
                                      (0, None, None))
 
             @jax.jit
-            def nfe_fn(params, _images, _labels):
+            def nfe_fn(params, state, _images, _labels):
                 """
                 Function to return NFE.
                 """
-                in_ode = pre_ode.apply(params["pre_ode"], _images)
+                in_ode, _ = pre_ode_fn(params["pre_ode"], state["pre_ode"], _images, is_training=False)
                 f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
                 return jnp.mean(f_nfe)
 
@@ -466,9 +538,14 @@ def init_model():
         resnet_params, resnet_state = resnet.init(rng, initialization_data_["res"], is_training=True)
         resnet_fn = lambda params, state, x, is_training: resnet.apply(params, state, None, x, is_training=is_training)
 
-    post_ode = hk.transform(wrap_module(PostODE))
-    post_ode_params = post_ode.init(rng, initialization_data_["post_ode"])
-    post_ode_fn = post_ode.apply
+    if odenet:
+        post_ode = hk.transform_with_state(wrap_module(PostODERes, [2, ]))
+        post_ode_params, post_ode_state = post_ode.init(rng, initialization_data_["post_ode"], is_training=True)
+        post_ode_fn = lambda params, state, x, is_training: post_ode.apply(params, state, None, x, is_training=is_training)
+    else:
+        post_ode = hk.transform(wrap_module(PostODE))
+        post_ode_params = post_ode.init(rng, initialization_data_["post_ode"])
+        post_ode_fn = post_ode.apply
 
     # return a dictionary of the three components of the model
     model = {
@@ -480,7 +557,11 @@ def init_model():
             "pre_ode": pre_ode_params,
             "post_ode": post_ode_params
         },
-        "state": None if odenet else resnet_state
+        "state": {
+            "pre_ode": pre_ode_state if odenet else None,
+            "resnet": None if odenet else resnet_state,
+            "post_ode": post_ode_state if odenet else None
+        }
     }
 
     if odenet:
@@ -496,15 +577,21 @@ def init_model():
         Forward pass of the model.
         """
         model_ = model["model"]
-        out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
-        if odenet:
-            out_ode, regs = model_["ode"](params["ode"], out_pre_ode)
-        else:
-            out_ode, state = model_["res"](params["res"], state, out_pre_ode, is_training=is_training)
-            regs = jnp.zeros(_images.shape[0])
-        logits = model_["post_ode"](params["post_ode"], out_ode)
 
-        return logits, regs, state
+        new_state = collections.defaultdict(lambda: None)
+        if odenet:
+            out_pre_ode, new_state["pre_ode"] = \
+                model_["pre_ode"](params["pre_ode"], state["pre_ode"], _images, is_training=is_training)
+            out_ode, regs = model_["ode"](params["ode"], out_pre_ode)
+            logits, new_state["post_ode"] = \
+                model_["post_ode"](params["post_ode"], state["post_ode"], out_ode, is_training=is_training)
+        else:
+            out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
+            out_ode, new_state["res"] = model_["res"](params["res"], state["res"], out_pre_ode, is_training=is_training)
+            regs = jnp.zeros(_images.shape[0])
+            logits = model_["post_ode"](params["post_ode"], out_ode)
+
+        return logits, regs, new_state
 
     return forward, model
 
@@ -652,7 +739,7 @@ def run():
                 sep_losses(opt_state, state, test_batch)
 
             if count_nfe:
-                nfe.append(model["nfe"](get_params(opt_state), *test_batch))
+                nfe.append(model["nfe"](get_params(opt_state), state, *test_batch))
             else:
                 nfe.append(0)
 
