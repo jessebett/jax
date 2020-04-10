@@ -804,6 +804,10 @@ def run():
                 outfile = open(param_filename, "wb")
                 pickle.dump(fargs, outfile)
                 outfile.close()
+
+            outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_iter.txt" % (dirname, reg, lam, num_blocks), "a")
+            outfile.write("Iter: {:04d}\n".format(itr))
+            outfile.close()
     meta = {
         "info": info,
         "args": parse_args
