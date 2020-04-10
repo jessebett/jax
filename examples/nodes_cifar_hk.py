@@ -19,7 +19,7 @@ from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=200)
+parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=200)
 parser.add_argument('--lr', type=float, default=1e-2)
@@ -364,13 +364,14 @@ class Dynamics(hk.Module):
                                   kernel_shape=3,
                                   stride=1,
                                   padding=lambda _: (1, 1),
-                                  with_bias=False)
-        self.conv2 = ConcatConv2D(output_channels=output_channels,
-                                  kernel_shape=3,
-                                  stride=1,
-                                  padding=lambda _: (1, 1),
                                   w_init=jnp.zeros,
                                   with_bias=False)
+        # self.conv2 = ConcatConv2D(output_channels=output_channels,
+        #                           kernel_shape=3,
+        #                           stride=1,
+        #                           padding=lambda _: (1, 1),
+        #                           w_init=jnp.zeros,
+        #                           with_bias=False)
 
     def __call__(self, x, t):
         # vmapping means x will be a single batch element, so need to expand dims at 0
@@ -378,8 +379,8 @@ class Dynamics(hk.Module):
 
         out = sigmoid(x)
         out = self.conv1(out, t)
-        out = sigmoid(out)
-        out = self.conv2(out, t)
+        # out = sigmoid(out)
+        # out = self.conv2(out, t)
 
         return out
 
