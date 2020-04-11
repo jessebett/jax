@@ -305,7 +305,7 @@ class PreODERes(hk.Module):
     def __init__(self,
                  block_nums,
                  bn_config=None,
-                 channels_per_group=(64, 128, 256, 512)):
+                 channels_per_group=(64, 64, 64, 64)):
         super(PreODERes, self).__init__()
         self.model = PreODE()
         bn_config = dict(bn_config or {})
@@ -411,7 +411,7 @@ class PostODERes(hk.Module):
     def __init__(self,
                  block_nums,
                  bn_config=None,
-                 channels_per_group=(512, )):
+                 channels_per_group=(64, )):
         super(PostODERes, self).__init__()
         self.model = PostODE()
         bn_config = dict(bn_config or {})
@@ -464,8 +464,8 @@ def init_model():
     ts = jnp.array([0., 1.])
 
     input_shape = (1, 32, 32, 3)
-    in_ode_shape = (-1, 4, 4, 512)
-    out_ode_shape = (-1, 4, 4, 512)
+    in_ode_shape = (-1, 4, 4, 64)
+    out_ode_shape = (-1, 4, 4, 64)
 
     initialization_data_ = initialization_data(input_shape, in_ode_shape, out_ode_shape)
 
@@ -507,7 +507,7 @@ def init_model():
                 nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params, **ode_kwargs)[0],
                                    (0, None, None), 1)
             else:
-                nodeint = lambda y0, t, params: odeint(aug_dynamics, y0, t, params, **ode_kwargs)[0]
+                nodeint = lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params, **ode_kwargs)[0]
         else:
             if vmap:
                 nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0],
