@@ -19,7 +19,7 @@ from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=100)
+parser.add_argument('--batch_size', type=int, default=200)
 parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=200)
 parser.add_argument('--lr', type=float, default=1e-2)
@@ -504,7 +504,7 @@ def init_model():
                 drdt = reg_dynamics(y, t, params)
                 return dydt, drdt
             if vmap:
-                nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, y0, t, params, **ode_kwargs)[0],
+                nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params, **ode_kwargs)[0],
                                    (0, None, None), 1)
             else:
                 nodeint = lambda y0, t, params: odeint(aug_dynamics, y0, t, params, **ode_kwargs)[0]
@@ -519,7 +519,7 @@ def init_model():
             """
             Apply the ODE block.
             """
-            out_ode, out_ode_r = nodeint(aug_init(out_pre_ode), ts, params)
+            out_ode, out_ode_r = nodeint(out_pre_ode, ts, params)
             return out_ode[-1], out_ode_r[-1]
 
         if count_nfe:
