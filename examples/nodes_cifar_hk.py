@@ -29,7 +29,7 @@ parser.add_argument('--atol', type=float, default=1e-7)
 parser.add_argument('--rtol', type=float, default=1e-7)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
-parser.add_argument('--init_step', type=float, default=-1.)
+parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
 parser.add_argument('--test_freq', type=int, default=1)
 parser.add_argument('--save_freq', type=int, default=5000)
@@ -305,7 +305,7 @@ class PreODERes(hk.Module):
     def __init__(self,
                  block_nums,
                  bn_config=None,
-                 channels_per_group=(64, 128, 256)):
+                 channels_per_group=(64, 128, 256, 512)):
         super(PreODERes, self).__init__()
         self.model = PreODE()
         bn_config = dict(bn_config or {})
@@ -314,12 +314,12 @@ class PreODERes(hk.Module):
         bn_config.setdefault("create_scale", True)
         bn_config.setdefault("create_offset", True)
 
-        assert len(block_nums) == 3
-        assert len(channels_per_group) == 3
+        assert len(block_nums) == 4
+        assert len(channels_per_group) == 4
 
         self._block_groups = []
-        strides = (1, 2, 2)
-        for i in range(3):
+        strides = (1, 2, 2, 2)
+        for i in range(4):
             block_group = []
             for j in range(block_nums[i]):
                 block_group.append(ResBlock(in_channels=64,
@@ -361,9 +361,9 @@ class Dynamics(hk.Module):
         self.input_shape = input_shape
         output_channels = input_shape[-1]
         self.conv1 = ConcatConv2D(output_channels=output_channels,
-                                  kernel_shape=3,
+                                  kernel_shape=1,
                                   stride=1,
-                                  padding=lambda _: (1, 1),
+                                  padding="SAME",
                                   w_init=jnp.zeros,
                                   with_bias=False)
         # self.conv2 = ConcatConv2D(output_channels=output_channels,
@@ -464,13 +464,13 @@ def init_model():
     ts = jnp.array([0., 1.])
 
     input_shape = (1, 32, 32, 3)
-    in_ode_shape = (-1, 8, 8, 256)
+    in_ode_shape = (-1, 4, 4, 512)
     out_ode_shape = (-1, 4, 4, 512)
 
     initialization_data_ = initialization_data(input_shape, in_ode_shape, out_ode_shape)
 
     if odenet:
-        pre_ode = hk.transform_with_state(wrap_module(PreODERes, [2, 2, 1]))
+        pre_ode = hk.transform_with_state(wrap_module(PreODERes, [2, 2, 2, 1]))
         pre_ode_params, pre_ode_state = pre_ode.init(rng, initialization_data_["pre_ode"], is_training=True)
         pre_ode_fn = lambda params, state, x, is_training: pre_ode.apply(params, state, None, x, is_training=is_training)
     else:
@@ -479,7 +479,6 @@ def init_model():
         pre_ode_fn = pre_ode.apply
 
     if odenet:
-        # TODO: how to do analagous multiple blocks
         dynamics = hk.transform(wrap_module(Dynamics, in_ode_shape))
         dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
         dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
@@ -550,14 +549,9 @@ def init_model():
         resnet_params, resnet_state = resnet.init(rng, initialization_data_["res"], is_training=True)
         resnet_fn = lambda params, state, x, is_training: resnet.apply(params, state, None, x, is_training=is_training)
 
-    if odenet:
-        post_ode = hk.transform_with_state(wrap_module(PostODERes, [2, ]))
-        post_ode_params, post_ode_state = post_ode.init(rng, initialization_data_["post_ode"], is_training=True)
-        post_ode_fn = lambda params, state, x, is_training: post_ode.apply(params, state, None, x, is_training=is_training)
-    else:
-        post_ode = hk.transform(wrap_module(PostODE))
-        post_ode_params = post_ode.init(rng, initialization_data_["post_ode"])
-        post_ode_fn = post_ode.apply
+    post_ode = hk.transform(wrap_module(PostODE))
+    post_ode_params = post_ode.init(rng, initialization_data_["post_ode"])
+    post_ode_fn = post_ode.apply
 
     # return a dictionary of the three components of the model
     model = {
@@ -572,7 +566,7 @@ def init_model():
         "state": {
             "pre_ode": pre_ode_state if odenet else None,
             "resnet": None if odenet else resnet_state,
-            "post_ode": post_ode_state if odenet else None
+            "post_ode": None
         }
     }
 
@@ -595,8 +589,7 @@ def init_model():
             out_pre_ode, new_state["pre_ode"] = \
                 model_["pre_ode"](params["pre_ode"], state["pre_ode"], _images, is_training=is_training)
             out_ode, regs = model_["ode"](params["ode"], out_pre_ode)
-            logits, new_state["post_ode"] = \
-                model_["post_ode"](params["post_ode"], state["post_ode"], out_ode, is_training=is_training)
+            logits = model_["post_ode"](params["post_ode"], out_ode)
         else:
             out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
             out_ode, new_state["res"] = model_["res"](params["res"], state["res"], out_pre_ode, is_training=is_training)
