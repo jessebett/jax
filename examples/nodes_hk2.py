@@ -144,11 +144,12 @@ class ResBlock(hk.Module):
                                with_bias=False)
 
     def __call__(self, x):
-        out = sigmoid(x)
-        out = self.conv1(out)
-        out = sigmoid(out)
-        out = self.conv2(out)
-        return x + out
+        # out = sigmoid(x)
+        # out = self.conv1(out)
+        # out = sigmoid(out)
+        # out = self.conv2(out)
+        # return x + out
+        return x
 
 
 class PreODE(hk.Module):
@@ -158,18 +159,20 @@ class PreODE(hk.Module):
 
     def __init__(self):
         super(PreODE, self).__init__()
-        # self.model = hk.Sequential([
-        #     hk.Conv2D(output_channels=64,
-        #               kernel_shape=3,
-        #               stride=1,
-        #               padding=lambda _: (1, 1),
-        #               with_bias=False),
-        # ])
-        self.flatten = Flatten()
+        self.model = hk.Sequential([
+            hk.Conv2D(output_channels=64,
+                      kernel_shape=3,
+                      stride=1,
+                      padding="VALID"),
+            sigmoid,
+            hk.Conv2D(output_channels=64,
+                      kernel_shape=4,
+                      stride=2,
+                      padding=lambda _: (1, 1)),
+        ])
 
     def __call__(self, x):
-        # return self.model(x)
-        return self.flatten(x)
+        return self.model(x)
 
 
 class Dynamics(hk.Module):
@@ -249,7 +252,7 @@ class PostODE(hk.Module):
             # hk.AvgPool(window_shape=(1, 4, 4, 1),
             #            strides=(1, 1, 1, 1),
             #            padding="VALID"),
-            # Flatten(),
+            Flatten(),
             hk.Linear(10)
         ])
 
@@ -280,9 +283,9 @@ def initialization_data(input_shape, in_ode_shape, out_ode_shape):
     out_ode_dim = jnp.prod(out_ode_shape[1:])
     data = {
         "pre_ode": jnp.zeros(input_shape),
-        "ode": (jnp.zeros(in_ode_dim), 0.),
+        "ode": (jnp.zeros(in_ode_shape), 0.),
         "res": jnp.zeros(in_ode_shape),
-        "post_ode": jnp.zeros(out_ode_dim) if odenet or True else jnp.zeros(out_ode_shape)
+        "post_ode": jnp.zeros(out_ode_shape) if odenet or True else jnp.zeros(out_ode_shape)
     }
     return data
 
@@ -294,8 +297,8 @@ def init_model():
     ts = jnp.array([0., 1.])
 
     input_shape = (1, 28, 28, 1)
-    in_ode_shape = (-1, 28, 28, 1)
-    out_ode_shape = (-1, 28, 28, 1)
+    in_ode_shape = (-1, 13, 13, 64)
+    out_ode_shape = (-1, 13, 13, 64)
 
     initialization_data_ = initialization_data(input_shape, in_ode_shape, out_ode_shape)
 
@@ -309,7 +312,7 @@ def init_model():
         pre_ode_fn = pre_ode.apply
 
     if odenet:
-        dynamics = hk.transform(wrap_module(MLPDynamics, in_ode_shape))
+        dynamics = hk.transform(wrap_module(Dynamics, in_ode_shape))
         dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
         dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
         if reg:
@@ -542,7 +545,6 @@ def run():
                                            lambda _: lax.cond(_epoch < 140, 1e-3, id, 1e-4, id)))
 
     opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
-    # opt_init, opt_update, get_params = optimizers.adam(step_size=parse_args.lr)
     opt_state = opt_init(model["params"])
 
     @jax.jit
