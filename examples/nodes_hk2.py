@@ -19,7 +19,7 @@ from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=200)
+parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=160)
 parser.add_argument('--lr', type=float, default=1e-2)
@@ -214,16 +214,26 @@ class MLPDynamics(hk.Module):
         super(MLPDynamics, self).__init__()
         self.input_shape = input_shape
         self.dim = jnp.prod(input_shape[1:])
-        self.lin1 = hk.Linear(self.dim)
+        self.hidden_dim = 100
+        self.lin1 = hk.Linear(self.hidden_dim,
+                              with_bias=False)
+        self.lin2 = hk.Linear(self.dim,
+                              w_init=jnp.zeros,
+                              with_bias=False)
 
     def __call__(self, x, t):
         # vmapping means x will be a single batch element, so need to expand dims at 0
         x = jnp.reshape(x, (-1, self.dim))
-        tt = jnp.ones_like(x[:, :1]) * t
 
         out = sigmoid(x)
+        tt = jnp.ones_like(x[:, :1]) * t
         t_out = jnp.concatenate([tt, out], axis=-1)
         out = self.lin1(t_out)
+
+        out = sigmoid(out)
+        tt = jnp.ones_like(out[:, :1]) * t
+        t_out = jnp.concatenate([tt, out], axis=-1)
+        out = self.lin2(t_out)
 
         return out
 
@@ -531,8 +541,8 @@ def run():
                         lambda _: lax.cond(_epoch < 100, 1e-2, id, 0,
                                            lambda _: lax.cond(_epoch < 140, 1e-3, id, 1e-4, id)))
 
-    # opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
-    opt_init, opt_update, get_params = optimizers.adam(step_size=parse_args.lr)
+    opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
+    # opt_init, opt_update, get_params = optimizers.adam(step_size=parse_args.lr)
     opt_state = opt_init(model["params"])
 
     @jax.jit
