@@ -25,8 +25,8 @@ parser.add_argument('--nepochs', type=int, default=160)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=0)
-parser.add_argument('--atol', type=float, default=1e-3)
-parser.add_argument('--rtol', type=float, default=1e-3)
+parser.add_argument('--atol', type=float, default=1e-8)
+parser.add_argument('--rtol', type=float, default=1e-8)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
@@ -501,7 +501,7 @@ def run():
         """
         _epoch = train_itr // num_batches
         id = lambda x: x
-        return lax.cond(_epoch < 60, 1, id, 0,
+        return lax.cond(_epoch < 60, 1., id, 0,
                         lambda _: lax.cond(_epoch < 100, 1e-1, id, 0,
                                            lambda _: lax.cond(_epoch < 140, 1e-2, id, 1e-3, id)))
 
