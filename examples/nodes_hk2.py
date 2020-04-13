@@ -37,7 +37,7 @@ parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resnet', action="store_true")
 parser.add_argument('--no_count_nfe', action="store_true")
-parser.add_argument('--num_blocks', type=int, default=6)
+parser.add_argument('--num_blocks', type=int, default=0)
 parse_args = parser.parse_args()
 
 
@@ -169,6 +169,11 @@ class PreODE(hk.Module):
                       kernel_shape=4,
                       stride=2,
                       padding=lambda _: (1, 1)),
+            sigmoid,
+            hk.Conv2D(output_channels=64,
+                      kernel_shape=4,
+                      stride=2,
+                      padding=lambda _: (1, 1))
         ])
 
     def __call__(self, x):
@@ -249,9 +254,9 @@ class PostODE(hk.Module):
     def __init__(self):
         super(PostODE, self).__init__()
         self.model = hk.Sequential([
-            # hk.AvgPool(window_shape=(1, 4, 4, 1),
-            #            strides=(1, 1, 1, 1),
-            #            padding="VALID"),
+            hk.AvgPool(window_shape=(1, 4, 4, 1),
+                       strides=(1, 1, 1, 1),
+                       padding="VALID"),
             Flatten(),
             hk.Linear(10)
         ])
@@ -297,8 +302,8 @@ def init_model():
     ts = jnp.array([0., 1.])
 
     input_shape = (1, 28, 28, 1)
-    in_ode_shape = (-1, 13, 13, 64)
-    out_ode_shape = (-1, 13, 13, 64)
+    in_ode_shape = (-1, 6, 6, 64)
+    out_ode_shape = (-1, 6, 6, 64)
 
     initialization_data_ = initialization_data(input_shape, in_ode_shape, out_ode_shape)
 
