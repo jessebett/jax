@@ -37,7 +37,7 @@ parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resnet', action="store_true")
 parser.add_argument('--no_count_nfe', action="store_true")
-parser.add_argument('--num_blocks', type=int, default=0)
+parser.add_argument('--num_blocks', type=int, default=6)
 parse_args = parser.parse_args()
 
 
@@ -144,12 +144,11 @@ class ResBlock(hk.Module):
                                with_bias=False)
 
     def __call__(self, x):
-        # out = sigmoid(x)
-        # out = self.conv1(out)
-        # out = sigmoid(out)
-        # out = self.conv2(out)
-        # return x + out
-        return x
+        out = sigmoid(x)
+        out = self.conv1(out)
+        out = sigmoid(out)
+        out = self.conv2(out)
+        return x + out
 
 
 class PreODE(hk.Module):
