@@ -501,9 +501,9 @@ def run():
         """
         _epoch = train_itr // num_batches
         id = lambda x: x
-        return lax.cond(_epoch < 60, 1e-1, id, 0,
-                        lambda _: lax.cond(_epoch < 100, 1e-2, id, 0,
-                                           lambda _: lax.cond(_epoch < 140, 1e-3, id, 1e-4, id)))
+        return lax.cond(_epoch < 60, 1, id, 0,
+                        lambda _: lax.cond(_epoch < 100, 1e-1, id, 0,
+                                           lambda _: lax.cond(_epoch < 140, 1e-2, id, 1e-3, id)))
 
     opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
     opt_state = opt_init(model["params"])
