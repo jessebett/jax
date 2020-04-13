@@ -531,7 +531,8 @@ def run():
                         lambda _: lax.cond(_epoch < 100, 1e-2, id, 0,
                                            lambda _: lax.cond(_epoch < 140, 1e-3, id, 1e-4, id)))
 
-    opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
+    # opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
+    opt_init, opt_update, get_params = optimizers.adam(step_size=parse_args.lr)
     opt_state = opt_init(model["params"])
 
     @jax.jit
