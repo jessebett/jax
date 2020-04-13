@@ -165,10 +165,11 @@ class PreODE(hk.Module):
         #               padding=lambda _: (1, 1),
         #               with_bias=False),
         # ])
+        self.flatten = Flatten()
 
     def __call__(self, x):
         # return self.model(x)
-        return x
+        return self.flatten(x)
 
 
 class Dynamics(hk.Module):
@@ -204,6 +205,29 @@ class Dynamics(hk.Module):
         return out
 
 
+class MLPDynamics(hk.Module):
+    """
+    Dynamics for ODE as an MLP.
+    """
+
+    def __init__(self, input_shape):
+        super(MLPDynamics, self).__init__()
+        self.input_shape = input_shape
+        self.dim = jnp.prod(input_shape[1:])
+        self.lin1 = hk.Linear(self.dim)
+
+    def __call__(self, x, t):
+        # vmapping means x will be a single batch element, so need to expand dims at 0
+        x = jnp.reshape(x, (-1, self.dim))
+        tt = jnp.ones_like(x[:, :1]) * t
+
+        out = sigmoid(x)
+        t_out = jnp.concatenate([tt, out], axis=-1)
+        out = self.lin1(t_out)
+
+        return out
+
+
 class PostODE(hk.Module):
     """
     Module applied after the ODE layer.
@@ -212,10 +236,10 @@ class PostODE(hk.Module):
     def __init__(self):
         super(PostODE, self).__init__()
         self.model = hk.Sequential([
-            hk.AvgPool(window_shape=(1, 4, 4, 1),
-                       strides=(1, 1, 1, 1),
-                       padding="VALID"),
-            Flatten(),
+            # hk.AvgPool(window_shape=(1, 4, 4, 1),
+            #            strides=(1, 1, 1, 1),
+            #            padding="VALID"),
+            # Flatten(),
             hk.Linear(10)
         ])
 
@@ -241,12 +265,14 @@ def initialization_data(input_shape, in_ode_shape, out_ode_shape):
     Data for initializing the modules.
     """
     in_ode_shape = (1, ) + in_ode_shape[1:]
+    in_ode_dim = jnp.prod(in_ode_shape[1:])
     out_ode_shape = (1, ) + out_ode_shape[1:]
+    out_ode_dim = jnp.prod(out_ode_shape[1:])
     data = {
         "pre_ode": jnp.zeros(input_shape),
-        "ode": (jnp.zeros(in_ode_shape), 0.),
+        "ode": (jnp.zeros(in_ode_dim), 0.),
         "res": jnp.zeros(in_ode_shape),
-        "post_ode": jnp.zeros(in_ode_shape) if odenet or True else jnp.zeros(out_ode_shape)
+        "post_ode": jnp.zeros(out_ode_dim) if odenet or True else jnp.zeros(out_ode_shape)
     }
     return data
 
@@ -273,7 +299,7 @@ def init_model():
         pre_ode_fn = pre_ode.apply
 
     if odenet:
-        dynamics = hk.transform(wrap_module(Dynamics, in_ode_shape))
+        dynamics = hk.transform(wrap_module(MLPDynamics, in_ode_shape))
         dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
         dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
         if reg:
