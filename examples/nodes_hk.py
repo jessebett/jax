@@ -14,7 +14,7 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 from jax.experimental import optimizers
-from jax.experimental.ode import build_odeint, odeint
+from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
@@ -26,7 +26,7 @@ parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--atol', type=float, default=1e-3)
 parser.add_argument('--rtol', type=float, default=1e-3)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=600)
+parser.add_argument('--test_freq', type=int, default=1)
 parser.add_argument('--save_freq', type=int, default=600)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
