@@ -217,6 +217,7 @@ class PreODE(hk.Module):
     def __init__(self):
         super(PreODE, self).__init__()
         self.model = hk.Sequential([
+            lambda x: x / 255.,
             hk.Conv2D(output_channels=64,
                       kernel_shape=3,
                       stride=1,
@@ -469,7 +470,7 @@ def init_data():
         label = tf.cast(label, tf.int32)
 
         # normalize image
-        img /= 255.
+        # img = img / 255.
 
         return img, label
 
