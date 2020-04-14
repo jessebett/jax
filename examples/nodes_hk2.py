@@ -31,7 +31,7 @@ parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=600)
+parser.add_argument('--test_freq', type=int, default=3000)
 parser.add_argument('--save_freq', type=int, default=3000)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
@@ -342,7 +342,9 @@ def init_model():
                 drdt = reg_dynamics(y, t, params)
                 return dydt, drdt
             if vmap:
-                nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params, **ode_kwargs)[0],
+                # manually set batch size to be 1 since vmapping
+                nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, aug_init(y0, 1),
+                                                                t, params, **ode_kwargs)[0],
                                    (0, None, None), 1)
             else:
                 nodeint = lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params, **ode_kwargs)[0]
@@ -430,13 +432,15 @@ def init_model():
     return forward, model
 
 
-def aug_init(y):
+def aug_init(y, batch_size=-1):
     """
     Flatten the dynamics and append regularization dynamics.
     We need to flatten the dynamics first since they may be convolutional
     (has width, height, and channels).
     """
-    return y, jnp.zeros(y.shape[0])
+    if batch_size == -1:
+        batch_size = y.shape[0]
+    return y, jnp.zeros(batch_size)
 
 
 def _acc_fn(logits, labels):
