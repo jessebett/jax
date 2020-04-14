@@ -31,7 +31,7 @@ parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=3000)
+parser.add_argument('--test_freq', type=int, default=600)
 parser.add_argument('--save_freq', type=int, default=3000)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
@@ -158,22 +158,26 @@ class PreODE(hk.Module):
 
     def __init__(self):
         super(PreODE, self).__init__()
+        # self.model = hk.Sequential([
+        #     lambda x: x.astype(jnp.float32) / 255.,
+        #     hk.Conv2D(output_channels=64,
+        #               kernel_shape=3,
+        #               stride=1,
+        #               padding="VALID"),
+        #     sigmoid,
+        #     hk.Conv2D(output_channels=64,
+        #               kernel_shape=4,
+        #               stride=2,
+        #               padding=lambda _: (1, 1)),
+        #     sigmoid,
+        #     hk.Conv2D(output_channels=64,
+        #               kernel_shape=4,
+        #               stride=2,
+        #               padding=lambda _: (1, 1))
+        # ])
         self.model = hk.Sequential([
             lambda x: x.astype(jnp.float32) / 255.,
-            hk.Conv2D(output_channels=64,
-                      kernel_shape=3,
-                      stride=1,
-                      padding="VALID"),
-            sigmoid,
-            hk.Conv2D(output_channels=64,
-                      kernel_shape=4,
-                      stride=2,
-                      padding=lambda _: (1, 1)),
-            sigmoid,
-            hk.Conv2D(output_channels=64,
-                      kernel_shape=4,
-                      stride=2,
-                      padding=lambda _: (1, 1))
+            Flatten()
         ])
 
     def __call__(self, x):
@@ -222,11 +226,10 @@ class MLPDynamics(hk.Module):
         self.input_shape = input_shape
         self.dim = jnp.prod(input_shape[1:])
         self.hidden_dim = 100
-        self.lin1 = hk.Linear(self.hidden_dim,
-                              with_bias=False)
-        self.lin2 = hk.Linear(self.dim,
-                              w_init=jnp.zeros,
-                              with_bias=False)
+        self.lin1 = hk.Linear(self.hidden_dim)
+        # self.lin2 = hk.Linear(self.dim,
+        #                       w_init=jnp.zeros,
+        #                       with_bias=False)
 
     def __call__(self, x, t):
         # vmapping means x will be a single batch element, so need to expand dims at 0
@@ -237,10 +240,10 @@ class MLPDynamics(hk.Module):
         t_out = jnp.concatenate([tt, out], axis=-1)
         out = self.lin1(t_out)
 
-        out = sigmoid(out)
-        tt = jnp.ones_like(out[:, :1]) * t
-        t_out = jnp.concatenate([tt, out], axis=-1)
-        out = self.lin2(t_out)
+        # out = sigmoid(out)
+        # tt = jnp.ones_like(out[:, :1]) * t
+        # t_out = jnp.concatenate([tt, out], axis=-1)
+        # out = self.lin2(t_out)
 
         return out
 
@@ -254,10 +257,10 @@ class PostODE(hk.Module):
         super(PostODE, self).__init__()
         self.model = hk.Sequential([
             sigmoid,
-            hk.AvgPool(window_shape=(1, 6, 6, 1),
-                       strides=(1, 1, 1, 1),
-                       padding="VALID"),
-            Flatten(),
+            # hk.AvgPool(window_shape=(1, 6, 6, 1),
+            #            strides=(1, 1, 1, 1),
+            #            padding="VALID"),
+            # Flatten(),
             hk.Linear(10)
         ])
 
@@ -313,7 +316,7 @@ def init_model():
         pre_ode_fn = pre_ode.apply
 
     if odenet:
-        dynamics = hk.transform(wrap_module(Dynamics, ode_shape))
+        dynamics = hk.transform(wrap_module(MLPDynamics, ode_shape))
         dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
         dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
         if reg:
