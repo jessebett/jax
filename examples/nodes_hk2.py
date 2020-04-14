@@ -1,5 +1,5 @@
 """
-Neural ODEs on MNIST with no downsampling before ODE, implemented with Haiku.
+Neural ODEs in MNIST, implemented with Haiku.
 """
 import argparse
 import collections
@@ -13,7 +13,6 @@ import tensorflow_datasets as tfds
 import jax
 from jax import lax
 import jax.numpy as jnp
-from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
 from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
@@ -24,14 +23,10 @@ parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=160)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
-parser.add_argument('--lam_w', type=float, default=0)
-parser.add_argument('--atol', type=float, default=1e-8)
-parser.add_argument('--rtol', type=float, default=1e-8)
-parser.add_argument('--method', type=str, default="dopri5")
-parser.add_argument('--no_vmap', action="store_true")
-parser.add_argument('--init_step', type=float, default=1.)
+parser.add_argument('--atol', type=float, default=1e-3)
+parser.add_argument('--rtol', type=float, default=1e-3)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=1)
+parser.add_argument('--test_freq', type=int, default=3000)
 parser.add_argument('--save_freq', type=int, default=3000)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
@@ -47,20 +42,14 @@ assert os.path.exists(parse_args.dirname)
 
 reg = parse_args.reg
 lam = parse_args.lam
-lam_w = parse_args.lam_w
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
-vmap = False if parse_args.no_vmap is True else True
 num_blocks = parse_args.num_blocks
-ode_kwargs = {
-    "atol": parse_args.atol,
-    "rtol": parse_args.rtol,
-    "method": parse_args.method,
-    "init_step": parse_args.init_step
-}
+atol = parse_args.atol
+rtol = parse_args.rtol
 
 
 # some primitive functions
@@ -69,6 +58,7 @@ def sigmoid(z):
   Numerically stable sigmoid.
   """
   return 1/(1 + jnp.exp(-z))
+  # return jnp.where(z >= 0, 1/(1 + jnp.exp(-z)), jnp.exp(z) / (1 + jnp.exp(z)))
 
 
 def softmax_cross_entropy(logits, labels):
@@ -109,19 +99,37 @@ class Flatten(hk.Module):
         return jnp.reshape(x, (x.shape[0], -1))
 
 
-class ConcatConv2D(hk.Module):
+class ConcatConv2d(hk.Module):
     """
     Convolution with extra channel and skip connection for time.
     """
 
     def __init__(self, **kwargs):
-        super(ConcatConv2D, self).__init__()
+        super(ConcatConv2d, self).__init__()
         self._layer = hk.Conv2D(**kwargs)
 
     def __call__(self, x, t):
         tt = jnp.ones_like(x[:, :, :, :1]) * t
         ttx = jnp.concatenate([tt, x], axis=-1)
         return self._layer(ttx)
+
+
+class LayerNorm(hk.Module):
+    """
+    Layer normalization.
+    """
+
+    def __init__(self, ):
+        super(LayerNorm, self).__init__()
+        self._layer = hk.BatchNorm(create_scale=True,
+                                   create_offset=True,
+                                   axis=[1, 2, 3])
+
+    def __call__(self, x):
+        # for Layer Norm we always use test-time statistics
+        return self._layer(inputs=x,
+                           test_local_stats=True,
+                           is_training=True)
 
 
 class ResBlock(hk.Module):
@@ -131,11 +139,13 @@ class ResBlock(hk.Module):
 
     def __init__(self, output_channels):
         super(ResBlock, self).__init__()
+        # self.norm1 = LayerNorm()
         self.conv1 = hk.Conv2D(output_channels=output_channels,
                                kernel_shape=3,
                                stride=1,
                                padding=lambda _: (1, 1),
                                with_bias=False)
+        # self.norm2 = LayerNorm()
         self.conv2 = hk.Conv2D(output_channels=output_channels,
                                kernel_shape=3,
                                stride=1,
@@ -144,11 +154,59 @@ class ResBlock(hk.Module):
                                with_bias=False)
 
     def __call__(self, x):
+        # out = self.norm1(x)
         out = sigmoid(x)
         out = self.conv1(out)
+        # out = self.norm2(out)
         out = sigmoid(out)
         out = self.conv2(out)
         return x + out
+
+
+def aug_init(y):
+    """
+    Flatten the dynamics and append regularization dynamics.
+    We need to flatten the dynamics first since they may be convolutional
+    (has width, height, and channels).
+    """
+    return jnp.concatenate((jnp.ravel(y), jnp.zeros(y.shape[0])))
+
+
+def unpack_aug(yr, ode_dim):
+    """
+    Unpack the dynamics according to the structure in aug_init.
+    """
+    batch_size = yr.size // (ode_dim + 1)
+    return yr[:-batch_size], yr[-batch_size:]
+
+
+def _acc_fn(logits, labels):
+    """
+    Classification accuracy of the model.
+    """
+    predicted_class = jnp.argmax(logits, axis=1)
+    return jnp.mean(predicted_class == labels)
+
+
+def _loss_fn(logits, labels):
+    return jnp.mean(softmax_cross_entropy(logits, labels))
+
+
+def _reg_loss_fn(reg):
+    return jnp.mean(reg)
+
+
+def wrap_module(module, *module_args):
+    """
+    Wrap the module in a function to be transformed.
+    """
+    def wrap(*args):
+        """
+        Wrapping of module.
+        """
+        model = module(*module_args)
+        return model(*args)
+    return wrap
 
 
 class PreODE(hk.Module):
@@ -159,15 +217,18 @@ class PreODE(hk.Module):
     def __init__(self):
         super(PreODE, self).__init__()
         self.model = hk.Sequential([
+            lambda x: x.astype(jnp.float32) / 255.,
             hk.Conv2D(output_channels=64,
                       kernel_shape=3,
                       stride=1,
                       padding="VALID"),
+            # LayerNorm(),
             sigmoid,
             hk.Conv2D(output_channels=64,
                       kernel_shape=4,
                       stride=2,
                       padding=lambda _: (1, 1)),
+            # LayerNorm(),
             sigmoid,
             hk.Conv2D(output_channels=64,
                       kernel_shape=4,
@@ -188,60 +249,28 @@ class Dynamics(hk.Module):
         super(Dynamics, self).__init__()
         self.input_shape = input_shape
         output_channels = input_shape[-1]
-        self.conv1 = ConcatConv2D(output_channels=output_channels,
+        # self.norm1 = LayerNorm()
+        self.conv1 = ConcatConv2d(output_channels=output_channels,
                                   kernel_shape=3,
                                   stride=1,
-                                  padding=lambda _: (1, 1),
-                                  with_bias=False)
-        self.conv2 = ConcatConv2D(output_channels=output_channels,
+                                  padding=lambda _: (1, 1))
+        # self.norm2 = LayerNorm()
+        self.conv2 = ConcatConv2d(output_channels=output_channels,
                                   kernel_shape=3,
                                   stride=1,
                                   padding=lambda _: (1, 1),
                                   w_init=jnp.zeros,
-                                  with_bias=False)
+                                  b_init=jnp.zeros)
 
     def __call__(self, x, t):
-        # vmapping means x will be a single batch element, so need to expand dims at 0
         x = jnp.reshape(x, self.input_shape)
-
+        # out = self.norm1(x)
         out = sigmoid(x)
         out = self.conv1(out, t)
+        # out = self.norm2(x)
         out = sigmoid(out)
         out = self.conv2(out, t)
-
-        return out
-
-
-class MLPDynamics(hk.Module):
-    """
-    Dynamics for ODE as an MLP.
-    """
-
-    def __init__(self, input_shape):
-        super(MLPDynamics, self).__init__()
-        self.input_shape = input_shape
-        self.dim = jnp.prod(input_shape[1:])
-        self.hidden_dim = 100
-        self.lin1 = hk.Linear(self.hidden_dim,
-                              with_bias=False)
-        self.lin2 = hk.Linear(self.dim,
-                              w_init=jnp.zeros,
-                              with_bias=False)
-
-    def __call__(self, x, t):
-        # vmapping means x will be a single batch element, so need to expand dims at 0
-        x = jnp.reshape(x, (-1, self.dim))
-
-        out = sigmoid(x)
-        tt = jnp.ones_like(x[:, :1]) * t
-        t_out = jnp.concatenate([tt, out], axis=-1)
-        out = self.lin1(t_out)
-
-        out = sigmoid(out)
-        tt = jnp.ones_like(out[:, :1]) * t
-        t_out = jnp.concatenate([tt, out], axis=-1)
-        out = self.lin2(t_out)
-
+        out = jnp.ravel(out)
         return out
 
 
@@ -253,6 +282,7 @@ class PostODE(hk.Module):
     def __init__(self):
         super(PostODE, self).__init__()
         self.model = hk.Sequential([
+            # LayerNorm(),
             sigmoid,
             hk.AvgPool(window_shape=(1, 6, 6, 1),
                        strides=(1, 1, 1, 1),
@@ -265,32 +295,16 @@ class PostODE(hk.Module):
         return self.model(x)
 
 
-def wrap_module(module, *module_args, **module_kwargs):
-    """
-    Wrap the module in a function to be transformed.
-    """
-    def wrap(*args, **kwargs):
-        """
-        Wrapping of module.
-        """
-        model = module(*module_args, **module_kwargs)
-        return model(*args, **kwargs)
-    return wrap
-
-
-def initialization_data(input_shape, in_ode_shape, out_ode_shape):
+def initialization_data(input_shape, ode_shape):
     """
     Data for initializing the modules.
     """
-    in_ode_shape = (1, ) + in_ode_shape[1:]
-    in_ode_dim = jnp.prod(in_ode_shape[1:])
-    out_ode_shape = (1, ) + out_ode_shape[1:]
-    out_ode_dim = jnp.prod(out_ode_shape[1:])
+    ode_shape = (1, ) + ode_shape[1:]
     data = {
         "pre_ode": jnp.zeros(input_shape),
-        "ode": (jnp.zeros(in_ode_shape), 0.),
-        "res": jnp.zeros(in_ode_shape),
-        "post_ode": jnp.zeros(out_ode_shape) if odenet or True else jnp.zeros(out_ode_shape)
+        "ode": (jnp.ravel(jnp.zeros(ode_shape)), 0.),
+        "res": jnp.zeros(ode_shape),
+        "post_ode": jnp.zeros(ode_shape)
     }
     return data
 
@@ -302,22 +316,17 @@ def init_model():
     ts = jnp.array([0., 1.])
 
     input_shape = (1, 28, 28, 1)
-    in_ode_shape = (-1, 6, 6, 64)
-    out_ode_shape = (-1, 6, 6, 64)
+    ode_shape = (-1, 6, 6, 64)
+    ode_dim = jnp.prod(ode_shape[1:])
 
-    initialization_data_ = initialization_data(input_shape, in_ode_shape, out_ode_shape)
+    initialization_data_ = initialization_data(input_shape, ode_shape)
 
-    if odenet:
-        pre_ode = hk.transform(wrap_module(PreODE))
-        pre_ode_params = pre_ode.init(rng, initialization_data_["pre_ode"])
-        pre_ode_fn = pre_ode.apply
-    else:
-        pre_ode = hk.transform(wrap_module(PreODE))
-        pre_ode_params = pre_ode.init(rng, initialization_data_["pre_ode"])
-        pre_ode_fn = pre_ode.apply
+    pre_ode = hk.transform(wrap_module(PreODE))
+    pre_ode_params = pre_ode.init(rng, initialization_data_["pre_ode"])
+    pre_ode_fn = pre_ode.apply
 
     if odenet:
-        dynamics = hk.transform(wrap_module(Dynamics, in_ode_shape))
+        dynamics = hk.transform(wrap_module(Dynamics, ode_shape))
         dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
         dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
         if reg:
@@ -325,63 +334,54 @@ def init_model():
                 """
                 Dynamics of regularization for ODE integration.
                 """
+                batch_size = y.size // ode_dim
                 if reg == "none":
-                    return jnp.zeros(y.shape[0])
+                    return jnp.zeros(batch_size)
                 else:
                     # do r3 regularization
                     y0, y_n = sol_recursive(lambda _y, _t: dynamics_wrap(_y, _t, params), y, t)
-                    r = y_n[-1]
-                    return jnp.sum(r ** 2, axis=[axis_ for axis_ in range(1, r.ndim)])
+                    r = jnp.reshape(y_n[-1], (-1, ode_dim))
+                    return jnp.sum(r ** 2, axis=1)
 
             def aug_dynamics(yr, t, params):
                 """
                 Dynamics augmented with regularization.
                 """
-                y, r = yr
+                y, r = unpack_aug(yr, ode_dim)
                 dydt = dynamics_wrap(y, t, params)
                 drdt = reg_dynamics(y, t, params)
-                return dydt, drdt
-            if vmap:
-                nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params, **ode_kwargs)[0],
-                                   (0, None, None), 1)
-            else:
-                nodeint = lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params, **ode_kwargs)[0]
+                return jnp.concatenate((dydt, drdt))
+            nodeint = build_odeint(aug_dynamics, atol=atol, rtol=rtol)
         else:
-            if vmap:
-                nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0],
-                                   (0, None, None), 1)
-            else:
-                nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0]
+            nodeint = build_odeint(dynamics_wrap, atol=atol, rtol=rtol)
 
         def ode(params, out_pre_ode):
             """
             Apply the ODE block.
             """
-            out_ode, out_ode_r = nodeint(out_pre_ode, ts, params)
-            return out_ode[-1], out_ode_r[-1]
+            flat_out_ode = nodeint(aug_init(out_pre_ode), ts, params)[-1]
+            out_ode, out_ode_r = unpack_aug(flat_out_ode, ode_dim)
+            out_ode = jnp.reshape(out_ode, ode_shape)
+            return out_ode, out_ode_r
 
         if count_nfe:
-            if vmap:
-                unreg_nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
-                                         (0, None, None))
-            else:
-                unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
+            unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params)
 
             @jax.jit
             def nfe_fn(params, _images, _labels):
                 """
                 Function to return NFE.
                 """
-                in_ode = pre_ode_fn(params["pre_ode"], _images)
-                f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
-                return jnp.mean(f_nfe)
+                in_ode = jnp.ravel(pre_ode.apply(params["pre_ode"], _images))
+                _, f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
+                return f_nfe
 
         else:
             nfe_fn = None
 
     else:
         resnet = hk.transform(wrap_module(
-            lambda: hk.Sequential([ResBlock(in_ode_shape[-1]) for _ in range(num_blocks)])))
+            lambda: hk.Sequential([ResBlock(ode_shape[-1]) for _ in range(num_blocks)])))
         resnet_params = resnet.init(rng, initialization_data_["res"])
         resnet_fn = resnet.apply
 
@@ -414,50 +414,17 @@ def init_model():
         Forward pass of the model.
         """
         model_ = model["model"]
-
+        out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
         if odenet:
-            out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
             out_ode, regs = model_["ode"](params["ode"], out_pre_ode)
-            logits = model_["post_ode"](params["post_ode"], out_ode)
         else:
-            out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
             out_ode = model_["res"](params["res"], out_pre_ode)
             regs = jnp.zeros(_images.shape[0])
-            logits = model_["post_ode"](params["post_ode"], out_ode)
+        logits = model_["post_ode"](params["post_ode"], out_ode)
 
         return logits, regs
 
     return forward, model
-
-
-def aug_init(y):
-    """
-    Flatten the dynamics and append regularization dynamics.
-    We need to flatten the dynamics first since they may be convolutional
-    (has width, height, and channels).
-    """
-    return y, jnp.zeros(y.shape[0])
-
-
-def _acc_fn(logits, labels):
-    """
-    Classification accuracy of the model.
-    """
-    predicted_class = jnp.argmax(logits, axis=1)
-    return jnp.mean(predicted_class == labels)
-
-
-def _loss_fn(logits, labels):
-    return jnp.mean(softmax_cross_entropy(logits, labels))
-
-
-def _reg_loss_fn(reg):
-    return jnp.mean(reg)
-
-
-def _weight_fn(params):
-    flat_params, _ = ravel_pytree(params)
-    return 0.5 * jnp.sum(jnp.square(flat_params))
 
 
 def loss_fn(forward, params, images, labels):
@@ -467,8 +434,7 @@ def loss_fn(forward, params, images, labels):
     logits, regs = forward(params, images)
     loss_ = _loss_fn(logits, labels)
     reg_ = _reg_loss_fn(regs)
-    weight_ = _weight_fn(params)
-    return loss_ + lam * reg_ + lam_w * weight_
+    return loss_ + lam * reg_
 
 
 def init_data():
@@ -492,24 +458,6 @@ def init_data():
 
     # make sure we always save the model on the last iteration
     assert num_batches * parse_args.nepochs % parse_args.save_freq == 0
-
-    import tensorflow as tf
-
-    def preprocess(img, label):
-        """
-        Preprocess with data augmentation.
-        """
-        # convert dtype
-        img = tf.image.convert_image_dtype(img, dtype=tf.float32)
-        label = tf.cast(label, tf.int32)
-
-        # normalize image
-        img /= 255.
-
-        return img, label
-
-    # process the dataset
-    ds_train = ds_train.map(preprocess, num_parallel_calls=10)
 
     ds_train = ds_train.cache()
     ds_train = ds_train.repeat()
@@ -540,9 +488,6 @@ def run():
     grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
 
     def lr_schedule(train_itr):
-        """
-        Learning rate schedule. Implemented in lax.
-        """
         _epoch = train_itr // num_batches
         id = lambda x: x
         return lax.cond(_epoch < 60, 1e-1, id, 0,
@@ -558,8 +503,7 @@ def run():
         Update the params based on grad for current batch.
         """
         images, labels = _batch
-        grad_ = grad_fn(get_params(_opt_state), images, labels)
-        return opt_update(_itr, grad_, _opt_state)
+        return opt_update(_itr, grad_fn(get_params(_opt_state), images, labels), _opt_state)
 
     @jax.jit
     def sep_losses(_opt_state, _batch):
