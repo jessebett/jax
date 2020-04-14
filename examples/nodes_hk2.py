@@ -217,7 +217,7 @@ class PreODE(hk.Module):
     def __init__(self):
         super(PreODE, self).__init__()
         self.model = hk.Sequential([
-            lambda x: x / 255.,
+            lambda x: x.astype(jnp.float32) / 255.,
             hk.Conv2D(output_channels=64,
                       kernel_shape=3,
                       stride=1,
@@ -458,24 +458,6 @@ def init_data():
 
     # make sure we always save the model on the last iteration
     assert num_batches * parse_args.nepochs % parse_args.save_freq == 0
-
-    import tensorflow as tf
-
-    def preprocess(img, label):
-        """
-        Preprocess with data augmentation.
-        """
-        # convert dtype
-        img = tf.image.convert_image_dtype(img, dtype=tf.float32)
-        label = tf.cast(label, tf.int32)
-
-        # normalize image
-        # img = img / 255.
-
-        return img, label
-
-    # process the dataset
-    ds_train = ds_train.map(preprocess, num_parallel_calls=10)
 
     ds_train = ds_train.cache()
     ds_train = ds_train.repeat()
