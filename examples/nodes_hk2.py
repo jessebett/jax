@@ -253,7 +253,7 @@ class PostODE(hk.Module):
     def __init__(self):
         super(PostODE, self).__init__()
         self.model = hk.Sequential([
-            hk.AvgPool(window_shape=(1, 4, 4, 1),
+            hk.AvgPool(window_shape=(1, 6, 6, 1),
                        strides=(1, 1, 1, 1),
                        padding="VALID"),
             Flatten(),
