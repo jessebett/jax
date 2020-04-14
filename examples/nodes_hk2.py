@@ -226,7 +226,7 @@ class MLPDynamics(hk.Module):
         self.input_shape = input_shape
         self.dim = jnp.prod(input_shape[1:])
         self.hidden_dim = 100
-        self.lin1 = hk.Linear(self.hidden_dim)
+        self.lin1 = hk.Linear(self.dim)
         # self.lin2 = hk.Linear(self.dim,
         #                       w_init=jnp.zeros,
         #                       with_bias=False)
@@ -286,11 +286,12 @@ def initialization_data(input_shape, ode_shape):
     Data for initializing the modules.
     """
     ode_shape = (1, ) + ode_shape[1:]
+    ode_dim = jnp.prod(ode_shape)
     data = {
         "pre_ode": jnp.zeros(input_shape),
-        "ode": (jnp.zeros(ode_shape), 0.),
+        "ode": (jnp.zeros(ode_dim), 0.),
         "res": jnp.zeros(ode_shape),
-        "post_ode": jnp.zeros(ode_shape)
+        "post_ode": jnp.zeros(ode_dim)
     }
     return data
 
@@ -302,7 +303,7 @@ def init_model():
     ts = jnp.array([0., 1.])
 
     input_shape = (1, 28, 28, 1)
-    ode_shape = (-1, 6, 6, 64)
+    ode_shape = (-1, 28, 28, 1)
 
     initialization_data_ = initialization_data(input_shape, ode_shape)
 
