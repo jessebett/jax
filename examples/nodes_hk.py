@@ -567,6 +567,10 @@ def run():
 
                 print(print_str)
 
+                outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
+                outfile.write(print_str + "\n")
+                outfile.close()
+
                 info[itr]["acc"] = acc_
                 info[itr]["loss_aug"] = loss_aug_
                 info[itr]["loss"] = loss_
@@ -582,6 +586,10 @@ def run():
                 outfile = open(param_filename, "wb")
                 pickle.dump(fargs, outfile)
                 outfile.close()
+
+            outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_iter.txt" % (dirname, reg, lam, num_blocks), "a")
+            outfile.write("Iter: {:04d}\n".format(itr))
+            outfile.close()
     meta = {
         "info": info,
         "args": parse_args
