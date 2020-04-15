@@ -304,6 +304,7 @@ def init_model():
 
     input_shape = (1, 28, 28, 1)
     ode_shape = (-1, 28, 28, 1)
+    ode_dim = jnp.prod(ode_shape[1:])
 
     initialization_data_ = initialization_data(input_shape, ode_shape)
 
@@ -326,6 +327,7 @@ def init_model():
                 Dynamics of regularization for ODE integration.
                 """
                 if reg == "none":
+                    y = jnp.reshape(y, (-1, ode_dim))
                     return jnp.zeros(y.shape[0])
                 else:
                     # do r3 regularization
