@@ -6,6 +6,7 @@ import collections
 import os
 import pickle
 import sys
+from functools import partial
 
 import haiku as hk
 
@@ -27,6 +28,7 @@ parser.add_argument('--subsample', type=int, default=50)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=0)
+parser.add_argument('--kl_coef', type=float, default=1)
 parser.add_argument('--atol', type=float, default=1.4e-8)
 parser.add_argument('--rtol', type=float, default=1.4e-8)
 parser.add_argument('--method', type=str, default="dopri5")
@@ -50,6 +52,7 @@ assert os.path.exists(parse_args.dirname)
 reg = parse_args.reg
 lam = parse_args.lam
 lam_w = parse_args.lam_w
+kl_coef = parse_args.kl_coef
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
@@ -277,15 +280,19 @@ def init_model(rec_ode_kwargs,
             """
             Integrate one sample of z0 (for one batch).
             """
-            z_, nfe_ = jax.vmap(lambda z_, t_: odeint(gen_dynamics_wrap, z_, t_,
-                                                      params["gen_dynamics"], **gen_ode_kwargs))(z0_, timesteps)
-            return z_[:, -1], nfe_
+            return jax.vmap(lambda z_, t_: odeint(gen_dynamics_wrap, z_, t_,
+                                                  params["gen_dynamics"], **gen_ode_kwargs))(z0_, timesteps)
         z, nfe = jax.vmap(integrate_sample)(z0)
 
-        # decode latent to data
-        pred = jax.vmap(gen_to_data.apply, in_axes=(None, 0))(params["gen_to_data"], z)
+        # decode latent to data, vmapping over batch and timepoints
+        pred = jax.vmap(jax.vmap(partial(gen_to_data.apply, params["gen_to_data"]), in_axes=1, out_axes=1))(z)
 
-        return pred
+        z0_params = {
+            "mean": mean_z0,
+            "std": std_z0
+        }
+
+        return pred, z0_params
 
     def ode_rnn(params, data, timesteps):
         """
@@ -340,8 +347,27 @@ def aug_init(y, batch_size=-1):
     return y, jnp.zeros(batch_size)
 
 
-def _loss_fn(preds, targets):
-    return jnp.mean((preds - targets) ** 2)
+def _likelihood(preds, data):
+    """
+    Compute log-likelihood of data under current predictions.
+    """
+    def sample_likelihood(data_, mu, std=0.01):
+        """
+        Log-Likelihood of one sample.
+        """
+        return -((data_ - mu) ** 2) / (2 * std ** 2) - jnp.log(std) - jnp.log(2 * jnp.pi) / 2
+    return jnp.mean(sample_likelihood(data[None], preds), axis=[1, 2, 3])
+
+
+def _kl_div(params):
+    """
+    Analytically compute KL between z0 distribution and prior.
+    """
+    mean_prior = 0
+    std_prior = 1
+    var_ratio = (params["std"] / std_prior) ** 2
+    t1 = ((params["mean"] - mean_prior) / std_prior) ** 2
+    return jnp.mean(0.5 * (var_ratio + t1 - 1 - jnp.log(var_ratio)))
 
 
 def _reg_loss_fn(reg):
@@ -353,15 +379,17 @@ def _weight_fn(params):
     return 0.5 * jnp.sum(jnp.square(flat_params))
 
 
-def loss_fn(forward, params, inputs, input_ts, targets):
+def loss_fn(forward, params, data, timesteps):
     """
     The loss function for training.
     """
-    preds, regs = forward(params, inputs, input_ts)
-    loss_ = _loss_fn(preds, targets)
-    reg_ = _reg_loss_fn(regs)
-    weight_ = _weight_fn(params)
-    return loss_ + lam * reg_ + lam_w * weight_
+    preds, z0_params = forward(params, data, timesteps)
+    likelihood_ = _likelihood(preds, data)
+    kl_ = _kl_div(z0_params)
+    # reg_ = _reg_loss_fn(regs)
+    # weight_ = _weight_fn(params)
+    return -jnp.mean(likelihood_ - kl_coef * kl_)
+    # return loss_ + lam * reg_ + lam_w * weight_
 
 
 def init_toy_data():
@@ -460,9 +488,9 @@ def run():
     model = init_model({}, {})
     forward = model["forward"]
     batch = next(ds_train)
-    result = forward(model["params"], *batch)
-
+    loss_ = loss_fn(forward, model["params"], *batch)
     grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
+    grad_ = grad_fn(model["params"], *batch)
 
     def lr_schedule(train_itr):
         _epoch = train_itr // num_batches
