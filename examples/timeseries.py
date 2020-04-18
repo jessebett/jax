@@ -16,7 +16,7 @@ def _get_next_val(t, tmin, tmax, init, final=None):
     return val
 
 
-def _gen_sample(time_steps,
+def _gen_sample(timesteps,
                 init_freq,
                 init_amplitude,
                 starting_point,
@@ -27,13 +27,13 @@ def _gen_sample(time_steps,
     Generate time-series sample.
     """
 
-    tmin = time_steps[0]
-    tmax = time_steps[-1]
+    tmin = timesteps[0]
+    tmax = timesteps[-1]
 
     data = []
-    t_prev = time_steps[0]
+    t_prev = timesteps[0]
     phi = phi_offset
-    for t in time_steps:
+    for t in timesteps:
         dt = t - t_prev
         amp = _get_next_val(t, tmin, tmax, init_amplitude, final_amplitude)
         freq = _get_next_val(t, tmin, tmax, init_freq, final_freq)
@@ -41,15 +41,15 @@ def _gen_sample(time_steps,
 
         y = amp * jnp.sin(phi) + starting_point
         t_prev = t
-        data.append(y)
+        data.append([y])
     return jnp.array(data)
 
 
 def _add_noise(key, samples, noise_weight):
-    n_samples, n_tp = samples.shape
+    n_samples, n_tp, n_dims = samples.shape
 
     # add noise to all the points except the first point
-    noise = jax.random.uniform(key, (n_samples, n_tp - 1))
+    noise = jax.random.uniform(key, (n_samples, n_tp - 1, n_dims))
 
     samples = jax.ops.index_update(samples, jax.ops.index[:, 1:], samples[:, 1:] + noise * noise_weight)
     return samples
@@ -98,12 +98,12 @@ class Periodic1D:
         """
         Sample periodic functions.
         """
-        time_steps_extrap = jax.random.uniform(key,
-                                               (n_tp - 1, ),
-                                               minval=0.,
-                                               maxval=max_t_extrap)
-        time_steps = jnp.sort(jnp.concatenate((jnp.array([0.]),
-                                               time_steps_extrap)))
+        timesteps_extrap = jax.random.uniform(key,
+                                              (n_tp - 1, ),
+                                              minval=0.,
+                                              maxval=max_t_extrap)
+        timesteps = jnp.sort(jnp.concatenate((jnp.array([0.]),
+                                              timesteps_extrap)))
 
         def gen_sample(subkey):
             """
@@ -116,7 +116,7 @@ class Periodic1D:
 
             z0 = self.z0 + jax.random.normal(subkey) * 0.1
 
-            sample = _gen_sample(time_steps,
+            sample = _gen_sample(timesteps,
                                  init_freq=init_freq,
                                  init_amplitude=init_amplitude,
                                  starting_point=z0,
@@ -127,4 +127,4 @@ class Periodic1D:
         samples = jax.vmap(gen_sample)(jax.random.split(key, num=n_samples))
 
         samples = _add_noise(key, samples, noise_weight)
-        return samples
+        return timesteps, samples

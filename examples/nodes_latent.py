@@ -130,28 +130,28 @@ class LatentGRU(hk.Module):
 
         new_state = self.new_state_net(concat)
         new_state_mean, new_state_std = new_state[..., :self.latent_dim], new_state[..., self.latent_dim:]
-        new_state_std = jnp.abs(new_state_std)  # TODO: exp this instead? (or even square it!)
+        new_state_std = jnp.abs(new_state_std)
 
         new_y_mean = (1-update_gate) * new_state_mean + update_gate * y_mean
         new_y_std = (1-update_gate) * new_state_std + update_gate * y_std
 
-        new_y_std = jnp.abs(new_y_std)   # TODO: should we exp this instead?
+        new_y_std = jnp.abs(new_y_std)
         return new_y_mean, new_y_std
 
 
-class EncoderDynamics(hk.Module):
+class Dynamics(hk.Module):
     """
     ODE-RNN dynamics.
     """
 
     def __init__(self,
                  latent_dim,
-                 dynamics_layers,
-                 dynamics_units):
-        super(EncoderDynamics, self).__init__()
+                 layers,
+                 units):
+        super(Dynamics, self).__init__()
         self.latent_dim = latent_dim
-        self.model = hk.Sequential([unit for _ in range(dynamics_layers + 1) for unit in
-                                    [jnp.tanh, hk.Linear(dynamics_units)]] +
+        self.model = hk.Sequential([unit for _ in range(layers + 1) for unit in
+                                    [jnp.tanh, hk.Linear(units)]] +
                                    [jnp.tanh, hk.Linear(latent_dim)]
                                    )
 
@@ -174,83 +174,126 @@ def wrap_module(module, *module_args, **module_kwargs):
     return wrap
 
 
-def initialization_data(latent_dim):
+def initialization_data(rec_dim, gen_dim, data_dim):
     """
     Creates data for initializing each of the modules based on the shapes of init_data.
     """
     data = {
-        "gru": (jnp.zeros(latent_dim), jnp.zeros(latent_dim), jnp.zeros((1, ))),
-        "dynamics": (jnp.zeros(latent_dim), 0.),
-        "transform_z0": (jnp.zeros(latent_dim), jnp.zeros(latent_dim))
+        "gru": (jnp.zeros(rec_dim), jnp.zeros(rec_dim), jnp.zeros((data_dim, ))),
+        "rec_dynamics": (jnp.zeros(rec_dim), 0.),
+        "rec_to_gen": (jnp.zeros(rec_dim), jnp.zeros(rec_dim)),
+        "gen_dynamics": (jnp.zeros(gen_dim), 0.),
+        "gen_to_data": jnp.zeros(gen_dim)
     }
     return data
 
 
-def init_model(latent_dim=10,
-               z0_dim=None,
+def init_model(rec_ode_kwargs,
+               gen_ode_kwargs,
+               rec_dim=20,
+               gen_dim=10,
+               data_dim=1,
+               rec_layers=1,
+               gen_layers=1,
                dynamics_units=100,
-               dynamics_layers=1,
-               gru_units=100,
-               **ode_rnn_kwargs):
+               gru_units=100,):
     """
     Instantiates transformed submodules of model and their parameters.
     """
 
-    initialization_data_ = initialization_data(latent_dim)
+    initialization_data_ = initialization_data(rec_dim,
+                                               gen_dim,
+                                               data_dim)
 
     init_kwargs = {
         "w_init": hk.initializers.RandomNormal(mean=0, stddev=0.1),
         "b_init": jnp.zeros
     }
 
-    if z0_dim is None:
-        z0_dim = latent_dim
-
     gru = hk.transform(wrap_module(LatentGRU,
-                                   latent_dim=latent_dim,
+                                   latent_dim=rec_dim,
                                    n_units=gru_units,
                                    **init_kwargs))
     gru_params = gru.init(rng, *initialization_data_["gru"])
 
-    # TODO: original model is time-homogeneous
-    dynamics = hk.transform(wrap_module(EncoderDynamics,
-                                        latent_dim=latent_dim,
-                                        dynamics_units=dynamics_units,
-                                        dynamics_layers=dynamics_layers)
-                            )
-    dynamics_params = dynamics.init(rng, *initialization_data_["dynamics"])
-    dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
+    rec_dynamics = hk.transform(wrap_module(Dynamics,
+                                            latent_dim=rec_dim,
+                                            units=dynamics_units,
+                                            layers=rec_layers)
+                                )
+    rec_dynamics_params = rec_dynamics.init(rng, *initialization_data_["rec_dynamics"])
+    rec_dynamics_wrap = lambda x, t, params: rec_dynamics.apply(params, x, t)
 
-    transform_z0 = hk.transform(wrap_module(lambda: hk.Sequential([
+    rec_to_gen = hk.transform(wrap_module(lambda: hk.Sequential([
         lambda x, y: jnp.concatenate((x, y), axis=-1),
         hk.Linear(100, **init_kwargs),
         jnp.tanh,
-        hk.Linear(2 * z0_dim, **init_kwargs)
+        hk.Linear(2 * gen_dim, **init_kwargs)
     ])))
-    transform_z0_params = transform_z0.init(rng, *initialization_data_["transform_z0"])
+    rec_to_gen_params = rec_to_gen.init(rng, *initialization_data_["rec_to_gen"])
+
+    gen_dynamics = hk.transform(wrap_module(Dynamics,
+                                            latent_dim=gen_dim,
+                                            units=dynamics_units,
+                                            layers=gen_layers))
+    gen_dynamics_params = gen_dynamics.init(rng, *initialization_data_["gen_dynamics"])
+    gen_dynamics_wrap = lambda x, t, params: gen_dynamics.apply(params, x, t)
+
+    gen_to_data = hk.transform(wrap_module(hk.Linear,
+                                           output_size=data_dim,
+                                           **init_kwargs))
+    gen_to_data_params = gen_to_data.init(rng, initialization_data_["gen_to_data"])
 
     init_params = {
         "gru": gru_params,
-        "dynamics": dynamics_params,
-        "transform_z0": transform_z0_params
+        "rec_dynamics": rec_dynamics_params,
+        "rec_to_gen": rec_to_gen_params,
+        "gen_dynamics": gen_dynamics_params,
+        "gen_to_data": gen_to_data_params
     }
 
-    def forward(params, data, time_steps):
+    def forward(params, data, timesteps, num_samples=3):
         """
         Forward pass of the model.
+        y are the latent variables of the recognition model
+        z are the latent variables of the generative model
         """
-        final_y, final_y_std, _ = jax.vmap(_run, in_axes=(None, 0, 0))(params, data, time_steps)
+        # ode-rnn encoder
+        final_y, final_y_std = jax.vmap(ode_rnn, in_axes=(None, 0, 0))(params, data, timesteps)
 
-        z0 = transform_z0.apply(params["transform_z0"], final_y, final_y_std)
-        mean_z0, std_z0 = z0[..., :z0_dim], z0[..., z0_dim:]
-        std_z0 = jnp.abs(std_z0)  # TODO: exp std_z0 to make it positive (but they use abs)
+        # translate
+        z0 = rec_to_gen.apply(params["rec_to_gen"], final_y, final_y_std)
+        mean_z0, std_z0 = z0[..., :gen_dim], z0[..., gen_dim:]
+        std_z0 = jnp.abs(std_z0)
 
-        return mean_z0, std_z0
+        def sample_z0(key):
+            """
+            Sample generative latent variable using reparameterization trick.
+            """
+            return mean_z0 + std_z0 * jax.random.normal(key, shape=mean_z0.shape)
+        z0 = jax.vmap(sample_z0)(jax.random.split(rng, num=num_samples))
 
-    def _run(params, data, time_steps):
+        def integrate_sample(z0_):
+            """
+            Integrate one sample of z0 (for one batch).
+            """
+            z_, nfe_ = jax.vmap(lambda z_, t_: odeint(gen_dynamics_wrap, z_, t_,
+                                                      params["gen_dynamics"], **gen_ode_kwargs))(z0_, timesteps)
+            return z_[:, -1], nfe_
+        z, nfe = jax.vmap(integrate_sample)(z0)
 
-        init_t = time_steps[-1]
-        init_y, init_std = gru.apply(params["gru"], jnp.zeros(latent_dim), jnp.zeros(latent_dim), data[-1])
+        # decode latent to data
+        pred = jax.vmap(gen_to_data.apply, in_axes=(None, 0))(params["gen_to_data"], z)
+
+        return pred
+
+    def ode_rnn(params, data, timesteps):
+        """
+        ODE-RNN model.
+        """
+
+        init_t = timesteps[-1]
+        init_y, init_std = gru.apply(params["gru"], jnp.zeros(rec_dim), jnp.zeros(rec_dim), data[-1])
 
         def scan_fun(carry, target):
             """
@@ -259,12 +302,12 @@ def init_model(latent_dim=10,
             prev_y, prev_std, prev_t = carry
             xi, ti = target
 
-            rev_dyn = lambda x, t, params_: -dynamics_wrap(x, -t, params_)
+            rev_dyn = lambda x, t, params_: -rec_dynamics_wrap(x, -t, params_)
             ys_ode, nfe = odeint(rev_dyn,
                                  prev_y,
                                  -jnp.array([prev_t, ti]),
-                                 params["dynamics"],
-                                 **ode_rnn_kwargs)
+                                 params["rec_dynamics"],
+                                 **rec_ode_kwargs)
             yi_ode = ys_ode[-1]
 
             yi, yi_std = gru.apply(params["gru"],
@@ -274,9 +317,9 @@ def init_model(latent_dim=10,
 
         (final_y, final_y_std, _), latent_ys = lax.scan(scan_fun,
                                                         (init_y, init_std, init_t),
-                                                        (data[-2::-1], time_steps[-2::-1]))
+                                                        (data[-2::-1], timesteps[-2::-1]))
 
-        return final_y, final_y_std, latent_ys
+        return final_y, final_y_std
 
     model = {
         "forward": forward,
@@ -328,13 +371,13 @@ def init_toy_data():
     n_samples = 1000
     noise_weight = 0.1
 
-    time_steps, samples = Periodic1D(init_freq=None,
-                                     init_amplitude=1.,
-                                     final_amplitude=1.,
-                                     final_freq=None,
-                                     z0=1.).sample(rng,
-                                                   n_samples=n_samples,
-                                                   noise_weight=noise_weight)
+    timesteps, samples = Periodic1D(init_freq=None,
+                                    init_amplitude=1.,
+                                    final_amplitude=1.,
+                                    final_freq=None,
+                                    z0=1.).sample(rng,
+                                                  n_samples=n_samples,
+                                                  noise_weight=noise_weight)
 
     def _split_train_test(data, train_frac=0.8):
         data_train = data[:int(n_samples * train_frac)]
@@ -375,8 +418,8 @@ def init_toy_data():
             """
             Subsample timeseries.
             """
-            subsample_inds = jnp.sort(swor(subkey, jnp.ones_like(time_steps), subsample))
-            return sample[subsample_inds], time_steps[subsample_inds]
+            subsample_inds = jnp.sort(swor(subkey, jnp.ones_like(timesteps), subsample))
+            return sample[subsample_inds], timesteps[subsample_inds]
 
         while True:
             if shuffle:
@@ -390,7 +433,7 @@ def init_toy_data():
                     # TODO: if we want to do proportional subsampling I don't think we can vmap
                     yield jax.vmap(get_subsample)(jax.random.split(key, num=batch_size), train_y[batch_inds])
                 else:
-                    yield train_y[batch_inds], jnp.repeat(time_steps[None], batch_size, axis=0)
+                    yield train_y[batch_inds], jnp.repeat(timesteps[None], batch_size, axis=0)
 
     ds_train = gen_data(parse_args.batch_size, subsample=parse_args.subsample)
     ds_test = gen_data(parse_args.test_batch_size, shuffle=False)
@@ -414,7 +457,7 @@ def run():
     num_batches = meta["num_batches"]
     num_test_batches = meta["num_test_batches"]
 
-    model = init_model()
+    model = init_model({}, {})
     forward = model["forward"]
     batch = next(ds_train)
     result = forward(model["params"], *batch)
