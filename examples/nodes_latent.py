@@ -21,21 +21,20 @@ from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=100)
-parser.add_argument('--test_batch_size', type=int, default=200)
-parser.add_argument('--nepochs', type=int, default=200)
+parser.add_argument('--batch_size', type=int, default=50)
+parser.add_argument('--test_batch_size', type=int, default=100)
+parser.add_argument('--nepochs', type=int, default=500)
 parser.add_argument('--subsample', type=int, default=50)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=0)
-parser.add_argument('--kl_coef', type=float, default=1)
 parser.add_argument('--atol', type=float, default=1.4e-8)
 parser.add_argument('--rtol', type=float, default=1.4e-8)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=-1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=50)
+parser.add_argument('--test_freq', type=int, default=1)
 parser.add_argument('--save_freq', type=int, default=50)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
@@ -52,7 +51,6 @@ assert os.path.exists(parse_args.dirname)
 reg = parse_args.reg
 lam = parse_args.lam
 lam_w = parse_args.lam_w
-kl_coef = parse_args.kl_coef
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
@@ -379,7 +377,7 @@ def _weight_fn(params):
     return 0.5 * jnp.sum(jnp.square(flat_params))
 
 
-def loss_fn(forward, params, data, timesteps):
+def loss_fn(forward, params, data, timesteps, kl_coef):
     """
     The loss function for training.
     """
@@ -487,56 +485,56 @@ def run():
 
     model = init_model({}, {})
     forward = model["forward"]
-    batch = next(ds_train)
-    loss_ = loss_fn(forward, model["params"], *batch)
     grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
-    grad_ = grad_fn(model["params"], *batch)
 
-    def lr_schedule(train_itr):
-        _epoch = train_itr // num_batches
-        id = lambda x: x
-        return lax.cond(_epoch < 60, 1e-1, id, 0,
-                        lambda _: lax.cond(_epoch < 100, 1e-2, id, 0,
-                                           lambda _: lax.cond(_epoch < 140, 1e-3, id, 1e-4, id)))
-
-    opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
+    lr_schedule = optimizers.exponential_decay(step_size=parse_args.lr,
+                                               decay_steps=1,
+                                               decay_rate=0.999,
+                                               lowest=parse_args.lr / 10)
+    opt_init, opt_update, get_params = optimizers.adamax(step_size=lr_schedule)
     opt_state = opt_init(model["params"])
 
+    def get_kl_coef(epoch_):
+        """
+        Tuning schedule for KL coefficient.
+        """
+        return max(0., 1 - 0.99 ** (epoch_ - 10))
+
     @jax.jit
-    def update(_itr, _opt_state, _batch):
+    def update(_itr, _opt_state, _batch, kl_coef):
         """
         Update the params based on grad for current batch.
         """
-        return opt_update(_itr, grad_fn(get_params(_opt_state), *_batch), _opt_state)
+        return opt_update(_itr, grad_fn(get_params(_opt_state), *_batch, kl_coef), _opt_state)
 
     @jax.jit
-    def sep_losses(_opt_state, _batch):
+    def sep_losses(_opt_state, _batch, kl_coef):
         """
         Convenience function for calculating losses separately.
         """
         params = get_params(_opt_state)
-        inputs, input_ts, targets = _batch
-        preds, regs = forward(params, inputs, input_ts)
-        loss_ = _loss_fn(preds, targets)
-        reg_ = _reg_loss_fn(regs)
-        total_loss_ = loss_ + lam * reg_
-        return total_loss_, loss_, reg_
+        data, timesteps = _batch
+        preds, z0_params = forward(params, data, timesteps)
+        likelihood_ = _likelihood(preds, data)
+        kl_ = _kl_div(z0_params)
+        return -jnp.mean(likelihood_ - kl_coef * kl_), likelihood_, kl_
 
-    def evaluate_loss(opt_state, ds_train_eval):
+    def evaluate_loss(opt_state, ds_test, kl_coef):
         """
         Convenience function for evaluating loss over train set in smaller batches.
         """
         sep_loss_aug_, sep_loss_, sep_loss_reg_, nfe = [], [], [], []
 
         for test_batch_num in range(num_test_batches):
-            test_batch = next(ds_train_eval)
+            test_batch = next(ds_test)
 
-            test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, test_batch)
+            test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, test_batch, kl_coef)
 
-            if count_nfe:
-                nfe.append(model["nfe"](get_params(opt_state), *test_batch))
-            else:
-                nfe.append(0)
+            # TODO: implement
+            # if count_nfe:
+            #     nfe.append(model["nfe"](get_params(opt_state), *test_batch))
+            # else:
+            nfe.append(0)
 
             sep_loss_aug_.append(test_batch_loss_aug_)
             sep_loss_.append(test_batch_loss_)
@@ -557,13 +555,14 @@ def run():
 
             itr += 1
 
-            opt_state = update(itr, opt_state, batch)
+            opt_state = update(itr, opt_state, batch, get_kl_coef(epoch))
 
             if itr % parse_args.test_freq == 0:
-                loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, ds_train_eval)
+                # TODO: include reg loss terms
+                loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, ds_test, get_kl_coef(epoch))
 
-                print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
-                            'Loss {:.6f} | r {:.6f} | NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_, nfe_)
+                print_str = 'Iter {:04d} | Loss {:.6f} | ' \
+                            'Likelihood {:.6f} | KL {:.6f} | NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_, nfe_)
 
                 print(print_str)
 
