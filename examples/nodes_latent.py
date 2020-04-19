@@ -10,7 +10,7 @@ from functools import partial
 
 import haiku as hk
 
-from examples.timeseries import Periodic1D
+from timeseries import Periodic1D
 
 import jax
 from jax import lax
