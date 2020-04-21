@@ -124,31 +124,26 @@ class ConcatConv2D(hk.Module):
         return self._layer(ttx)
 
 
-class ResBlock(hk.Module):
+class MLPBlock(hk.Module):
     """
     Standard ResBlock.
     """
 
-    def __init__(self, output_channels):
-        super(ResBlock, self).__init__()
-        self.conv1 = hk.Conv2D(output_channels=output_channels,
-                               kernel_shape=3,
-                               stride=1,
-                               padding=lambda _: (1, 1),
-                               with_bias=False)
-        self.conv2 = hk.Conv2D(output_channels=output_channels,
-                               kernel_shape=3,
-                               stride=1,
-                               padding=lambda _: (1, 1),
-                               w_init=jnp.zeros,
-                               with_bias=False)
+    def __init__(self, input_shape):
+        super(MLPBlock, self).__init__()
+        self.input_shape = input_shape
+        self.dim = jnp.prod(input_shape[1:])
+        self.hidden_dim = 100
+        self.lin1 = hk.Linear(self.dim)
 
     def __call__(self, x):
+        # vmapping means x will be a single batch element, so need to expand dims at 0
+        x = jnp.reshape(x, (-1, self.dim))
+
         out = sigmoid(x)
-        out = self.conv1(out)
-        out = sigmoid(out)
-        out = self.conv2(out)
-        return x + out
+        out = self.lin1(out)
+
+        return out
 
 
 class PreODE(hk.Module):
@@ -385,7 +380,7 @@ def init_model():
 
     else:
         resnet = hk.transform(wrap_module(
-            lambda: hk.Sequential([ResBlock(ode_shape[-1]) for _ in range(num_blocks)])))
+            lambda: hk.Sequential([MLPBlock(ode_shape) for _ in range(num_blocks)])))
         resnet_params = resnet.init(rng, initialization_data_["res"])
         resnet_fn = resnet.apply
 
