@@ -416,6 +416,7 @@ def adamax(step_size, b1=0.9, b2=0.999, eps=1e-8):
     return x
   return init, update, get_params
 
+
 @optimizer
 def sm3(step_size, momentum=0.9):
   """Construct optimizer triple for SM3.
