@@ -3903,7 +3903,6 @@ _reduce_max_translation_rule = partial(_reduce_chooser_translation_rule, max_p,
 reduce_max_p = standard_primitive(_reduce_op_shape_rule, _input_dtype,
                                   'reduce_max', _reduce_max_translation_rule)
 ad.defjvp2(reduce_max_p, _reduce_chooser_jvp_rule)
-
 batching.defreducer(reduce_max_p)
 
 
