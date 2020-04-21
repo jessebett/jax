@@ -128,3 +128,85 @@ class Periodic1D:
 
         samples = _add_noise(key, samples, noise_weight)
         return timesteps, samples
+
+def init_periodic_data(rng, parse_args):
+    """
+    Initialize toy data. This example is easier since time_points are shared across all examples.
+    """
+    n_samples = 1000
+    noise_weight = 0.1
+
+    timesteps, samples = Periodic1D(init_freq=None,
+                                    init_amplitude=1.,
+                                    final_amplitude=1.,
+                                    final_freq=None,
+                                    z0=1.).sample(rng,
+                                                  n_samples=n_samples,
+                                                  noise_weight=noise_weight)
+
+    def _split_train_test(data, train_frac=0.8):
+        data_train = data[:int(n_samples * train_frac)]
+        data_test = data[int(n_samples * train_frac):]
+        return data_train, data_test
+
+    train_y, test_y = _split_train_test(samples)
+
+    num_train = len(train_y)
+    assert num_train % parse_args.batch_size == 0
+    num_train_batches = num_train // parse_args.batch_size
+
+    assert num_train % parse_args.test_batch_size == 0
+    num_test_batches = num_train // parse_args.test_batch_size
+
+    # make sure we always save the model on the last iteration
+    assert num_train_batches * parse_args.nepochs % parse_args.save_freq == 0
+
+    def gen_data(batch_size, shuffle=True, subsample=None):
+        """
+        Generator for train data.
+        """
+        key = rng
+        num_batches = num_train // batch_size
+        inds = jnp.arange(num_train)
+
+        def swor(subkey, w, k):
+            """
+            Sample k items from collection of n items with weights given by w.
+            """
+            n = len(w)
+            g = jax.random.gumbel(subkey, shape=(n,))
+            g += jnp.log(w)
+            g *= -1
+            return jnp.argsort(g)[:k]
+
+        def get_subsample(subkey, sample):
+            """
+            Subsample timeseries.
+            """
+            subsample_inds = jnp.sort(swor(subkey, jnp.ones_like(timesteps), subsample))
+            return sample[subsample_inds], timesteps[subsample_inds]
+
+        while True:
+            if shuffle:
+                key, = jax.random.split(key, num=1)
+                epoch_inds = jax.random.shuffle(key, inds)
+            else:
+                epoch_inds = inds
+            for i in range(num_batches):
+                batch_inds = epoch_inds[i * batch_size: (i + 1) * batch_size]
+                if subsample is not None:
+                    # TODO: if we want to do proportional subsampling I don't think we can vmap
+                    yield jax.vmap(get_subsample)(jax.random.split(key, num=batch_size), train_y[batch_inds])
+                else:
+                    yield train_y[batch_inds], jnp.repeat(timesteps[None], batch_size, axis=0)
+
+    # TODO: jit these!
+    ds_train = gen_data(parse_args.batch_size, subsample=parse_args.subsample)
+    ds_test = gen_data(parse_args.test_batch_size, shuffle=False)
+
+    meta = {
+        "num_batches": num_train_batches,
+        "num_test_batches": num_test_batches
+    }
+
+    return ds_train, ds_test, meta
