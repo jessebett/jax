@@ -333,7 +333,7 @@ def init_model():
                     # do r3 regularization
                     y0, y_n = sol_recursive(lambda _y, _t: dynamics_wrap(_y, _t, params), y, t)
                     r = y_n[-1]
-                    return jnp.sum(r ** 2, axis=[axis_ for axis_ in range(1, r.ndim)])
+                    return jnp.mean(r ** 2, axis=[axis_ for axis_ in range(1, r.ndim)])
 
             def aug_dynamics(yr, t, params):
                 """
