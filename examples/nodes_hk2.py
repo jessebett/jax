@@ -19,7 +19,7 @@ from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=1)
+parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=160)
 parser.add_argument('--lr', type=float, default=1e-2)
@@ -54,7 +54,6 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
-vmap = False
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,

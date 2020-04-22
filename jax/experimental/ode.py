@@ -311,28 +311,6 @@ def _odeint_wrapper(func, rtol, atol, init_step, mxstep, method, y0, ts, *args):
   out, nfe = _odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args)
   return jax.vmap(unravel)(out), nfe
 
-def _euler_odeint(func, num_steps, y0, ts, *args):
-  func_ = lambda y, t: func(y, t, *args)
-
-  # TODO: does not work for multiple ts
-
-  length = ts[-1] - ts[0]
-  step_size = length / num_steps
-
-  f0 = func_(y0, ts[0])
-  init_val = [y0, f0, ts[0]]
-  def for_body_fun(i, val):
-    cur_y, cur_f, cur_t = val
-    next_t = cur_t + step_size
-    next_y = cur_y + cur_f * step_size
-    next_f = func_(next_y, next_t)
-    return [next_y, next_f, next_t]
-  final_y, _, final_t = lax.fori_loop(0, num_steps, for_body_fun, init_val)
-
-  return final_y
-
-
-
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
 def _dopri5_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
@@ -433,15 +411,12 @@ def _odeint_fwd(_odeint, func, rtol, atol, init_step, mxstep, y0, ts, *args):
 def _odeint_rev(method, func, rtol, atol, init_step, mxstep, res, g):
   ys, ts, args = res
   g, _ = g
-  func_vjp = partial(jax.vjp, func)
-  def aug_dyn(y_bar, y, t, *args):
-      y_dot, vjpfun = func_vjp(y, -t, *args)
-      return (-y_dot, *vjpfun(y_bar))
 
   def aug_dynamics(augmented_state, t, *args):
     """Original system augmented with vjp_y, vjp_t and vjp_args."""
     y, y_bar, *_ = augmented_state
-    return aug_dyn(y_bar, y, t, *args)
+    y_dot, vjpfun = jax.vjp(func, y, -t, *args)
+    return (-y_dot, *vjpfun(y_bar))
 
   y_bar = g[-1]
   ts_bar = []
