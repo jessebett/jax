@@ -27,6 +27,7 @@ from jax.experimental import stax
 from jax.experimental.jet import jet, fact, zero_series
 from jax.tree_util import tree_map
 from jax import lax
+from jax.experimental.ode import odeint
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -282,6 +283,57 @@ class JetTest(jtu.JaxTestCase):
     terms_y = [rng.randn(*y.shape) for _ in range(order)]
     series_in = (terms_b, terms_x, terms_y)
     self.check_jet(np.where, primals, series_in)
+
+  def test_cnf_dynamics(self):
+
+    rng = random.PRNGKey(0)
+    D = 2
+    BS = 13
+    x = random.normal(rng,(BS,D))
+
+    # ========= Functions to define a neural network. =========
+
+    def init_random_params(scale, layer_sizes, rng=random.PRNGKey(0)):
+      return [(scale * random.normal(rng, (m, n)),
+               scale * random.normal(rng, (n,)))  # Todo: use different rng at each layer
+              for m, n, in zip(layer_sizes[:-1], layer_sizes[1:])]
+
+    def sigmoid(z):
+      """
+      Numerically stable sigmoid.
+      """
+      return 1/(1 + np.exp(-z))
+
+    def mlp(params, input):
+        # Evaluate a multi-layer perceptron on a single input vector.
+        for w, b in params:
+            output = np.dot(input, w) + b
+            input = sigmoid(output)
+        return output
+
+    def nn_dynamics(z, t, args):
+        return mlp(args, np.hstack([z, t]))
+
+    def aug_dynamics(aug_state, t, args):
+        # Full Jacobian CNF
+        z = aug_state[:-1]
+        f = lambda z: nn_dynamics(z, t, args)
+        dz_dt = f(z)
+        J = jacfwd(f)(z)
+        dlogp_dt = np.trace(J)
+        return np.hstack([dz_dt, dlogp_dt])
+
+    init_params = init_random_params(0.1, [D + 1, 50, 100, D])
+    init_state = np.hstack([x[0,:], 0.])
+    t_test = 0.5
+    # aug_out = odeint(aug_dynamics, init_state, np.array([0., 1.]), init_params)[1]
+
+    def dynamics_closure(z):
+        return aug_dynamics(z,t_test, init_params)
+
+    primal_in = init_state
+    terms_in = [random.normal(rng,primal_in.shape) for _ in range(3)]
+    self.check_jet(dynamics_closure, (primal_in,), (terms_in,), atol=1e-4, rtol=1e-4)
 
 
 if __name__ == '__main__':
