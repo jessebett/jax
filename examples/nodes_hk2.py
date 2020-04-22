@@ -135,7 +135,8 @@ class MLPBlock(hk.Module):
         self.input_shape = input_shape
         self.dim = jnp.prod(input_shape[1:])
         self.hidden_dim = 100
-        self.lin1 = hk.Linear(self.dim)
+        self.lin1 = hk.Linear(self.hidden_dim)
+        self.lin2 = hk.Linear(self.dim)
 
     def __call__(self, x):
         # vmapping means x will be a single batch element, so need to expand dims at 0
@@ -143,6 +144,8 @@ class MLPBlock(hk.Module):
 
         out = sigmoid(x)
         out = self.lin1(out)
+        out = sigmoid(out)
+        out = self.lin2(out)
 
         return out
 
