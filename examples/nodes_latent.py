@@ -50,6 +50,7 @@ assert os.path.exists(parse_args.dirname)
 
 reg = parse_args.reg
 lam = parse_args.lam
+lam_rec = lam_gen = lam
 lam_w = parse_args.lam_w
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
@@ -142,7 +143,7 @@ class LatentGRU(hk.Module):
 
 class Dynamics(hk.Module):
     """
-    ODE-RNN dynamics.
+    ODE dynamics for both encoder and decoder.
     """
 
     def __init__(self,
@@ -187,6 +188,34 @@ def initialization_data(rec_dim, gen_dim, data_dim):
         "gen_to_data": jnp.zeros(gen_dim)
     }
     return data
+
+
+def augment_dynamics(dynamics, sign=1):
+    """
+    Closure to augment dynamics.
+    """
+    # TODO: check if stuff is cached here
+    def reg_dynamics(y, t, params):
+        """
+        Dynamics of regularization.
+        """
+        if reg == "none":
+            return 0.
+        else:
+            # do r3 regularization
+            y0, y_n = sol_recursive(lambda _y, _t: dynamics(_y, _t, params), y, t)
+            r = y_n[-1]
+            return jnp.sum(r ** 2, axis=[axis_ for axis_ in range(1, r.ndim)])
+
+    def aug_dynamics(yr, t, params):
+        """
+        Dynamics augmented with regularization.
+        """
+        y, r = yr
+        dydt = dynamics(y, t, params)
+        drdt = reg_dynamics(y, t, params)
+        return sign * dydt, sign * drdt
+    return aug_dynamics
 
 
 def init_model(rec_ode_kwargs,
@@ -253,14 +282,15 @@ def init_model(rec_ode_kwargs,
         "gen_to_data": gen_to_data_params
     }
 
-    def forward(params, data, timesteps, num_samples=3):
+    def forward(count_nfe_, params, data, timesteps, num_samples=3):
         """
         Forward pass of the model.
         y are the latent variables of the recognition model
         z are the latent variables of the generative model
         """
         # ode-rnn encoder
-        final_y, final_y_std = jax.vmap(ode_rnn, in_axes=(None, 0, 0))(params, data, timesteps)
+        final_y, final_y_std, rec_r, rec_nfes = \
+            jax.vmap(partial(ode_rnn, count_nfe_), in_axes=(None, 0, 0))(params, data, timesteps)
 
         # translate
         z0 = rec_to_gen.apply(params["rec_to_gen"], final_y, final_y_std)
@@ -278,9 +308,19 @@ def init_model(rec_ode_kwargs,
             """
             Integrate one sample of z0 (for one batch).
             """
-            return jax.vmap(lambda z_, t_: odeint(gen_dynamics_wrap, z_, t_,
+            if count_nfe_:
+                dynamics = gen_dynamics_wrap
+                init_fn = lambda x: x
+            else:
+                dynamics = augment_dynamics(gen_dynamics_wrap)
+                init_fn = aug_init
+            return jax.vmap(lambda z_, t_: odeint(dynamics, init_fn(z_), t_,
                                                   params["gen_dynamics"], **gen_ode_kwargs))(z0_, timesteps)
-        z, nfe = jax.vmap(integrate_sample)(z0)
+        z_r, gen_nfes = jax.vmap(integrate_sample)(z0)
+        if count_nfe_:
+            z, gen_r = z_r, 0.
+        else:
+            z, gen_r = z_r
 
         # decode latent to data, vmapping over batch and timepoints
         pred = jax.vmap(jax.vmap(partial(gen_to_data.apply, params["gen_to_data"]), in_axes=1, out_axes=1))(z)
@@ -290,9 +330,14 @@ def init_model(rec_ode_kwargs,
             "std": std_z0
         }
 
-        return pred, z0_params
+        nfe = {
+            "rec": jnp.mean(jnp.sum(rec_nfes, axis=1)),
+            "gen": jnp.mean(gen_nfes)
+        }
 
-    def ode_rnn(params, data, timesteps):
+        return pred, rec_r, gen_r, z0_params, nfe
+
+    def ode_rnn(count_nfe_, params, data, timesteps):
         """
         ODE-RNN model.
         """
@@ -307,42 +352,54 @@ def init_model(rec_ode_kwargs,
             prev_y, prev_std, prev_t = carry
             xi, ti = target
 
-            rev_dyn = lambda x, t, params_: -rec_dynamics_wrap(x, -t, params_)
-            ys_ode, nfe = odeint(rev_dyn,
-                                 prev_y,
+            if count_nfe_:
+                dynamics = lambda *args: -rec_dynamics_wrap(*args)
+                init = prev_y
+            else:
+                dynamics = augment_dynamics(rec_dynamics_wrap, sign=-1)
+                init = aug_init(prev_y)
+            ys_ode, nfe = odeint(lambda x, t, params_: dynamics(x, -t, params_),
+                                 init,
                                  -jnp.array([prev_t, ti]),
                                  params["rec_dynamics"],
                                  **rec_ode_kwargs)
-            yi_ode = ys_ode[-1]
+            if count_nfe_:
+                yi_ode = ys_ode[-1]
+                r_ode = 0.
+            else:
+                ys_ode, rs_ode = ys_ode
+                yi_ode, r_ode = ys_ode[-1], rs_ode[-1]
 
             yi, yi_std = gru.apply(params["gru"],
                                    yi_ode, prev_std, xi)
 
-            return (yi, yi_std, ti), (yi, yi_std)
+            return (yi, yi_std, ti), (r_ode, nfe)
 
-        (final_y, final_y_std, _), latent_ys = lax.scan(scan_fun,
-                                                        (init_y, init_std, init_t),
-                                                        (data[-2::-1], timesteps[-2::-1]))
+        (final_y, final_y_std, _), rs_nfes = lax.scan(scan_fun,
+                                                      (init_y, init_std, init_t),
+                                                      (data[-2::-1], timesteps[-2::-1]))
 
-        return final_y, final_y_std
+        rs, nfes = rs_nfes
+
+        # TODO: if we regularize encoder, how to weight rs in general?
+        return final_y, final_y_std, jnp.mean(rs), nfes
 
     model = {
-        "forward": forward,
-        "params": init_params
+        "forward": partial(forward, False),
+        "params": init_params,
+        "nfe": lambda *args: partial(forward, count_nfe)(*args)[-1]
     }
 
     return model
 
 
-def aug_init(y, batch_size=-1):
+def aug_init(y):
     """
     Flatten the dynamics and append regularization dynamics.
     We need to flatten the dynamics first since they may be convolutional
     (has width, height, and channels).
     """
-    if batch_size == -1:
-        batch_size = y.shape[0]
-    return y, jnp.zeros(batch_size)
+    return y, 0.
 
 
 def _likelihood(preds, data):
@@ -381,12 +438,13 @@ def loss_fn(forward, params, data, timesteps, kl_coef):
     """
     The loss function for training.
     """
-    preds, z0_params = forward(params, data, timesteps)
+    preds, rec_r, gen_r, z0_params, nfe = forward(params, data, timesteps)
     likelihood_ = _likelihood(preds, data)
     kl_ = _kl_div(z0_params)
-    # reg_ = _reg_loss_fn(regs)
+    rec_reg_ = _reg_loss_fn(rec_r)
+    gen_reg_ = _reg_loss_fn(gen_r)
     # weight_ = _weight_fn(params)
-    return -jnp.mean(likelihood_ - kl_coef * kl_)
+    return -jnp.mean(likelihood_ - kl_coef * kl_) + lam_rec * rec_reg_ + lam_gen * gen_reg_
     # return loss_ + lam * reg_ + lam_w * weight_
 
 
@@ -432,38 +490,48 @@ def run():
         """
         params = get_params(_opt_state)
         data, timesteps = _batch
-        preds, z0_params = forward(params, data, timesteps)
+        preds, rec_r, gen_r, z0_params, nfe = forward(params, data, timesteps)
         likelihood_ = _likelihood(preds, data)
         kl_ = _kl_div(z0_params)
-        return -jnp.mean(likelihood_ - kl_coef * kl_), likelihood_, kl_
+        return -jnp.mean(likelihood_ - kl_coef * kl_), likelihood_, kl_, rec_r, gen_r
 
     def evaluate_loss(opt_state, ds_test, kl_coef):
         """
         Convenience function for evaluating loss over train set in smaller batches.
         """
-        sep_loss_aug_, sep_loss_, sep_loss_reg_, nfe = [], [], [], []
+        # TODO: refactor as scan
+        loss, likelihood, kl, rec_r, gen_r, rec_nfe, gen_nfe = [], [], [], [], [], [], []
 
         for test_batch_num in range(num_test_batches):
             test_batch = next(ds_test)
 
-            test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, test_batch, kl_coef)
+            batch_loss, batch_likelihood, batch_kl, batch_rec_r, batch_gen_r = \
+                sep_losses(opt_state, test_batch, kl_coef)
 
-            # TODO: implement
-            # if count_nfe:
-            #     nfe.append(model["nfe"](get_params(opt_state), *test_batch))
-            # else:
-            nfe.append(0)
+            if count_nfe:
+                nfes = model["nfe"](get_params(opt_state), *test_batch)
+                rec_nfe.append(nfes["rec"])
+                gen_nfe.append(nfes["gen"])
+            else:
+                rec_nfe.append(0)
+                gen_nfe.append(0)
 
-            sep_loss_aug_.append(test_batch_loss_aug_)
-            sep_loss_.append(test_batch_loss_)
-            sep_loss_reg_.append(test_batch_loss_reg_)
+            loss.append(batch_loss)
+            likelihood.append(batch_likelihood)
+            kl.append(batch_kl)
+            rec_r.append(batch_rec_r)
+            gen_r.append(batch_gen_r)
 
-        sep_loss_aug_ = jnp.array(sep_loss_aug_)
-        sep_loss_ = jnp.array(sep_loss_)
-        sep_loss_reg_ = jnp.array(sep_loss_reg_)
-        nfe = jnp.array(nfe)
+        loss = jnp.array(loss)
+        likelihood = jnp.array(likelihood)
+        kl = jnp.array(kl)
+        rec_r = jnp.array(rec_r)
+        gen_r = jnp.array(gen_r)
+        rec_nfe = jnp.array(rec_nfe)
+        gen_nfe = jnp.array(gen_nfe)
 
-        return jnp.mean(sep_loss_aug_), jnp.mean(sep_loss_), jnp.mean(sep_loss_reg_), jnp.mean(nfe)
+        return jnp.mean(loss), jnp.mean(likelihood), jnp.mean(kl), jnp.mean(rec_r), jnp.mean(gen_r), \
+               jnp.mean(rec_nfe), jnp.mean(gen_nfe)
 
     itr = 0
     info = collections.defaultdict(dict)
@@ -476,11 +544,13 @@ def run():
             opt_state = update(itr, opt_state, batch, get_kl_coef(epoch))
 
             if itr % parse_args.test_freq == 0:
-                # TODO: include reg loss terms
-                loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, ds_test, get_kl_coef(epoch))
+                loss_, likelihood_, kl_, rec_r_, gen_r_, rec_nfe_, gen_nfe_ = \
+                    evaluate_loss(opt_state, ds_test, get_kl_coef(epoch))
 
                 print_str = 'Iter {:04d} | Loss {:.6f} | ' \
-                            'Likelihood {:.6f} | KL {:.6f} | NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_, nfe_)
+                            'Likelihood {:.6f} | KL {:.6f} | Enc. r {:.6f} | Dec. r {:.6f} | ' \
+                            'Enc. NFE {:.6f} | Dec. NFE {:.6f}'.\
+                    format(itr, loss_, likelihood_, kl_, rec_r_, gen_r_, rec_nfe_, gen_nfe_)
 
                 print(print_str)
 
@@ -488,10 +558,13 @@ def run():
                 outfile.write(print_str + "\n")
                 outfile.close()
 
-                info[itr]["loss_aug"] = loss_aug_
                 info[itr]["loss"] = loss_
-                info[itr]["loss_reg"] = loss_reg_
-                info[itr]["nfe"] = nfe_
+                info[itr]["likelihood"] = likelihood_
+                info[itr]["kl"] = kl_
+                info[itr]["rec_r"] = rec_r_
+                info[itr]["gen_r"] = gen_r_
+                info[itr]["rec_nfe"] = rec_nfe_
+                info[itr]["gen_nfe"] = gen_nfe_
 
             if itr % parse_args.save_freq == 0:
                 if odenet:
