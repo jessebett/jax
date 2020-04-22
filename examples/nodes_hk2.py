@@ -54,6 +54,7 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
+vmap = False
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
@@ -221,10 +222,8 @@ class MLPDynamics(hk.Module):
         self.input_shape = input_shape
         self.dim = jnp.prod(input_shape[1:])
         self.hidden_dim = 100
-        self.lin1 = hk.Linear(self.dim)
-        # self.lin2 = hk.Linear(self.dim,
-        #                       w_init=jnp.zeros,
-        #                       with_bias=False)
+        self.lin1 = hk.Linear(self.hidden_dim)
+        self.lin2 = hk.Linear(self.dim)
 
     def __call__(self, x, t):
         # vmapping means x will be a single batch element, so need to expand dims at 0
@@ -235,10 +234,10 @@ class MLPDynamics(hk.Module):
         t_out = jnp.concatenate([tt, out], axis=-1)
         out = self.lin1(t_out)
 
-        # out = sigmoid(out)
-        # tt = jnp.ones_like(out[:, :1]) * t
-        # t_out = jnp.concatenate([tt, out], axis=-1)
-        # out = self.lin2(t_out)
+        out = sigmoid(out)
+        tt = jnp.ones_like(out[:, :1]) * t
+        t_out = jnp.concatenate([tt, out], axis=-1)
+        out = self.lin2(t_out)
 
         return out
 
