@@ -6,7 +6,6 @@ import collections
 import os
 import pickle
 import sys
-import time
 from functools import partial
 
 import haiku as hk
@@ -386,9 +385,9 @@ def init_model(rec_ode_kwargs,
         return final_y, final_y_std, jnp.mean(rs), nfes
 
     model = {
-        "forward": jax.jit(partial(forward, False)),
+        "forward": partial(forward, False),
         "params": init_params,
-        "nfe": jax.jit(lambda *args: partial(forward, count_nfe)(*args)[-1])
+        "nfe": lambda *args: partial(forward, count_nfe)(*args)[-1]
     }
 
     return model
@@ -403,7 +402,6 @@ def aug_init(y):
     return y, 0.
 
 
-@jax.jit
 def _likelihood(preds, data):
     """
     Compute log-likelihood of data under current predictions.
@@ -416,7 +414,6 @@ def _likelihood(preds, data):
     return jnp.mean(sample_likelihood(data[None], preds), axis=[1, 2, 3])
 
 
-@jax.jit
 def _kl_div(params):
     """
     Analytically compute KL between z0 distribution and prior.
@@ -428,7 +425,6 @@ def _kl_div(params):
     return jnp.mean(0.5 * (var_ratio + t1 - 1 - jnp.log(var_ratio)))
 
 
-@jax.jit
 def _reg_loss_fn(reg):
     return jnp.mean(reg)
 
@@ -542,33 +538,31 @@ def run():
             batch = next(ds_train)
 
             itr += 1
-            start = time.time()
-            opt_state = update(itr, opt_state, batch, get_kl_coef(epoch))
-            end = time.time() - start
-            print(itr, end)
 
-            # if itr % parse_args.test_freq == 0:
-            #     loss_, likelihood_, kl_, rec_r_, gen_r_, rec_nfe_, gen_nfe_ = \
-            #         evaluate_loss(opt_state, ds_test, get_kl_coef(epoch))
-            #
-            #     print_str = 'Iter {:04d} | Loss {:.6f} | ' \
-            #                 'Likelihood {:.6f} | KL {:.6f} | Enc. r {:.6f} | Dec. r {:.6f} | ' \
-            #                 'Enc. NFE {:.6f} | Dec. NFE {:.6f}'.\
-            #         format(itr, loss_, likelihood_, kl_, rec_r_, gen_r_, rec_nfe_, gen_nfe_)
-            #
-            #     print(print_str)
-            #
-            #     outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
-            #     outfile.write(print_str + "\n")
-            #     outfile.close()
-            #
-            #     info[itr]["loss"] = loss_
-            #     info[itr]["likelihood"] = likelihood_
-            #     info[itr]["kl"] = kl_
-            #     info[itr]["rec_r"] = rec_r_
-            #     info[itr]["gen_r"] = gen_r_
-            #     info[itr]["rec_nfe"] = rec_nfe_
-            #     info[itr]["gen_nfe"] = gen_nfe_
+            opt_state = update(itr, opt_state, batch, get_kl_coef(epoch))
+
+            if itr % parse_args.test_freq == 0:
+                loss_, likelihood_, kl_, rec_r_, gen_r_, rec_nfe_, gen_nfe_ = \
+                    evaluate_loss(opt_state, ds_test, get_kl_coef(epoch))
+
+                print_str = 'Iter {:04d} | Loss {:.6f} | ' \
+                            'Likelihood {:.6f} | KL {:.6f} | Enc. r {:.6f} | Dec. r {:.6f} | ' \
+                            'Enc. NFE {:.6f} | Dec. NFE {:.6f}'.\
+                    format(itr, loss_, likelihood_, kl_, rec_r_, gen_r_, rec_nfe_, gen_nfe_)
+
+                print(print_str)
+
+                outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
+                outfile.write(print_str + "\n")
+                outfile.close()
+
+                info[itr]["loss"] = loss_
+                info[itr]["likelihood"] = likelihood_
+                info[itr]["kl"] = kl_
+                info[itr]["rec_r"] = rec_r_
+                info[itr]["gen_r"] = gen_r_
+                info[itr]["rec_nfe"] = rec_nfe_
+                info[itr]["gen_nfe"] = gen_nfe_
 
             if itr % parse_args.save_freq == 0:
                 if odenet:
