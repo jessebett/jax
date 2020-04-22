@@ -5,6 +5,60 @@ Generate synthetic dataset. Modified from https://github.com/YuliaRubanova/laten
 import jax
 import jax.numpy as jnp
 
+import os
+import errno
+import tarfile
+import pickle
+
+
+def makedir_exist_ok(dirpath):
+    """
+    Python2 support for os.makedirs(.., exist_ok=True)
+    """
+    try:
+        os.makedirs(dirpath)
+    except OSError as e:
+        if e.errno == errno.EEXIST:
+            pass
+        else:
+            raise
+
+
+def download_url(url, root, filename=None):
+    """Download a file from a url and place it in root.
+
+    Args:
+        url (str): URL to download file from
+        root (str): Directory to place downloaded file in
+        filename (str, optional): Name to save the file under. If None, use the basename of the URL
+    """
+    from six.moves import urllib
+
+    root = os.path.expanduser(root)
+    if not filename:
+        filename = os.path.basename(url)
+    fpath = os.path.join(root, filename)
+
+    makedir_exist_ok(root)
+
+    # downloads file
+    if os.path.isfile(fpath):
+        print('Using downloaded and verified file: ' + fpath)
+    else:
+        try:
+            print('Downloading ' + url + ' to ' + fpath)
+            urllib.request.urlretrieve(
+                url, fpath
+            )
+        except OSError:
+            if url[:5] == 'https':
+                url = url.replace('https:', 'http:')
+                print('Failed download. Trying https -> http instead.'
+                      ' Downloading ' + url + ' to ' + fpath)
+                urllib.request.urlretrieve(
+                    url, fpath
+                )
+
 
 def _get_next_val(t, tmin, tmax, init, final=None):
     """
@@ -128,6 +182,273 @@ class Periodic1D:
 
         samples = _add_noise(key, samples, noise_weight)
         return timesteps, samples
+
+
+class PhysioNet:
+    """
+    PhysioNet Dataset.
+    """
+
+    urls = [
+        'https://physionet.org/files/challenge-2012/1.0.0/set-a.tar.gz?download',
+        'https://physionet.org/files/challenge-2012/1.0.0/set-b.tar.gz?download',
+    ]
+
+    outcome_urls = ['https://physionet.org/files/challenge-2012/1.0.0/Outcomes-a.txt']
+
+    params = [
+        'Age', 'Gender', 'Height', 'ICUType', 'Weight', 'Albumin', 'ALP', 'ALT', 'AST', 'Bilirubin', 'BUN',
+        'Cholesterol', 'Creatinine', 'DiasABP', 'FiO2', 'GCS', 'Glucose', 'HCO3', 'HCT', 'HR', 'K', 'Lactate', 'Mg',
+        'MAP', 'MechVent', 'Na', 'NIDiasABP', 'NIMAP', 'NISysABP', 'PaCO2', 'PaO2', 'pH', 'Platelets', 'RespRate',
+        'SaO2', 'SysABP', 'Temp', 'TroponinI', 'TroponinT', 'Urine', 'WBC'
+    ]
+
+    params_dict = {k: i for i, k in enumerate(params)}
+
+    labels = ["SAPS-I", "SOFA", "Length_of_stay", "Survival", "In-hospital_death" ]
+    labels_dict = {k: i for i, k in enumerate(labels)}
+
+    def __init__(self,
+                 root,
+                 train=True,
+                 download=False,
+                 quantization=0.1,
+                 n_samples=None):
+
+        self.root = root
+        self.train = train
+        self.reduce = "average"
+        self.quantization = quantization
+
+        if download:
+            self.download()
+
+        if not self._check_exists():
+            raise RuntimeError('Dataset not found. You can use download=True to download it')
+
+        if self.train:
+            data_file = self.training_file
+        else:
+            data_file = self.test_file
+
+        infile = open(os.path.join(self.processed_folder, data_file), 'rb')
+        self.data = pickle.load(infile)
+        infile.close()
+
+        infile = open(os.path.join(self.processed_folder, self.label_file), 'rb')
+        self.labels = pickle.load(infile)
+        infile.close()
+
+        if n_samples is not None:
+            self.data = self.data[:n_samples]
+            self.labels = self.labels[:n_samples]
+
+
+    def download(self):
+        if self._check_exists():
+            return
+
+        os.makedirs(self.raw_folder, exist_ok=True)
+        os.makedirs(self.processed_folder, exist_ok=True)
+
+        # Download outcome data
+        for url in self.outcome_urls:
+            filename = url.rpartition('/')[2]
+            download_url(url, self.raw_folder, filename)
+            txtfile = os.path.join(self.raw_folder, filename)
+            with open(txtfile) as f:
+                lines = f.readlines()
+                outcomes = {}
+                for l in lines[1:]:
+                    l = l.rstrip().split(',')
+                    record_id, labels = l[0], jnp.array(l[1:]).astype(float)
+                    outcomes[record_id] = labels
+
+                outfile = open(os.path.join(self.processed_folder, filename.split('.')[0] + '.pt'), 'wb')
+                pickle.dump(labels, outfile)
+                outfile.close()
+
+        for url in self.urls:
+            filename = url.rpartition('/')[2]
+            download_url(url, self.raw_folder, filename)
+            tar = tarfile.open(os.path.join(self.raw_folder, filename), "r:gz")
+            tar.extractall(self.raw_folder)
+            tar.close()
+
+            print('Processing {}...'.format(filename))
+
+            dirname = os.path.join(self.raw_folder, filename.split('.')[0])
+            patients = []
+            total = 0
+            for txtfile in os.listdir(dirname):
+                record_id = txtfile.split('.')[0]
+                with open(os.path.join(dirname, txtfile)) as f:
+                    lines = f.readlines()
+                    prev_time = 0
+                    tt = [0.]
+                    vals = [jnp.zeros(len(self.params))]
+                    mask = [jnp.zeros(len(self.params))]
+                    nobs = [jnp.zeros(len(self.params))]
+                    for l in lines[1:]:
+                        total += 1
+                        time, param, val = l.split(',')
+                        # Time in hours
+                        time = float(time.split(':')[0]) + float(time.split(':')[1]) / 60.
+                        # round up the time stamps (up to 6 min by default)
+                        # used for speed -- we actually don't need to quantize it in Latent ODE
+                        time = round(time / self.quantization) * self.quantization
+
+                        if time != prev_time:
+                            tt.append(time)
+                            vals.append(jnp.zeros(len(self.params)))
+                            mask.append(jnp.zeros(len(self.params)))
+                            nobs.append(jnp.zeros(len(self.params)))
+                            prev_time = time
+
+                        if param in self.params_dict:
+                            #vals[-1][self.params_dict[param]] = float(val)
+                            n_observations = nobs[-1][self.params_dict[param]]
+                            if self.reduce == 'average' and n_observations > 0:
+                                prev_val = vals[-1][self.params_dict[param]]
+                                new_val = (prev_val * n_observations + float(val)) / (n_observations + 1)
+                                vals[-1][self.params_dict[param]] = new_val
+                            else:
+                                vals[-1][self.params_dict[param]] = float(val)
+                            mask[-1][self.params_dict[param]] = 1
+                            nobs[-1][self.params_dict[param]] += 1
+                        else:
+                            assert param == 'RecordID', 'Read unexpected param {}'.format(param)
+                tt = jnp.array(tt)
+                vals = jnp.stack(vals)
+                mask = jnp.stack(mask)
+
+                labels = None
+                if record_id in outcomes:
+                    # Only training set has labels
+                    labels = outcomes[record_id]
+                    # Out of 5 label types provided for Physionet, take only the last one -- mortality
+                    labels = labels[4]
+
+                patients.append((record_id, tt, vals, mask, labels))
+
+            outfile = open(os.path.join(self.processed_folder,
+                                        filename.split('.')[0] + "_" + str(self.quantization) + '.pt'), 'wb')
+            pickle.dump(patients, outfile)
+            outfile.close()
+
+        print('Done!')
+
+    def _check_exists(self):
+        for url in self.urls:
+            filename = url.rpartition('/')[2]
+
+            if not os.path.exists(
+                os.path.join(self.processed_folder,
+                    filename.split('.')[0] + "_" + str(self.quantization) + '.pt')
+            ):
+                return False
+        return True
+
+    @property
+    def raw_folder(self):
+        return os.path.join(self.root, self.__class__.__name__, 'raw')
+
+    @property
+    def processed_folder(self):
+        return os.path.join(self.root, self.__class__.__name__, 'processed')
+
+    @property
+    def training_file(self):
+        return 'set-a_{}.pt'.format(self.quantization)
+
+    @property
+    def test_file(self):
+        return 'set-b_{}.pt'.format(self.quantization)
+
+    @property
+    def label_file(self):
+        return 'Outcomes-a.pt'
+
+    def __getitem__(self, index):
+        return self.data[index]
+
+    def __len__(self):
+        return len(self.data)
+
+    def get_label(self, record_id):
+        return self.labels[record_id]
+
+    def __repr__(self):
+        fmt_str = 'Dataset ' + self.__class__.__name__ + '\n'
+        fmt_str += '    Number of datapoints: {}\n'.format(self.__len__())
+        fmt_str += '    Split: {}\n'.format('train' if self.train is True else 'test')
+        fmt_str += '    Root Location: {}\n'.format(self.root)
+        fmt_str += '    Quantization: {}\n'.format(self.quantization)
+        fmt_str += '    Reduce: {}\n'.format(self.reduce)
+        return fmt_str
+
+
+def variable_time_collate_fn(batch,
+                             args,
+                             data_type="train",
+                             data_min=None,
+                             data_max=None):
+    """
+    Expects a batch of time series data in the form of (record_id, tt, vals, mask, labels) where
+        - record_id is a patient id
+        - tt is a 1-dimensional tensor containing T time values of observations.
+        - vals is a (T, D) tensor containing observed values for D variables.
+        - mask is a (T, D) tensor containing 1 where values were observed and 0 otherwise.
+        - labels is a list of labels for the current patient, if labels are available. Otherwise None.
+    Returns:
+        combined_tt: The union of all time observations.
+        combined_vals: (M, T, D) tensor containing the observed values.
+        combined_mask: (M, T, D) tensor containing 1 where values were observed and 0 otherwise.
+    """
+    D = batch[0][2].shape[1]
+    combined_tt, inverse_indices = torch.unique(torch.cat([ex[1] for ex in batch]), sorted=True, return_inverse=True)
+    combined_tt = combined_tt.to(device)
+
+    offset = 0
+    combined_vals = torch.zeros([len(batch), len(combined_tt), D]).to(device)
+    combined_mask = torch.zeros([len(batch), len(combined_tt), D]).to(device)
+
+    combined_labels = None
+    N_labels = 1
+
+    combined_labels = torch.zeros(len(batch), N_labels) + torch.tensor(float('nan'))
+    combined_labels = combined_labels.to(device = device)
+
+    for b, (record_id, tt, vals, mask, labels) in enumerate(batch):
+        tt = tt.to(device)
+        vals = vals.to(device)
+        mask = mask.to(device)
+        if labels is not None:
+            labels = labels.to(device)
+
+        indices = inverse_indices[offset:offset + len(tt)]
+        offset += len(tt)
+
+        combined_vals[b, indices] = vals
+        combined_mask[b, indices] = mask
+
+        if labels is not None:
+            combined_labels[b] = labels
+
+    combined_vals, _, _ = utils.normalize_masked_data(combined_vals, combined_mask,
+        att_min = data_min, att_max = data_max)
+
+    if torch.max(combined_tt) != 0.:
+        combined_tt = combined_tt / torch.max(combined_tt)
+
+    data_dict = {
+        "data": combined_vals,
+        "time_steps": combined_tt,
+        "mask": combined_mask,
+        "labels": combined_labels}
+
+    data_dict = utils.split_and_subsample_batch(data_dict, args, data_type = data_type)
+    return data_dict
 
 def init_periodic_data(rng, parse_args):
     """
