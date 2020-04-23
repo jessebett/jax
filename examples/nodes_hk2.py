@@ -537,7 +537,17 @@ def run():
                                            lambda _: lax.cond(_epoch < 140, 1e-3, id, 1e-4, id)))
 
     opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
-    opt_state = opt_init(model["params"])
+    if parse_args.load_ckpt:
+        file_ = open(parse_args.load_ckpt, 'rb')
+        init_params = pickle.load(file_)
+        file_.close()
+
+        # parse itr from the checkpoint
+        load_itr = int(os.path.basename(parse_args.load_ckpt).split("_")[-2])
+    else:
+        init_params = model["params"]
+        load_itr = 0
+    opt_state = opt_init(init_params)
 
     @jax.jit
     def update(_itr, _opt_state, _batch):
@@ -599,6 +609,9 @@ def run():
 
             itr += 1
 
+            if parse_args.load_ckpt:
+                if itr <= load_itr:
+                    continue
             opt_state = update(itr, opt_state, batch)
 
             if itr % parse_args.test_freq == 0:
