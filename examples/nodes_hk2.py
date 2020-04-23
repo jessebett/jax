@@ -503,7 +503,7 @@ def init_data():
 
     ds_train = ds_train.cache()
     ds_train = ds_train.repeat()
-    ds_train = ds_train.shuffle(1000)
+    ds_train = ds_train.shuffle(1000, seed=seed)
     ds_train, ds_train_eval = ds_train.batch(parse_args.batch_size), ds_train.batch(test_batch_size)
     ds_train, ds_train_eval = tfds.as_numpy(ds_train), tfds.as_numpy(ds_train_eval)
 
