@@ -38,6 +38,7 @@ parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resnet', action="store_true")
 parser.add_argument('--no_count_nfe', action="store_true")
 parser.add_argument('--num_blocks', type=int, default=6)
+parser.add_argument('--load_ckpt', type=str, default=None)
 parse_args = parser.parse_args()
 
 
@@ -485,7 +486,8 @@ def init_data():
                                      split=['train'],
                                      shuffle_files=True,
                                      as_supervised=True,
-                                     with_info=True)
+                                     with_info=True,
+                                     read_config=tfds.ReadConfig(shuffle_seed=parse_args.seed))
 
     num_train = ds_info.splits['train'].num_examples
 
