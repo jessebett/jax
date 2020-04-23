@@ -182,7 +182,7 @@ class PreODE(hk.Module):
         #               padding=lambda _: (1, 1))
         # ])
         self.model = hk.Sequential([
-            lambda x: x.astype(jnp.float32) / 255.,
+            lambda x: x.astype(jnp.float64) / 255.,
             Flatten()
         ])
 
