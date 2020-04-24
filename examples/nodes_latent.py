@@ -34,8 +34,8 @@ parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
-parser.add_argument('--test_freq', type=int, default=1)
-parser.add_argument('--save_freq', type=int, default=50)
+parser.add_argument('--test_freq', type=int, default=160)
+parser.add_argument('--save_freq', type=int, default=160)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resnet', action="store_true")
@@ -385,7 +385,6 @@ def init_model(rec_ode_kwargs,
 
         rs, nfes = rs_nfes
 
-        # TODO: if we regularize encoder, how to weight rs in general?
         return final_y, final_y_std, jnp.mean(rs), nfes
 
     model = {
