@@ -63,8 +63,8 @@ num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
     "rtol": parse_args.rtol,
-    "method": parse_args.method,
-    "init_step": parse_args.init_step
+    # "method": parse_args.method,
+    # "init_step": parse_args.init_step
 }
 
 
