@@ -19,7 +19,7 @@ from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 from jax.config import config
-config.update("jax_enable_x64", True)
+# config.update("jax_enable_x64", True)
 
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=100)
@@ -182,7 +182,7 @@ class PreODE(hk.Module):
         #               padding=lambda _: (1, 1))
         # ])
         self.model = hk.Sequential([
-            lambda x: x.astype(jnp.float64) / 255.,
+            lambda x: x.astype(jnp.float32) / 255.,
             Flatten()
         ])
 
