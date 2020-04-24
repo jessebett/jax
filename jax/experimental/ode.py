@@ -282,7 +282,7 @@ def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
                       np.minimum(err_ratio**(1.0 / order) / safety, 1.0 / dfactor))
   return np.where(mean_error_ratio == 0, last_step * ifactor, last_step / factor)
 
-def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, init_step=-1., mxstep=np.inf, method="dopri5"):
+def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
   """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
 
   Args:
@@ -301,14 +301,13 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, init_step=-1., mxstep=n
     point in `t`, represented as an array (or pytree of arrays) with the same
     shape/structure as `y0` except with a new leading axis of length `len(t)`.
   """
-  return _odeint_wrapper(func, rtol, atol, init_step, mxstep, method, y0, t, *args)
+  return _odeint_wrapper(func, rtol, atol, mxstep, y0, t, *args)
 
-@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
-def _odeint_wrapper(func, rtol, atol, init_step, mxstep, method, y0, ts, *args):
+@partial(jax.jit, static_argnums=(0, 1, 2, 3))
+def _odeint_wrapper(func, rtol, atol, mxstep, y0, ts, *args):
   y0, unravel = ravel_pytree(y0)
   func = ravel_first_arg(func, unravel)
-  _odeint = methods[method]
-  out, nfe = _odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args)
+  out, nfe = _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args)
   return jax.vmap(unravel)(out), nfe
 
 def _euler_odeint(func, num_steps, y0, ts, *args):
@@ -332,9 +331,8 @@ def _euler_odeint(func, num_steps, y0, ts, *args):
   return final_y
 
 
-
-@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
-def _dopri5_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
+def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
 
   def scan_fun(carry, target_t):
@@ -364,9 +362,8 @@ def _dopri5_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
     return carry, y_target
 
   f0 = func_(y0, ts[0])
-  dt, init_nfe = lax.cond(init_step <= 0,
-                          None, lambda _: (initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0), 2),
-                          None, lambda _: (init_step, 1))
+  init_nfe = 1
+  dt = initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0)
   interp_coeff = np.array([y0] * 5)
   init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff, init_nfe]
   carry, ys = lax.scan(scan_fun, init_carry, ts[1:])
@@ -426,11 +423,11 @@ def _adams_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
   nfe = carry[-1]
   return np.concatenate((y0[None], ys)), nfe
 
-def _odeint_fwd(_odeint, func, rtol, atol, init_step, mxstep, y0, ts, *args):
-  ys, nfe = _odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args)
+def _odeint_fwd(func, rtol, atol, mxstep, y0, ts, *args):
+  ys, nfe = _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args)
   return (ys, nfe), (ys, ts, args)
 
-def _odeint_rev(method, func, rtol, atol, init_step, mxstep, res, g):
+def _odeint_rev(func, rtol, atol, mxstep, res, g):
   ys, ts, args = res
   g, _ = g
 
@@ -474,8 +471,8 @@ methods = {
   "dopri5": _dopri5_odeint,
   "adams": _adams_odeint
 }
-_dopri5_odeint.defvjp(partial(_odeint_fwd, _dopri5_odeint), partial(_odeint_rev, "dopri5"))
-_adams_odeint.defvjp(partial(_odeint_fwd, _adams_odeint), partial(_odeint_rev, "adams"))
+_dopri5_odeint.defvjp(_odeint_fwd, _odeint_rev)
+# _adams_odeint.defvjp(partial(_odeint_fwd, _adams_odeint), partial(_odeint_rev, "adams"))
 
 def pend(np, y, _, m, g):
   theta, omega = y
@@ -522,9 +519,9 @@ def pend_benchmark_odeint(**kwargs):
   _, _ = benchmark_odeint(pend, [np.pi - 0.1, 0.0], np.linspace(0., 10., 2),
                           0.25, 9.8, **kwargs)
 
-def pend_check_grads(method):
+def pend_check_grads():
   def f(y0, ts, *args):
-    return odeint(partial(pend, np), y0, ts, *args, method=method)[0]
+    return odeint(partial(pend, np), y0, ts, *args)[0]
 
   y0 = [np.pi - 0.1, 0.0]
   ts = np.linspace(0., 1., 11)
@@ -609,15 +606,15 @@ def weird_time_pendulum_check_grads():
 
 if __name__ == '__main__':
   kwargs = {
-    "method": "dopri5",
-    "init_step": 0.1,
-    "atol": 1e-3,
-    "rtol": 1e-3
+    # "method": "dopri5",
+    # "init_step": 0.1,
+    "atol": 1.4e-8,
+    "rtol": 1.4e-8
   }
   const_test(**kwargs)
   linear_test(**kwargs)
   sin_test(**kwargs)
   pend_benchmark_odeint(**kwargs)
-  pend_check_grads(kwargs["method"])
+  pend_check_grads()
   weird_time_pendulum_check_grads()
   print("method\t\t", kwargs["method"])
