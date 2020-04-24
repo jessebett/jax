@@ -364,14 +364,14 @@ def init_model(rec_ode_kwargs,
             xi, ti = target
 
             # euler integration
-            step_size = (prev_t - ti) / 1.
-            def body_fun(itr, val):
-                _prev_y, _prev_t = val
-                t = _prev_t + step_size
-                next_y = _prev_y + step_size * rec_dynamics_wrap(_prev_y, _prev_t, params["rec_dynamics"])
-                return (next_y, t)
-            yi_ode, _ = lax.fori_loop(0., 1., body_fun, (prev_y, prev_t))
-            nfe = 1.
+            numsteps = 1.
+            ts_grid = jnp.linspace(ti, prev_t, numsteps)
+            def body_fun(_carry, t):
+                _prev_y, _prev_t = _carry
+                next_y = _prev_y + (t - _prev_t) * rec_dynamics_wrap(_prev_y, _prev_t, params["rec_dynamics"])
+                return (next_y, t), None
+            (yi_ode, _), _ = lax.scan(body_fun, (prev_y, prev_t), ts_grid)
+            nfe = numsteps
             r_ode = 0.
 
             yi, yi_std = gru.apply(params["gru"],
