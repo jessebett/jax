@@ -62,8 +62,8 @@ num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
     "rtol": parse_args.rtol,
-    "method": parse_args.method,
-    "init_step": parse_args.init_step
+    # "method": parse_args.method,
+    # "init_step": parse_args.init_step
 }
 
 
@@ -73,6 +73,14 @@ def sigmoid(z):
   Numerically stable sigmoid.
   """
   return 1/(1 + jnp.exp(-z))
+
+
+def logsumexp(x, axis=-1):
+    """
+    Numerically stable logsumexp.
+    """
+    x_max = x.max(axis)
+    return x_max + jnp.log(jnp.sum(jnp.exp(x - x_max), axis, keepdims=False))
 
 
 def sol_recursive(f, z, t):
@@ -443,7 +451,7 @@ def loss_fn(forward, params, data, timesteps, kl_coef):
     kl_ = _kl_div(z0_params)
     rec_reg_ = _reg_loss_fn(rec_r)
     gen_reg_ = _reg_loss_fn(gen_r)
-    return -jnp.mean(likelihood_ - kl_coef * kl_) + lam_rec * rec_reg_ + lam_gen * gen_reg_
+    return -logsumexp(likelihood_ - kl_coef * kl_, axis=0) + lam_rec * rec_reg_ + lam_gen * gen_reg_
 
 
 def run():
