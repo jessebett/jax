@@ -408,8 +408,8 @@ def adamax(step_size, b1=0.9, b2=0.999, eps=1e-8):
   def update(i, g, state):
     x, m, u = state
     m = (1 - b1) * g + b1 * m  # First  moment estimate.
-    u = np.maximum(b2 * u, np.abs(g))  # Update exponentially weighted infinity norm.
-    x = x - (step_size(i) / (1 - b1 ** (i + 1))) * m / (u + eps)
+    u = np.maximum(b2 * u, np.abs(g) + eps)  # Update exponentially weighted infinity norm.
+    x = x - (step_size(i) / (1 - b1 ** (i + 1))) * m / u
     return x, m, u
   def get_params(state):
     x, m, u = state
