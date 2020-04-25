@@ -22,7 +22,7 @@ from jax.experimental.jet import jet
 
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=50)
-parser.add_argument('--test_batch_size', type=int, default=1000)
+parser.add_argument('--test_batch_size', type=int, default=800)
 parser.add_argument('--nepochs', type=int, default=500)
 parser.add_argument('--subsample', type=int, default=50)
 parser.add_argument('--lr', type=float, default=1e-2)
