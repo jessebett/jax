@@ -166,9 +166,10 @@ class Dynamics(hk.Module):
                                    )
 
     def __call__(self, y, t):
-        y = jnp.reshape(y, (-1, self.latent_dim))
-        y_t = jnp.concatenate((y, jnp.ones((y.shape[0], 1)) * t), axis=1)
-        return self.model(y_t)
+        # y = jnp.reshape(y, (-1, self.latent_dim))
+        # y_t = jnp.concatenate((y, jnp.ones((y.shape[0], 1)) * t), axis=1)
+        # return self.model(y_t)
+        return self.model(y)
 
 
 def wrap_module(module, *module_args, **module_kwargs):
