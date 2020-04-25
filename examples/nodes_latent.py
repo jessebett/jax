@@ -260,7 +260,7 @@ def init_model(rec_ode_kwargs,
                                             layers=rec_layers)
                                 )
     rec_dynamics_params = rec_dynamics.init(rng, *initialization_data_["rec_dynamics"])
-    rec_dynamics_wrap = lambda x, t, params: jnp.squeeze(rec_dynamics.apply(params, x, t), axis=0)
+    rec_dynamics_wrap = lambda x, t, params: rec_dynamics.apply(params, x, t)
 
     rec_to_gen = hk.transform(wrap_module(lambda: hk.Sequential([
         lambda x, y: jnp.concatenate((x, y), axis=-1),
@@ -353,9 +353,6 @@ def init_model(rec_ode_kwargs,
         init_t = timesteps[-1]
         init_y, init_std = gru.apply(params["gru"], jnp.zeros(rec_dim), jnp.zeros(rec_dim), data[-1])
 
-        interval_length = timesteps[-1] - timesteps[0]
-        minstep = interval_length / 50
-
         def scan_fun(carry, target):
             """
             Function to scan over observations of input sequence.
@@ -363,16 +360,23 @@ def init_model(rec_ode_kwargs,
             prev_y, prev_std, prev_t = carry
             xi, ti = target
 
-            # euler integration
-            numsteps = 1.
-            ts_grid = jnp.linspace(ti, prev_t, numsteps)
-            def body_fun(_carry, t):
-                _prev_y, _prev_t = _carry
-                next_y = _prev_y + (t - _prev_t) * rec_dynamics_wrap(_prev_y, _prev_t, params["rec_dynamics"])
-                return (next_y, t), None
-            (yi_ode, _), _ = lax.scan(body_fun, (prev_y, prev_t), ts_grid)
-            nfe = numsteps
-            r_ode = 0.
+            if count_nfe_:
+                dynamics = lambda *args: -rec_dynamics_wrap(*args)
+                init = prev_y
+            else:
+                dynamics = augment_dynamics(rec_dynamics_wrap, sign=-1)
+                init = aug_init(prev_y)
+            ys_ode, nfe = odeint(lambda x, t, params_: dynamics(x, -t, params_),
+                                 init,
+                                 -jnp.array([prev_t, ti]),
+                                 params["rec_dynamics"],
+                                 **rec_ode_kwargs)
+            if count_nfe_:
+                yi_ode = ys_ode[-1]
+                r_ode = 0.
+            else:
+                ys_ode, rs_ode = ys_ode
+                yi_ode, r_ode = ys_ode[-1], rs_ode[-1]
 
             yi, yi_std = gru.apply(params["gru"],
                                    yi_ode, prev_std, xi)
