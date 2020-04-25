@@ -494,7 +494,7 @@ def run():
         preds, rec_r, gen_r, z0_params, nfe = forward(params, data, timesteps)
         likelihood_ = _likelihood(preds, data)
         kl_ = _kl_div(z0_params)
-        return -jnp.mean(likelihood_ - kl_coef * kl_), likelihood_, kl_, rec_r, gen_r
+        return -logsumexp(likelihood_ - kl_coef * kl_, axis=0), likelihood_, kl_, rec_r, gen_r
 
     def evaluate_loss(opt_state, ds_test, kl_coef):
         """
