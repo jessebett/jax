@@ -455,7 +455,7 @@ def init_periodic_data(rng, parse_args):
     Initialize toy data. This example is easier since time_points are shared across all examples.
     """
     n_samples = 1000
-    noise_weight = 0.1
+    noise_weight = 0.01
 
     timesteps, samples = Periodic1D(init_freq=None,
                                     init_amplitude=1.,
