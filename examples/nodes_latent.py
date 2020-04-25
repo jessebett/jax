@@ -189,7 +189,8 @@ def initialization_data(rec_dim, gen_dim, data_dim):
     Creates data for initializing each of the modules based on the shapes of init_data.
     """
     data = {
-        "gru": (jnp.zeros(rec_dim), jnp.zeros(rec_dim), jnp.zeros((data_dim, ))),
+        # "gru": (jnp.zeros(rec_dim), jnp.zeros(rec_dim), jnp.zeros((data_dim, ))),
+        "gru_rnn": (jnp.zeros(data_dim + 1), jnp.zeros(2 * rec_dim)),
         "rec_dynamics": (jnp.zeros(rec_dim), 0.),
         "rec_to_gen": (jnp.zeros(rec_dim), jnp.zeros(rec_dim)),
         "gen_dynamics": (jnp.zeros(gen_dim), 0.),
@@ -248,11 +249,18 @@ def init_model(rec_ode_kwargs,
         "b_init": jnp.zeros
     }
 
-    gru = hk.transform(wrap_module(LatentGRU,
-                                   latent_dim=rec_dim,
-                                   n_units=gru_units,
-                                   **init_kwargs))
-    gru_params = gru.init(rng, *initialization_data_["gru"])
+    # gru = hk.transform(wrap_module(LatentGRU,
+    #                                latent_dim=rec_dim,
+    #                                n_units=gru_units,
+    #                                **init_kwargs))
+    # gru_params = gru.init(rng, *initialization_data_["gru"])
+
+    gru_rnn = hk.transform(wrap_module(hk.GRU,
+                                       hidden_size=2 * rec_dim,
+                                       w_i_init=hk.initializers.RandomNormal(mean=0, stddev=0.1),
+                                       w_h_init=hk.initializers.RandomNormal(mean=0, stddev=0.1),
+                                       b_init=jnp.zeros))
+    gru_rnn_params = gru_rnn.init(rng, *initialization_data_["gru_rnn"])
 
     rec_dynamics = hk.transform(wrap_module(Dynamics,
                                             latent_dim=rec_dim,
@@ -283,7 +291,8 @@ def init_model(rec_ode_kwargs,
     gen_to_data_params = gen_to_data.init(rng, initialization_data_["gen_to_data"])
 
     init_params = {
-        "gru": gru_params,
+        # "gru": gru_params,
+        "gru_rnn": gru_rnn_params,
         "rec_dynamics": rec_dynamics_params,
         "rec_to_gen": rec_to_gen_params,
         "gen_dynamics": gen_dynamics_params,
@@ -296,9 +305,12 @@ def init_model(rec_ode_kwargs,
         y are the latent variables of the recognition model
         z are the latent variables of the generative model
         """
-        # ode-rnn encoder
+        # # ode-rnn encoder
+        # final_y, final_y_std, rec_r, rec_nfes = \
+        #     jax.vmap(partial(ode_rnn, count_nfe_), in_axes=(None, 0, 0))(params, data, timesteps)
+        # ode encoder
         final_y, final_y_std, rec_r, rec_nfes = \
-            jax.vmap(partial(ode_rnn, count_nfe_), in_axes=(None, 0, 0))(params, data, timesteps)
+            jax.vmap(rnn, in_axes=(None, 0, 0))(params, data, timesteps)
 
         # translate
         z0 = rec_to_gen.apply(params["rec_to_gen"], final_y, final_y_std)
@@ -390,6 +402,27 @@ def init_model(rec_ode_kwargs,
         rs, nfes = rs_nfes
 
         return final_y, final_y_std, jnp.mean(rs), nfes
+
+    def rnn(params, data, timesteps):
+        """
+        ODE-RNN model.
+        """
+
+        # concatenate time_delta
+        delta = jnp.expand_dims(jnp.concatenate((timesteps[1:] - timesteps[:-1], jnp.zeros(1))), axis=1)
+        data_delta = jnp.concatenate((data, delta), axis=1)
+
+        init_state = jnp.zeros(2 * rec_dim)
+
+        def scan_fun(prev_state, next_input):
+            out, next_state = gru_rnn.apply(params["gru_rnn"], next_input, prev_state)
+            return next_state, out
+        state, out = lax.scan(scan_fun, init_state, data_delta)
+        last_out = out[-1]
+
+        final_y, final_y_std = last_out[..., :rec_dim], last_out[..., rec_dim:]
+
+        return final_y, final_y_std, 0., jnp.zeros(data.shape[0] - 1)
 
     model = {
         "forward": partial(forward, False),
