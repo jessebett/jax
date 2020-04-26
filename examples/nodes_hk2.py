@@ -19,7 +19,7 @@ from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 from jax.config import config
-# config.update("jax_enable_x64", True)
+config.update("jax_enable_x64", True)
 
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=100)
@@ -58,7 +58,7 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
-vmap = False
+vmap = True
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
@@ -182,7 +182,7 @@ class PreODE(hk.Module):
         #               padding=lambda _: (1, 1))
         # ])
         self.model = hk.Sequential([
-            lambda x: x.astype(jnp.float32) / 255.,
+            lambda x: x.astype(jnp.float64) / 255.,
             Flatten()
         ])
 
@@ -382,7 +382,7 @@ def init_model():
                 """
                 in_ode = pre_ode_fn(params["pre_ode"], _images)
                 f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
-                return jnp.mean(f_nfe)
+                return f_nfe
 
         else:
             nfe_fn = None
@@ -637,9 +637,9 @@ def run():
 
             if itr % parse_args.save_freq == 0:
                 if odenet:
-                    param_filename = "%s/reg_%s_lam_%.4e_%d_fargs.pickle" % (dirname, reg, lam, itr)
+                    param_filename = "%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr)
                 else:
-                    param_filename = "%s/reg_%s_lam_%.4e_num_blocks_%d_%d_fargs.pickle" % (dirname, reg, lam, num_blocks, itr)
+                    param_filename = "%s/reg_%s_lam_%.18e_num_blocks_%d_%d_fargs.pickle" % (dirname, reg, lam, num_blocks, itr)
                 fargs = get_params(opt_state)
                 outfile = open(param_filename, "wb")
                 pickle.dump(fargs, outfile)
@@ -652,7 +652,7 @@ def run():
         "info": info,
         "args": parse_args
     }
-    outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "wb")
+    outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "wb")
     pickle.dump(meta, outfile)
     outfile.close()
 
