@@ -184,6 +184,78 @@ class Periodic1D:
         return timesteps, samples
 
 
+class Periodic1DGap:
+    """
+    Period 1 dimensional data.
+    """
+    def __init__(self,
+                 init_freq=0.3,
+                 init_amplitude=1.,
+                 final_amplitude=10.,
+                 final_freq=1.,
+                 z0=0.):
+        """
+        If (init_freq, init_amplitude, final_amplitude, final_freq) is not provided, it is randomly sampled.
+        For now, all the time series share the time points and the starting point.
+        """
+        super(Periodic1DGap, self).__init__()
+
+        self.init_freq = init_freq
+        self.init_amplitude = init_amplitude
+        self.final_amplitude = final_amplitude
+        self.final_freq = final_freq
+        self.z0 = z0
+
+    def sample(self,
+               key,
+               n_samples=1,
+               noise_weight=1.,
+               max_t_extrap_left=5.,
+               min_t_extrap_right=10.,
+               max_t_extrap_right=15.,
+               n_tp=100):
+        """
+        Sample periodic functions.
+        """
+        n_tp_left = n_tp // 2
+        n_tp_right = n_tp - n_tp_left
+        timesteps_extrap_left = jax.random.uniform(key,
+                                                   (n_tp_left - 1, ),
+                                                   minval=0.,
+                                                   maxval=max_t_extrap_left)
+        timesteps_extrap_right = jax.random.uniform(key,
+                                                    (n_tp_right - 1, ),
+                                                    minval=min_t_extrap_right,
+                                                    maxval=max_t_extrap_right)
+        timesteps = jnp.sort(jnp.concatenate((jnp.array([0.]),
+                                              timesteps_extrap_left,
+                                              timesteps_extrap_right)))
+
+        def gen_sample(subkey):
+            """
+            Generate one time-series sample.
+            """
+            subkey, init_freq = _assign_value_or_sample(subkey, self.init_freq, [0.4, 0.8])
+            final_freq = init_freq if self.final_freq is None else self.final_freq
+            subkey, init_amplitude = _assign_value_or_sample(subkey, self.init_amplitude, [0., 1.])
+            subkey, final_amplitude = _assign_value_or_sample(subkey, self.final_amplitude, [0., 1.])
+
+            z0 = self.z0 + jax.random.normal(subkey) * 0.1
+
+            sample = _gen_sample(timesteps,
+                                 init_freq=init_freq,
+                                 init_amplitude=init_amplitude,
+                                 starting_point=z0,
+                                 final_amplitude=final_amplitude,
+                                 final_freq=final_freq)
+            return sample
+
+        samples = jax.vmap(gen_sample)(jax.random.split(key, num=n_samples))
+
+        samples = _add_noise(key, samples, noise_weight)
+        return timesteps, samples
+
+
 class PhysioNet:
     """
     PhysioNet Dataset.
@@ -450,6 +522,7 @@ def variable_time_collate_fn(batch,
     data_dict = utils.split_and_subsample_batch(data_dict, args, data_type = data_type)
     return data_dict
 
+
 def init_periodic_data(rng, parse_args):
     """
     Initialize toy data. This example is easier since time_points are shared across all examples.
@@ -457,7 +530,7 @@ def init_periodic_data(rng, parse_args):
     n_samples = 1000
     noise_weight = 0.01
 
-    timesteps, samples = Periodic1D(init_freq=None,
+    timesteps, samples = Periodic1DGap(init_freq=None,
                                     init_amplitude=1.,
                                     final_amplitude=1.,
                                     final_freq=None,
