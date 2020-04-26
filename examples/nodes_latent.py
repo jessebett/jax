@@ -35,7 +35,7 @@ parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
 parser.add_argument('--test_freq', type=int, default=80)
-parser.add_argument('--save_freq', type=int, default=80)
+parser.add_argument('--save_freq', type=int, default=160)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resnet', action="store_true")
@@ -169,6 +169,8 @@ class Dynamics(hk.Module):
         # y = jnp.reshape(y, (-1, self.latent_dim))
         # y_t = jnp.concatenate((y, jnp.ones((y.shape[0], 1)) * t), axis=1)
         # return self.model(y_t)
+        # need to reshape so regularization knows what to take mean over
+        y = jnp.reshape(y, (-1, self.latent_dim))
         return self.model(y)
 
 
@@ -215,7 +217,7 @@ def augment_dynamics(dynamics, sign=1):
             # do r3 regularization
             y0, y_n = sol_recursive(lambda _y, _t: dynamics(_y, _t, params), y, t)
             r = y_n[-1]
-            return jnp.sum(r ** 2, axis=[axis_ for axis_ in range(1, r.ndim)])
+            return jnp.mean(r ** 2, axis=[axis_ for axis_ in range(1, r.ndim)])
 
     def aug_dynamics(yr, t, params):
         """
@@ -300,7 +302,7 @@ def init_model(rec_ode_kwargs,
         "gen_to_data": gen_to_data_params
     }
 
-    def forward(count_nfe_, params, data, timesteps, num_samples=3):
+    def forward(count_nfe_, params, data, data_timesteps, timesteps, num_samples=3):
         """
         Forward pass of the model.
         y are the latent variables of the recognition model
@@ -308,7 +310,7 @@ def init_model(rec_ode_kwargs,
         """
         # # ode-rnn encoder
         final_y, final_y_std, rec_r, rec_nfes = \
-            jax.vmap(partial(ode_rnn, count_nfe_), in_axes=(None, 0, 0))(params, data, timesteps)
+            jax.vmap(partial(ode_rnn, count_nfe_), in_axes=(None, 0, 0))(params, data, data_timesteps)
         # ode encoder
         # final_y, final_y_std, rec_r, rec_nfes = \
         #     jax.vmap(rnn, in_axes=(None, 0, 0))(params, data, timesteps)
@@ -356,7 +358,7 @@ def init_model(rec_ode_kwargs,
             "gen": jnp.mean(gen_nfes)
         }
 
-        return pred, rec_r, gen_r, z0_params, nfe
+        return z, pred, rec_r, gen_r, z0_params, nfe
 
     def ode_rnn(count_nfe_, params, data, timesteps):
         """
@@ -373,23 +375,15 @@ def init_model(rec_ode_kwargs,
             prev_y, prev_std, prev_t = carry
             xi, ti = target
 
-            if count_nfe_:
-                dynamics = lambda *args: -rec_dynamics_wrap(*args)
-                init = prev_y
-            else:
-                dynamics = augment_dynamics(rec_dynamics_wrap, sign=-1)
-                init = aug_init(prev_y)
+            dynamics = lambda *args: -rec_dynamics_wrap(*args)
+            init = prev_y
             ys_ode, nfe = odeint(lambda x, t, params_: dynamics(x, -t, params_),
                                  init,
                                  -jnp.array([prev_t, ti]),
                                  params["rec_dynamics"],
                                  **rec_ode_kwargs)
-            if count_nfe_:
-                yi_ode = ys_ode[-1]
-                r_ode = 0.
-            else:
-                ys_ode, rs_ode = ys_ode
-                yi_ode, r_ode = ys_ode[-1], rs_ode[-1]
+            yi_ode = ys_ode[-1]
+            r_ode = 0.
 
             yi, yi_std = gru.apply(params["gru"],
                                    yi_ode, prev_std, xi)
@@ -428,7 +422,7 @@ def init_model(rec_ode_kwargs,
     model = {
         "forward": partial(forward, False),
         "params": init_params,
-        "nfe": lambda *args: partial(forward, count_nfe)(*args)[-1]
+        "nfe": lambda params, data, timesteps: partial(forward, count_nfe)(params, data, timesteps, timesteps)[-1]
     }
 
     return model
@@ -499,7 +493,7 @@ def run():
     num_test_batches = meta["num_test_batches"]
 
     model = init_model(ode_kwargs, ode_kwargs)
-    forward = model["forward"]
+    forward = lambda params, data, timesteps: model["forward"](params, data, timesteps, timesteps)[1:]
     grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
 
     lr_schedule = optimizers.exponential_decay(step_size=parse_args.lr,
