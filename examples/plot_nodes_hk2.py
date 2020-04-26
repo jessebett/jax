@@ -127,7 +127,7 @@ def get_nfe_dist(lam):
     meta_file = open("%s/reg_%s_lam_%.4e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
     meta = pickle.load(meta_file)
 
-    nfes_filename = "%s/reg_%s_lam_%.4e_nfe_dist.pickle" % (dirname, reg, lam)
+    nfes_filename = "%s/reg_%s_lam_%.12e_nfe_dist.pickle" % (dirname, reg, lam)
     try:
         nfes_file = open(nfes_filename, "rb")
         nfes = pickle.load(nfes_file)
