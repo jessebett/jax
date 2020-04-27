@@ -10,7 +10,7 @@ from functools import partial
 
 import haiku as hk
 
-from timeseries import init_periodic_data
+from timeseries import init_periodic_gap_data
 
 import jax
 from jax import lax
@@ -447,7 +447,8 @@ def init_model(rec_ode_kwargs,
     model = {
         "forward": partial(forward, False),
         "params": init_params,
-        "nfe": lambda params, data, timesteps: partial(forward, count_nfe)(params, data, timesteps, timesteps)[-1]
+        "nfe": lambda params, data_left, timesteps_left, timesteps:
+        partial(forward, count_nfe)(params, data_left, timesteps_left, timesteps)[-1]
     }
 
     return model
@@ -494,11 +495,11 @@ def _weight_fn(params):
     return 0.5 * jnp.sum(jnp.square(flat_params))
 
 
-def loss_fn(forward, params, data, timesteps, kl_coef):
+def loss_fn(forward, params, data_left, timesteps_left, data, timesteps, kl_coef):
     """
     The loss function for training.
     """
-    preds, rec_r, gen_r, z0_params, nfe = forward(params, data, timesteps)
+    preds, rec_r, gen_r, z0_params, nfe = forward(params, data_left, timesteps_left, timesteps)
     likelihood_ = _likelihood(preds, data)
     kl_ = _kl_div(z0_params)
     rec_reg_ = _reg_loss_fn(rec_r)
@@ -513,12 +514,12 @@ def run():
     print("Reg: %s\tLambda %.4e" % (reg, lam))
     print("Reg: %s\tLambda %.4e" % (reg, lam), file=sys.stderr)
 
-    ds_train, ds_test, meta = init_periodic_data(rng, parse_args)
+    ds_train, ds_test, meta = init_periodic_gap_data(rng, parse_args)
     num_batches = meta["num_batches"]
     num_test_batches = meta["num_test_batches"]
 
     model = init_model(ode_kwargs, ode_kwargs)
-    forward = lambda params, data, timesteps: model["forward"](params, data, timesteps, timesteps)[1:]
+    forward = lambda *args: model["forward"](*args)[1:]
     grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
 
     lr_schedule = optimizers.exponential_decay(step_size=parse_args.lr,
@@ -547,8 +548,8 @@ def run():
         Convenience function for calculating losses separately.
         """
         params = get_params(_opt_state)
-        data, timesteps = _batch
-        preds, rec_r, gen_r, z0_params, nfe = forward(params, data, timesteps)
+        data_left, timesteps_left, data, timesteps = _batch
+        preds, rec_r, gen_r, z0_params, nfe = forward(params, data_left, timesteps_left, timesteps)
         likelihood_ = _likelihood(preds, data)
         kl_ = _kl_div(z0_params)
         return -logsumexp(likelihood_ - kl_coef * kl_, axis=0), likelihood_, kl_, rec_r, gen_r
@@ -567,7 +568,8 @@ def run():
                 sep_losses(opt_state, test_batch, kl_coef)
 
             if count_nfe:
-                nfes = model["nfe"](get_params(opt_state), *test_batch)
+                data_left, timesteps_left, data, timesteps = test_batch
+                nfes = model["nfe"](get_params(opt_state), data_left, timesteps_left, timesteps)
                 rec_nfe.append(nfes["rec"])
                 gen_nfe.append(nfes["gen"])
             else:
