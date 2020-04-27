@@ -281,18 +281,16 @@ class PhysioNet:
 
     params_dict = {k: i for i, k in enumerate(params)}
 
-    labels = ["SAPS-I", "SOFA", "Length_of_stay", "Survival", "In-hospital_death" ]
+    labels = ["SAPS-I", "SOFA", "Length_of_stay", "Survival", "In-hospital_death"]
     labels_dict = {k: i for i, k in enumerate(labels)}
 
     def __init__(self,
                  root,
-                 train=True,
                  download=False,
                  quantization=0.1,
                  n_samples=None):
 
         self.root = root
-        self.train = train
         self.reduce = "average"
         self.quantization = quantization
 
@@ -302,22 +300,14 @@ class PhysioNet:
         if not self._check_exists():
             raise RuntimeError('Dataset not found. You can use download=True to download it')
 
-        if self.train:
-            data_file = self.training_file
-        else:
-            data_file = self.test_file
-
-        infile = open(os.path.join(self.processed_folder, data_file), 'rb')
-        self.data = pickle.load(infile)
-        infile.close()
-
-        infile = open(os.path.join(self.processed_folder, self.label_file), 'rb')
-        self.labels = pickle.load(infile)
-        infile.close()
+        self.data = []
+        for data_file in [self.training_file, self.test_file]:
+            infile = open(os.path.join(self.processed_folder, data_file), 'rb')
+            self.data += pickle.load(infile)
+            infile.close()
 
         if n_samples is not None:
             self.data = self.data[:n_samples]
-            self.labels = self.labels[:n_samples]
 
     def download(self):
         """
@@ -328,23 +318,6 @@ class PhysioNet:
 
         os.makedirs(self.raw_folder, exist_ok=True)
         os.makedirs(self.processed_folder, exist_ok=True)
-
-        # Download outcome data
-        for url in self.outcome_urls:
-            filename = url.rpartition('/')[2]
-            download_url(url, self.raw_folder, filename)
-            txtfile = os.path.join(self.raw_folder, filename)
-            with open(txtfile) as f:
-                lines = f.readlines()
-                outcomes = {}
-                for l in lines[1:]:
-                    l = l.rstrip().split(',')
-                    record_id, labels = l[0], jnp.array(l[1:]).astype(float)
-                    outcomes[record_id] = labels
-
-                outfile = open(os.path.join(self.processed_folder, filename.split('.')[0] + '.pt'), 'wb')
-                pickle.dump(labels, outfile)
-                outfile.close()
 
         for url in self.urls:
             filename = url.rpartition('/')[2]
@@ -358,7 +331,11 @@ class PhysioNet:
             dirname = os.path.join(self.raw_folder, filename.split('.')[0])
             patients = []
             total = 0
-            for txtfile in os.listdir(dirname):
+            for file_num, txtfile in enumerate(os.listdir(dirname)):
+                print(file_num, txtfile)
+                outfile = open("%s/iter.txt" % self.root, "a")
+                outfile.write("%d, %s\n".format(file_num, txtfile))
+                outfile.close()
                 record_id = txtfile.split('.')[0]
                 with open(os.path.join(dirname, txtfile)) as f:
                     lines = f.readlines()
@@ -367,14 +344,16 @@ class PhysioNet:
                     vals = [jnp.zeros(len(self.params))]
                     mask = [jnp.zeros(len(self.params))]
                     nobs = [jnp.zeros(len(self.params))]
-                    for l in lines[1:]:
+                    for line_num, l in enumerate(lines[1:]):
+                        # print(line_num, len(lines[1:]))
                         total += 1
                         time, param, val = l.split(',')
                         # Time in hours
                         time = float(time.split(':')[0]) + float(time.split(':')[1]) / 60.
                         # round up the time stamps (up to 6 min by default)
                         # used for speed -- we actually don't need to quantize it in Latent ODE
-                        time = round(time / self.quantization) * self.quantization
+                        if self.quantization != 0:
+                            time = round(time / self.quantization) * self.quantization
 
                         if time != prev_time:
                             tt.append(time)
@@ -384,30 +363,24 @@ class PhysioNet:
                             prev_time = time
 
                         if param in self.params_dict:
-                            #vals[-1][self.params_dict[param]] = float(val)
                             n_observations = nobs[-1][self.params_dict[param]]
                             if self.reduce == 'average' and n_observations > 0:
                                 prev_val = vals[-1][self.params_dict[param]]
                                 new_val = (prev_val * n_observations + float(val)) / (n_observations + 1)
-                                vals[-1][self.params_dict[param]] = new_val
+                                vals[-1] = jax.ops.index_update(vals[-1],
+                                                                jax.ops.index[self.params_dict[param]], new_val)
                             else:
-                                vals[-1][self.params_dict[param]] = float(val)
-                            mask[-1][self.params_dict[param]] = 1
-                            nobs[-1][self.params_dict[param]] += 1
+                                vals[-1] = jax.ops.index_update(vals[-1],
+                                                                jax.ops.index[self.params_dict[param]], float(val))
+                            mask[-1] = jax.ops.index_update(mask[-1], jax.ops.index[self.params_dict[param]], 1)
+                            nobs[-1] = jax.ops.index_add(nobs[-1], jax.ops.index[self.params_dict[param]], 1)
                         else:
                             assert param == 'RecordID', 'Read unexpected param {}'.format(param)
                 tt = jnp.array(tt)
                 vals = jnp.stack(vals)
                 mask = jnp.stack(mask)
 
-                labels = None
-                if record_id in outcomes:
-                    # Only training set has labels
-                    labels = outcomes[record_id]
-                    # Out of 5 label types provided for Physionet, take only the last one -- mortality
-                    labels = labels[4]
-
-                patients.append((record_id, tt, vals, mask, labels))
+                patients.append((record_id, tt, vals, mask))
 
             outfile = open(os.path.join(self.processed_folder,
                                         filename.split('.')[0] + "_" + str(self.quantization) + '.pt'), 'wb')
@@ -464,6 +437,19 @@ class PhysioNet:
         fmt_str += '    Quantization: {}\n'.format(self.quantization)
         fmt_str += '    Reduce: {}\n'.format(self.reduce)
         return fmt_str
+
+
+def init_physionet_data(root):
+    """
+    Initialize physionet data.
+    """
+    data = PhysioNet(root=root,            # TODO: this needs to be set correctly from nodes_latent
+                     download=True,
+                     quantization=0.016,   # TODO: make this 0 (it's only there for speed)
+                     n_samples=16000).data
+
+    # TODO: train/test split data
+    #   they use an sklearn function for this
 
 
 def variable_time_collate_fn(batch,
@@ -704,3 +690,8 @@ def init_periodic_gap_data(rng, parse_args):
     }
 
     return ds_train, ds_test, meta
+
+
+if __name__ == "__main__":
+    # TODO: set this
+    init_physionet_data()
