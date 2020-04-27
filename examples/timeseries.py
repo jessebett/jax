@@ -213,7 +213,7 @@ class Periodic1DGap:
                max_t_extrap_left=5.,
                min_t_extrap_right=10.,
                max_t_extrap_right=15.,
-               n_tp=100):
+               n_tp=200):
         """
         Sample periodic functions.
         """
@@ -229,9 +229,9 @@ class Periodic1DGap:
                                                     maxval=max_t_extrap_right)
         timesteps_left = jnp.sort(jnp.concatenate((jnp.array([0.]),
                                                    timesteps_extrap_left)))
-        timesteps = jnp.sort(jnp.concatenate((timesteps_left,
-                                              jnp.array([min_t_extrap_right]),
-                                              timesteps_extrap_right)))
+        timesteps_right = jnp.sort(jnp.concatenate((jnp.array([min_t_extrap_right]),
+                                                    timesteps_extrap_right)))
+        timesteps = jnp.concatenate((timesteps_left, timesteps_right))
 
         def gen_sample(subkey):
             """
@@ -256,7 +256,8 @@ class Periodic1DGap:
 
         samples = _add_noise(key, samples, noise_weight)
         samples_left = samples[:, :n_tp_left]
-        return timesteps_left, samples_left, timesteps, samples
+        samples_right = samples[:, n_tp_left:]
+        return timesteps_left, samples_left, timesteps_right, samples_right
 
 
 class PhysioNet:
@@ -548,6 +549,7 @@ def init_periodic_data(rng, parse_args):
         data_test = data[int(n_samples * train_frac):]
         return data_train, data_test
 
+    # TODO: use test_y
     train_y, test_y = _split_train_test(samples)
 
     num_train = len(train_y)
@@ -618,13 +620,14 @@ def init_periodic_gap_data(rng, parse_args):
     n_samples = 1000
     noise_weight = 0.01
 
-    timesteps_left, samples_left, timesteps, samples = Periodic1DGap(init_freq=None,
-                                                                     init_amplitude=1.,
-                                                                     final_amplitude=1.,
-                                                                     final_freq=None,
-                                                                     z0=1.).sample(rng,
-                                                                                   n_samples=n_samples,
-                                                                                   noise_weight=noise_weight)
+    timesteps_left, samples_left, timesteps_right, samples_right = \
+        Periodic1DGap(init_freq=None,
+                      init_amplitude=1.,
+                      final_amplitude=1.,
+                      final_freq=None,
+                      z0=1.).sample(rng,
+                                    n_samples=n_samples,
+                                    noise_weight=noise_weight)
 
     def _split_train_test(data, train_frac=0.8):
         data_train = data[:int(n_samples * train_frac)]
@@ -633,11 +636,9 @@ def init_periodic_gap_data(rng, parse_args):
 
     # TODO: you're not using test_y
     train_left_y, test_left_y = _split_train_test(samples_left)
-    train_y, test_y = _split_train_test(samples)
+    train_right_y, test_right_y = _split_train_test(samples_right)
 
-    # TODO: split samples into left and right after splitting train and test
-
-    num_train = len(train_y)
+    num_train = len(train_right_y)
     assert num_train % parse_args.batch_size == 0
     num_train_batches = num_train // parse_args.batch_size
 
@@ -665,12 +666,16 @@ def init_periodic_gap_data(rng, parse_args):
             g *= -1
             return jnp.argsort(g)[:k]
 
-        def get_subsample(subkey, sample):
+        def get_subsample(subkey, sample_left, sample_right):
             """
             Subsample timeseries.
             """
-            subsample_inds = jnp.sort(swor(subkey, jnp.ones_like(timesteps), subsample))
-            return sample[subsample_inds], timesteps[subsample_inds]
+            subsample_left_inds = jnp.sort(swor(subkey, jnp.ones_like(timesteps_left), subsample))
+            subsample_right_inds = jnp.sort(swor(subkey, jnp.ones_like(timesteps_right), subsample))
+
+            sample = jnp.concatenate((sample_left[subsample_left_inds], sample_right[subsample_right_inds]), axis=1)
+            timesteps = jnp.concatenate((timesteps_left[subsample_left_inds], timesteps_right[subsample_right_inds]))
+            return sample_left[subsample_left_inds], timesteps_left[subsample_left_inds], sample, timesteps
 
         while True:
             if shuffle:
@@ -682,10 +687,13 @@ def init_periodic_gap_data(rng, parse_args):
                 batch_inds = epoch_inds[i * batch_size: (i + 1) * batch_size]
                 if subsample is not None:
                     # TODO: if we want to do proportional subsampling I don't think we can vmap
-                    yield jax.vmap(get_subsample)(jax.random.split(key, num=batch_size), train_y[batch_inds])
+                    yield jax.vmap(get_subsample)(jax.random.split(key, num=batch_size),
+                                                  train_left_y[batch_inds], train_right_y[batch_inds])
                 else:
+                    train = jnp.concatenate((train_left_y[batch_inds], train_right_y[batch_inds]), axis=1)
+                    timesteps = jnp.concatenate((timesteps_left, timesteps_right))
                     yield train_left_y[batch_inds], jnp.repeat(timesteps_left[None], batch_size, axis=0), \
-                          train_y[batch_inds], jnp.repeat(timesteps[None], batch_size, axis=0)
+                          train, jnp.repeat(timesteps[None], batch_size, axis=0)
 
     ds_train = gen_data(parse_args.batch_size)
     ds_test = gen_data(parse_args.test_batch_size, shuffle=False)
