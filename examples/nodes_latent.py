@@ -153,16 +153,16 @@ class LatentGRU(hk.Module):
         return new_y_mean, new_y_std
 
 
-class Dynamics(hk.Module):
+class RecDynamics(hk.Module):
     """
-    ODE dynamics for both encoder and decoder.
+    ODE dynamics for encoder.
     """
 
     def __init__(self,
                  latent_dim,
                  layers,
                  units):
-        super(Dynamics, self).__init__()
+        super(RecDynamics, self).__init__()
         self.latent_dim = latent_dim
         self.model = hk.Sequential([unit for _ in range(layers + 1) for unit in
                                     [jnp.tanh, hk.Linear(units)]] +
@@ -170,12 +170,33 @@ class Dynamics(hk.Module):
                                    )
 
     def __call__(self, y, t):
+        # use time-independent dynamics
+        # need to reshape so regularization knows what to take mean over
+        y = jnp.reshape(y, (-1, self.latent_dim))
+        return self.model(y)
+
+
+class GenDynamics(hk.Module):
+    """
+    ODE dynamics for decoder.
+    """
+
+    def __init__(self,
+                 latent_dim,
+                 layers,
+                 units):
+        super(GenDynamics, self).__init__()
+        self.latent_dim = latent_dim
+        self.model = hk.Sequential([unit for _ in range(layers + 1) for unit in
+                                    [jnp.tanh, hk.Linear(units)]] +
+                                   [jnp.tanh, hk.Linear(latent_dim)]
+                                   )
+
+    def __call__(self, y, t):
+        # use time-dependent dynamics
         y = jnp.reshape(y, (-1, self.latent_dim))
         y_t = jnp.concatenate((y, jnp.ones((y.shape[0], 1)) * t), axis=1)
         return self.model(y_t)
-        # need to reshape so regularization knows what to take mean over
-        # y = jnp.reshape(y, (-1, self.latent_dim))
-        # return self.model(y)
 
 
 def wrap_module(module, *module_args, **module_kwargs):
@@ -269,7 +290,7 @@ def init_model(rec_ode_kwargs,
     #                                    b_init=jnp.zeros))
     # gru_rnn_params = gru_rnn.init(rng, *initialization_data_["gru_rnn"])
 
-    rec_dynamics = hk.transform(wrap_module(Dynamics,
+    rec_dynamics = hk.transform(wrap_module(RecDynamics,
                                             latent_dim=rec_dim,
                                             units=dynamics_units,
                                             layers=rec_layers)
@@ -285,7 +306,7 @@ def init_model(rec_ode_kwargs,
     ])))
     rec_to_gen_params = rec_to_gen.init(rng, *initialization_data_["rec_to_gen"])
 
-    gen_dynamics = hk.transform(wrap_module(Dynamics,
+    gen_dynamics = hk.transform(wrap_module(GenDynamics,
                                             latent_dim=gen_dim,
                                             units=dynamics_units,
                                             layers=gen_layers))
