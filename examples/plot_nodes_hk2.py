@@ -5,6 +5,9 @@ For plotting jobs from nodes_hk2.py
 import pickle
 from glob import glob
 from functools import reduce
+import argparse
+
+import jax
 
 # import matplotlib as mpl
 # import matplotlib.pyplot as plt
@@ -18,6 +21,7 @@ reg = "r3"
 num_blocks = 0
 
 forward, model = init_model()
+forward = jax.jit(forward)
 _, ds_train_eval, meta = init_data()
 num_test_batches = meta["num_test_batches"]
 
@@ -270,12 +274,13 @@ def pareto_nfe_r():
             get_r(lam, reg_order)
 
 
-def r_corr():
+def r_corr(lam):
     """
     Are the regularizations correlated.
     """
     # r3_regs = list(map(lambda lam: get_r(lam, "r3")[96000], sorted(lams)))
-    r4_regs = list(map(lambda lam: get_r(lam, "r4")[96000], sorted(lams)))
+    # r4_regs = list(map(lambda lam: get_r(lam, "r4"), sorted(lams)))
+    get_r(lam, "r4")
 
     # fig, ax = plt.subplots()
     # ax.scatter(r3_regs, r4_regs)
@@ -293,4 +298,9 @@ if __name__ == "__main__":
     # pareto_plot_nfe()
     # histogram_nfe()
     # pareto_nfe_r()
-    r_corr()
+
+    parser = argparse.ArgumentParser('Neural ODE')
+    parser.add_argument('--lam', type=float, default=0)
+    parse_args = parser.parse_args()
+
+    r_corr(parse_args.lam)
