@@ -170,12 +170,12 @@ class Dynamics(hk.Module):
                                    )
 
     def __call__(self, y, t):
-        # y = jnp.reshape(y, (-1, self.latent_dim))
-        # y_t = jnp.concatenate((y, jnp.ones((y.shape[0], 1)) * t), axis=1)
-        # return self.model(y_t)
-        # need to reshape so regularization knows what to take mean over
         y = jnp.reshape(y, (-1, self.latent_dim))
-        return self.model(y)
+        y_t = jnp.concatenate((y, jnp.ones((y.shape[0], 1)) * t), axis=1)
+        return self.model(y_t)
+        # need to reshape so regularization knows what to take mean over
+        # y = jnp.reshape(y, (-1, self.latent_dim))
+        # return self.model(y)
 
 
 def wrap_module(module, *module_args, **module_kwargs):
@@ -591,7 +591,7 @@ def run():
 
                 print(print_str)
 
-                outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
+                outfile = open("%s/reg_%s_lam_%.12e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
                 outfile.write(print_str + "\n")
                 outfile.close()
 
@@ -605,22 +605,22 @@ def run():
 
             if itr % parse_args.save_freq == 0:
                 if odenet:
-                    param_filename = "%s/reg_%s_lam_%.4e_%d_fargs.pickle" % (dirname, reg, lam, itr)
+                    param_filename = "%s/reg_%s_lam_%.12e_%d_fargs.pickle" % (dirname, reg, lam, itr)
                 else:
-                    param_filename = "%s/reg_%s_lam_%.4e_num_blocks_%d_%d_fargs.pickle" % (dirname, reg, lam, num_blocks, itr)
+                    param_filename = "%s/reg_%s_lam_%.12e_num_blocks_%d_%d_fargs.pickle" % (dirname, reg, lam, num_blocks, itr)
                 fargs = get_params(opt_state)
                 outfile = open(param_filename, "wb")
                 pickle.dump(fargs, outfile)
                 outfile.close()
 
-            outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_iter.txt" % (dirname, reg, lam, num_blocks), "a")
+            outfile = open("%s/reg_%s_lam_%.12e_num_blocks_%d_iter.txt" % (dirname, reg, lam, num_blocks), "a")
             outfile.write("Iter: {:04d}\n".format(itr))
             outfile.close()
     meta = {
         "info": info,
         "args": parse_args
     }
-    outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "wb")
+    outfile = open("%s/reg_%s_lam_%.12e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "wb")
     pickle.dump(meta, outfile)
     outfile.close()
 
