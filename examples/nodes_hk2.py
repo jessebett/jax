@@ -50,6 +50,7 @@ assert os.path.exists(parse_args.dirname)
 # set up config
 
 reg = parse_args.reg
+reg = "r4"
 lam = parse_args.lam
 lam_w = parse_args.lam_w
 seed = parse_args.seed
@@ -97,8 +98,9 @@ def sol_recursive(f, z, t):
   (y0, [y1h]) = jet(g, (z, ), ((jnp.ones_like(z), ), ))
   (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
   (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
+  (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
 
-  return (y0, [y1, y2])
+  return (y0, [y1, y2, y3])
 
 
 # set up modules
@@ -625,7 +627,7 @@ def run():
 
                 print(print_str)
 
-                outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
+                outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
                 outfile.write(print_str + "\n")
                 outfile.close()
 
@@ -645,7 +647,7 @@ def run():
                 pickle.dump(fargs, outfile)
                 outfile.close()
 
-            outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_iter.txt" % (dirname, reg, lam, num_blocks), "a")
+            outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_iter.txt" % (dirname, reg, lam, num_blocks), "a")
             outfile.write("Iter: {:04d}\n".format(itr))
             outfile.close()
     meta = {
