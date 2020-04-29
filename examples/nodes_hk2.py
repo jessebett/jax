@@ -15,7 +15,7 @@ from jax import lax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint
+from jax.experimental.ode import odeint, _adams_odeint, ravel_first_arg
 from jax.experimental.jet import jet
 
 from jax.config import config
@@ -372,7 +372,17 @@ def init_model():
 
         if count_nfe:
             if vmap:
-                unreg_nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
+                # unreg_nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
+                #                          (0, None, None))
+                def _odeint_wrapper(func, rtol, atol, mxstep, y0, ts, *args):
+                    y0, unravel = ravel_pytree(y0)
+                    func = ravel_first_arg(func, unravel)
+                    return _adams_odeint(func, rtol, atol, -1., mxstep, y0, ts, *args)[1]
+                unreg_nodeint = jax.vmap(lambda y0, t, params: _odeint_wrapper(dynamics_wrap,
+                                                                               ode_kwargs["rtol"],
+                                                                               ode_kwargs["atol"],
+                                                                               jnp.inf,
+                                                                               y0, t, params),
                                          (0, None, None))
             else:
                 unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
@@ -384,7 +394,7 @@ def init_model():
                 """
                 in_ode = pre_ode_fn(params["pre_ode"], _images)
                 f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
-                return f_nfe
+                return jnp.mean(f_nfe)
 
         else:
             nfe_fn = None

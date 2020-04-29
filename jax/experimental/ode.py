@@ -363,6 +363,7 @@ def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
 
   f0 = func_(y0, ts[0])
   init_nfe = 1
+  # dt = 0.5
   dt = initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0)
   interp_coeff = np.array([y0] * 5)
   init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff, init_nfe]
@@ -370,7 +371,7 @@ def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   nfe = carry[-1]
   return np.concatenate((y0[None], ys)), nfe
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
+# @partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
 def _adams_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
 
