@@ -28,27 +28,8 @@ from jax.experimental.ode import odeint
 import jax.numpy as np
 import jax.scipy.stats.norm as norm
 
-
-# Synthetic dataset
-def gen_pinwheel(radial_std=0.3, tangential_std=0.1, num_classes=5,
-                 num_per_class=20, rate=0.25, rng=random.PRNGKey(0)):
-    rads = np.linspace(0, 2 * np.pi, num_classes, endpoint=False)
-
-    features = (random.normal(rng, (num_classes * num_per_class, 2)) \
-                            * np.array([radial_std, tangential_std]) \
-                            + np.array([1., 0.]))
-
-    labels = np.repeat(np.arange(num_classes), num_per_class)
-
-    angles = rads[labels] + rate * np.exp(features[:, 0])
-    rotations = np.stack([np.cos(angles), -np.sin(angles), np.sin(angles), np.cos(angles)])
-    rotations = np.reshape(rotations.T, (-1, 2, 2))
-
-    data = np.einsum("ti,tij->tj", features, rotations)
-    #data = 2 * random.permutation(rng, data)
-    return data, labels
-
-
+from data import gen_pinwheel
+from plot_utils import mesh_eval
 
 # ========= Functions to define a neural network. =========
 
@@ -86,12 +67,12 @@ def ffjord_log_density(params, x, D, rng):
         # eps must be drawn from a distribution with zero mean and
         # identity covariance.
         f = lambda z: nn_dynamics(z, t, args)
-        #dz_dt, jac_times_eps = jvp(f, (z,), (eps,))
-        #dz_dt = f(z)
-        #dlogp_dt = np.dot(eps, jac_times_eps)
-        dz_dt = f(z)
-        J = jacfwd(f)(z)
-        dlogp_dt = np.trace(J)
+        dz_dt, jac_times_eps = jvp(f, (z,), (eps,))
+        # dz_dt = f(z)
+        dlogp_dt = np.dot(eps, jac_times_eps)
+        # dz_dt = f(z)
+        # J = jacfwd(f)(z)
+        # dlogp_dt = np.trace(J)
         return np.hstack([dz_dt, dlogp_dt])
 
     init_state = np.hstack([x, 0.])
@@ -108,22 +89,6 @@ def batch_likelihood(params, data, rng):
     return np.mean(batch_density(params, data, D, rngs))
 
 
-# ========= Helper function for plotting. =========
-
-@partial(jit, static_argnums=(0, 1, 2, 4))
-def _mesh_eval(func, x_limits, y_limits, params, num_ticks):
-    # Evaluate func on a 2D grid defined by x_limits and y_limits.
-    x = np.linspace(*x_limits, num=num_ticks)
-    y = np.linspace(*y_limits, num=num_ticks)
-    X, Y = np.meshgrid(x, y)
-    xy_vec = np.stack([X.ravel(), Y.ravel()]).T
-    zs = vmap(func, in_axes=(0, None))(xy_vec, params)
-    #print(np.sum(zs) * (x_limits[1] - x_limits[0])
-    # * (y_limits[1] - y_limits[0]) / (num_ticks**2))
-    return X, Y, zs.reshape(X.shape)
-
-def mesh_eval(func, x_limits, y_limits, params, num_ticks=51):
-    return _mesh_eval(func, x_limits, y_limits, params, num_ticks)
 
 # ========= Define an intractable unnormalized density =========
 
