@@ -60,8 +60,7 @@ def ffjord_sample(params, D, rng):
 
 def ffjord_log_density(params, x, D, rng):
 
-    eps = random.normal(rng, (D,))
-    def aug_dynamics(aug_state, t, args):
+    def aug_dynamics(aug_state, t, eps, args):
         z = aug_state[:-1]
         # Hutchinson's estimator of the trace of the Jacobian of f.
         # eps must be drawn from a distribution with zero mean and
@@ -76,7 +75,8 @@ def ffjord_log_density(params, x, D, rng):
         return np.hstack([dz_dt, dlogp_dt])
 
     init_state = np.hstack([x, 0.])
-    aug_out = odeint(aug_dynamics, init_state, np.array([0., 1.]), params)[1]
+    eps = random.normal(rng, (D,))
+    aug_out = odeint(aug_dynamics, init_state, np.array([0., 1.]), eps, params)[1]
     z, dlogp = aug_out[:-1], aug_out[-1]
     logpz = standard_normal_logpdf(z)
     return logpz + dlogp
@@ -89,12 +89,11 @@ def batch_likelihood(params, data, rng):
     return np.mean(batch_density(params, data, D, rngs))
 
 
-
 # ========= Define an intractable unnormalized density =========
 
 if __name__ == "__main__":
 
-    data, _ = gen_pinwheel()
+    data, _ = gen_pinwheel(num_classes=3)
     D = data.shape[1]
 
     @jit
@@ -111,6 +110,15 @@ if __name__ == "__main__":
     y_limits = [-2, 2]
 
     rng = random.PRNGKey(0)
+
+    def test_grads():
+        from jax.test_util import check_grads
+        N, D = np.shape(data)
+        rngs = random.split(rng, N)
+        batch_density = vmap(ffjord_log_density, in_axes=(None, 0, None, 0))
+        _vffjord = lambda p : batch_density(p,data,D,rngs)
+        check_grads(_vffjord, (params,), 1, modes=["rev"])
+
     def callback(params, t):
         print("Iteration {} log-likelihood: {}".format(t, -objective(params, t)))
 

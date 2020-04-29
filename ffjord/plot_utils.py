@@ -1,5 +1,5 @@
 import jax.numpy as np
-from jax.api import jit
+from jax.api import jit, vmap
 from functools import partial
 import matplotlib.pyplot as plt
 
