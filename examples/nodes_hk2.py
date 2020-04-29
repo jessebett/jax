@@ -15,7 +15,7 @@ from jax import lax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint, _adams_odeint, ravel_first_arg
+from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
 from jax.config import config
@@ -50,7 +50,6 @@ assert os.path.exists(parse_args.dirname)
 # set up config
 
 reg = parse_args.reg
-reg = "r4"
 lam = parse_args.lam
 lam_w = parse_args.lam_w
 seed = parse_args.seed
@@ -59,7 +58,7 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
-vmap = True
+vmap = False
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
@@ -98,9 +97,8 @@ def sol_recursive(f, z, t):
   (y0, [y1h]) = jet(g, (z, ), ((jnp.ones_like(z), ), ))
   (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
   (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
-  (y0, [y1, y2, y3, y4h]) = jet(g, (z, ), ((y0, y1, y2, y3h), ))
 
-  return (y0, [y1, y2, y3])
+  return (y0, [y1, y2])
 
 
 # set up modules
@@ -372,17 +370,7 @@ def init_model():
 
         if count_nfe:
             if vmap:
-                # unreg_nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
-                #                          (0, None, None))
-                def _odeint_wrapper(func, rtol, atol, mxstep, y0, ts, *args):
-                    y0, unravel = ravel_pytree(y0)
-                    func = ravel_first_arg(func, unravel)
-                    return _adams_odeint(func, rtol, atol, -1., mxstep, y0, ts, *args)[1]
-                unreg_nodeint = jax.vmap(lambda y0, t, params: _odeint_wrapper(dynamics_wrap,
-                                                                               ode_kwargs["rtol"],
-                                                                               ode_kwargs["atol"],
-                                                                               jnp.inf,
-                                                                               y0, t, params),
+                unreg_nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
                                          (0, None, None))
             else:
                 unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
