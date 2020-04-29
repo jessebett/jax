@@ -25,7 +25,6 @@ Adjoint algorithm based on Appendix C of https://arxiv.org/pdf/1806.07366.pdf
 
 from functools import partial
 import operator as op
-import time
 
 import jax
 import jax.numpy as np
@@ -33,12 +32,8 @@ from jax import lax
 from jax import ops
 from jax.util import safe_map, safe_zip
 from jax.flatten_util import ravel_pytree
-from jax.test_util import check_grads
 from jax.tree_util import tree_map
 from jax import linear_util as lu
-import numpy as onp
-import scipy.integrate as osp_integrate
-import scipy
 
 map = safe_map
 zip = safe_zip
@@ -338,8 +333,8 @@ def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   def scan_fun(carry, target_t):
 
     def cond_fun(state):
-      i, _, _, t, _, _, _ = state
-      return (t < target_t) & (i < mxstep)
+      i, _, _, t, dt, _, _ = state
+      return (t < target_t) & (i < mxstep) & (dt > 0)
 
     def body_fun(state):
       i, y, f, t, dt, last_t, interp_coeff = state
@@ -432,15 +427,12 @@ def _odeint_rev(func, rtol, atol, mxstep, res, g):
   ys, ts, args = res
   g, _ = g
 
-  def aug_dynamics(augmented_state, t, *res):
+  def aug_dynamics(augmented_state, t, *args):
     """Original system augmented with vjp_y, vjp_t and vjp_args."""
     y, y_bar, *_ = augmented_state
-    # Even though `aug_dynamics` is a closure with `ts` defined in its
-    # environment we need to pass in `res` to keep the tracer happy, avoiding
-    # UnexpectedTracerError exceptions.
-    _, ts, args = res
-    # `t` here is backwards time from `ts[-1]`, not forwards time.
-    y_dot, vjpfun = jax.vjp(func, y, ts[-1] - t, *args)
+    # `t` here is negatice time, so we need to negate again to get back to
+    # normal time. See the `odeint` invocation in `scan_fun` below.
+    y_dot, vjpfun = jax.vjp(func, y, -t, *args)
     return (-y_dot, *vjpfun(y_bar))
 
   y_bar = g[-1]
@@ -455,8 +447,8 @@ def _odeint_rev(func, rtol, atol, mxstep, res, g):
     # Run augmented system backwards to previous observation
     _, y_bar, t0_bar, args_bar = odeint(
         aug_dynamics, (ys[i], y_bar, t0_bar, args_bar),
-        np.array([ts[-1] - ts[i], ts[-1] - ts[i - 1]]),
-        *res, rtol=rtol, atol=atol, mxstep=mxstep)[0]
+        np.array([-ts[i], -ts[i - 1]]),
+        *args, rtol=rtol, atol=atol, mxstep=mxstep)[0]
     y_bar, t0_bar, args_bar = tree_map(op.itemgetter(1), (y_bar, t0_bar, args_bar))
     # Add gradient from current output
     y_bar = y_bar + g[i - 1]
