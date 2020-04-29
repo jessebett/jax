@@ -357,7 +357,7 @@ def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
     return carry, y_target
 
   f0 = func_(y0, ts[0])
-  init_nfe = 1
+  init_nfe = 2.
   # dt = 0.5
   dt = initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0)
   interp_coeff = np.array([y0] * 5)
