@@ -88,17 +88,23 @@ def sol_recursive(f, z, t):
   """
   Recursively compute higher order derivatives of dynamics of ODE.
   """
-  def g(z):
+  z_t = jnp.concatenate((z, jnp.array([[t]])), axis=1)
+
+  def g(z_t):
     """
     Closure to expand z.
     """
-    return f(z, t)
+    z, t = z_t[:, :-1], z_t[:, -1]
+    dz = f(z, t)
+    dt = jnp.array([[1.]])
+    dz_t = jnp.concatenate((dz, dt), axis=1)
+    return dz_t
 
-  (y0, [y1h]) = jet(g, (z, ), ((jnp.ones_like(z), ), ))
-  (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
-  (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
+  (y0, [y1h]) = jet(g, (z_t, ), ((jnp.ones_like(z_t), ), ))
+  (y0, [y1, y2h]) = jet(g, (z_t, ), ((y0, y1h,), ))
+  (y0, [y1, y2, y3h]) = jet(g, (z_t, ), ((y0, y1, y2h), ))
 
-  return (y0, [y1, y2])
+  return (y0[:, :-1], [y1[:, :-1], y2[:, :-1]])
 
 
 # set up modules
