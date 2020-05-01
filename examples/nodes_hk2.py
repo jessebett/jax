@@ -88,23 +88,27 @@ def sol_recursive(f, z, t):
   """
   Recursively compute higher order derivatives of dynamics of ODE.
   """
-  z_t = jnp.concatenate((z, jnp.array([[t]])), axis=1)
+  # TODO: flatten z and concat t once?
+  # z_t = jnp.concatenate((z, jnp.repeat(jnp.array([[t]]), z.shape[0], axis=0)), axis=1)
+  z_shape = z.shape
+  z_t = jnp.concatenate((jnp.ravel(z), jnp.array([t])))
 
   def g(z_t):
     """
     Closure to expand z.
     """
-    z, t = z_t[:, :-1], z_t[:, -1]
-    dz = f(z, t)
-    dt = jnp.array([[1.]])
-    dz_t = jnp.concatenate((dz, dt), axis=1)
+    z, t = jnp.reshape(z_t[:-1], z_shape), z_t[-1]
+    dz = jnp.ravel(f(z, t))
+    dt = jnp.array([t])
+    dz_t = jnp.concatenate((dz, dt))
     return dz_t
 
   (y0, [y1h]) = jet(g, (z_t, ), ((jnp.ones_like(z_t), ), ))
   (y0, [y1, y2h]) = jet(g, (z_t, ), ((y0, y1h,), ))
   (y0, [y1, y2, y3h]) = jet(g, (z_t, ), ((y0, y1, y2h), ))
 
-  return (y0[:, :-1], [y1[:, :-1], y2[:, :-1]])
+  # TODO: shape this correctly! this will fail silently
+  return (jnp.reshape(y0[:-1], z_shape), [jnp.reshape(y1[:-1], z_shape), jnp.reshape(y2[:-1], z_shape)])
 
 
 # set up modules
