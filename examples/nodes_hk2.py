@@ -99,7 +99,7 @@ def sol_recursive(f, z, t):
     """
     z, t = jnp.reshape(z_t[:-1], z_shape), z_t[-1]
     dz = jnp.ravel(f(z, t))
-    dt = jnp.array([t])
+    dt = jnp.array([1.])
     dz_t = jnp.concatenate((dz, dt))
     return dz_t
 
