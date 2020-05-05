@@ -58,26 +58,26 @@ def ffjord_sample(params, D, rng):
     z = random.normal(rng, D)
     return odeint(nn_dynamics, z, np.array([1., 0.]), params)  # Todo: reverse time
 
+def ffjord_dynamics(ffjord_state, t, eps, args):
+    z = ffjord_state[:-1]
+    # Hutchinson's estimator of the trace of the Jacobian of f.
+    # eps must be drawn from a distribution with zero mean and
+    # identity covariance.
+    f = lambda z: nn_dynamics(z, t, args)
+    dz_dt, jac_times_eps = jvp(f, (z,), (eps,))
+    # dz_dt = f(z)
+    dlogp_dt = np.dot(eps, jac_times_eps)
+    # dz_dt = f(z)
+    # J = jacfwd(f)(z)
+    # dlogp_dt = np.trace(J)
+    return np.hstack([dz_dt, dlogp_dt])
+
+
 def ffjord_log_density(params, x, D, rng):
-
-    def aug_dynamics(aug_state, t, eps, args):
-        z = aug_state[:-1]
-        # Hutchinson's estimator of the trace of the Jacobian of f.
-        # eps must be drawn from a distribution with zero mean and
-        # identity covariance.
-        f = lambda z: nn_dynamics(z, t, args)
-        dz_dt, jac_times_eps = jvp(f, (z,), (eps,))
-        # dz_dt = f(z)
-        dlogp_dt = np.dot(eps, jac_times_eps)
-        # dz_dt = f(z)
-        # J = jacfwd(f)(z)
-        # dlogp_dt = np.trace(J)
-        return np.hstack([dz_dt, dlogp_dt])
-
     init_state = np.hstack([x, 0.])
     eps = random.normal(rng, (D,))
-    aug_out = odeint(aug_dynamics, init_state, np.array([0., 1.]), eps, params)[1]
-    z, dlogp = aug_out[:-1], aug_out[-1]
+    ffjord_out = odeint(ffjord_dynamics, init_state, np.array([0., 1.]), eps, params)[1]
+    z, dlogp = ffjord_out[:-1], ffjord_out[-1]
     logpz = standard_normal_logpdf(z)
     return logpz + dlogp
 
@@ -87,6 +87,36 @@ def batch_likelihood(params, data, rng):
     rngs = random.split(rng, N)
     batch_density = vmap(ffjord_log_density, in_axes=(None, 0, None, 0))
     return np.mean(batch_density(params, data, D, rngs))
+
+
+# ========= Regularization Dynamics =========
+
+def sol_recursive(f, z, t):
+  """
+  Recursively compute higher order derivatives of dynamics of ODE.
+  """
+  (y0, [y1h]) = jet(f, (z, t ), ((np.ones_like(z), ), (np.ones_like(t), )))
+  (y0, [y1, y2h]) = jet(f, (z, t ), ((y0, y1h,), (np.ones_like(t), np.zeros_like(t),) ))
+  (y0, [y1, y2, y3h]) = jet(f, (z, t ), ((y0, y1, y2h), (np.ones_like(t), np.zeros_like(t), np.zeros_like(t)) ))
+
+  return (y0, [y1, y2])
+
+def reg_dynamics(reg_aug_state, t, eps, params):
+    ffjord_state, reg_state = reg_aug_state[:-1], reg_aug_state[-1]
+    def _ffjord_dyn(z,t):
+        return ffjord_dynamics(z, t, eps, params)
+    return _ffjord_dyn(ffjord_state,0.)
+
+def reg_log_density(params,x,D,rng):
+    init_ffjord_state = np.hstack([x, 0.])
+    init_reg_state = 0.
+    init_aug_reg_state = np.hstack([init_ffjord_state,init_reg_state])
+
+    eps = random.normal(rng, (D,))
+
+    return reg_dynamics(init_aug_reg_state,0.,eps,params)
+
+
 
 
 # ========= Define an intractable unnormalized density =========
@@ -140,7 +170,7 @@ if __name__ == "__main__":
 
     # Set up optimizer.
     init_params = init_random_params(0.1, [D + 1, 50, 100, D], rng)
-    opt_init, opt_update, get_params = optimizers.momentum(step_size=0.01, mass=0.9)
+    opt_init, opt_update, get_params = optimizers.adam(step_size=0.01)
     opt_state = opt_init(init_params)
 
     @jit
