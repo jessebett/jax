@@ -16,7 +16,7 @@ import numpy as onp
 from nodes_hk2 import init_model, init_data, _reg_loss_fn
 
 # TODO: set this to absolute path
-dirname = "2020-04-24-15-59-17"
+dirname = "2020-05-01-12-02-58"
 reg = "r3"
 num_blocks = 0
 
@@ -33,25 +33,25 @@ def parse_lam(filename):
     return float(filename.split("_")[3])
 
 
-lams = list(map(parse_lam, glob("%s/*r3*meta.pickle" % dirname)))
+lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (dirname, reg))))
 
 
 def get_info(lam):
     """
     Get (final NFE, final loss) pair for a given lambda.
     """
-    meta_file = open("%s/reg_%s_lam_%.4e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
+    meta_file = open("%s/reg_%s_lam_%.18e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
     meta = pickle.load(meta_file)
 
     itr = 96000
-    nfe_filename = "%s/reg_%s_lam_%.12e_%d_adams_nfe.pickle" % (dirname, reg, lam, itr)
+    nfe_filename = "%s/reg_%s_lam_%.12e_%d_nfe.pickle" % (dirname, reg, lam, itr)
     try:
         nfe_file = open(nfe_filename, "rb")
         nfe = pickle.load(nfe_file)
         nfe_file.close()
     except IOError:
         print("Calculating NFE for %.4e" % lam)
-        param_file = open("%s/reg_%s_lam_%.4e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+        param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
         params = pickle.load(param_file)
         nfes = []
         # nfe = 0
@@ -88,7 +88,7 @@ def pareto_plot_nfe():
     plt.rc('text', usetex=True)
     fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
 
-    sorted_lams = sorted(lams)[:-41]
+    sorted_lams = sorted(lams)
     x, y = zip(*map(get_info, sorted_lams))
     anno = sorted_lams
 
@@ -102,7 +102,7 @@ def pareto_plot_nfe():
     # plot the pareto front
     maxY = False
     sorted_list = sorted([[x[i], y[i]] for i in range(len(x))], reverse=maxY)
-    pareto_front = sorted_list[1:9] + [sorted_list[0]]
+    pareto_front = [sorted_list[0]]
     for pair in sorted_list[1:]:
         if maxY:
             if pair[1] >= pareto_front[-1][1]:
@@ -112,10 +112,10 @@ def pareto_plot_nfe():
                 pareto_front.append(pair)
     pf_X = [pair[0] for pair in pareto_front]
     pf_Y = [pair[1] for pair in pareto_front]
-    # ax.plot(pf_X, pf_Y, c='0.35')
+    ax.plot(pf_X, pf_Y, c='0.35')
 
-    ax.set_xlabel("Log Mean Regularization")
-    ax.set_ylabel("Log Unregularized Training Loss")
+    ax.set_xlabel("Average Number of Function Evaluations")
+    ax.set_ylabel("Unregularized Training Loss")
 
     norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
     cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
@@ -124,8 +124,8 @@ def pareto_plot_nfe():
     plt.gcf().subplots_adjust(right=0.88, left=0.13)
     # plt.gcf().subplots_adjust(right=0.88)
 
-    plt.savefig("%s/loss_nfe_adams_pareto.pdf" % dirname)
-    plt.savefig("%s/loss_nfe_adams_pareto.png" % dirname)
+    plt.savefig("%s/loss_nfe_%s_pareto.pdf" % (dirname, reg))
+    plt.savefig("%s/loss_nfe_%s_pareto.png" % (dirname, reg))
     plt.clf()
     plt.close(fig)
 
@@ -414,7 +414,6 @@ if __name__ == "__main__":
     parse_args = parser.parse_args()
 
     get_info(parse_args.lam)
-
     # nfe_r()
     # pareto_plot_nfe()
     # histogram_nfe()

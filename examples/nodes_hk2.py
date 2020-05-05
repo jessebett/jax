@@ -58,7 +58,7 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
-vmap = False
+vmap = True
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
