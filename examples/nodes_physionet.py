@@ -25,9 +25,9 @@ from jax.config import config
 config.update("jax_enable_x64", True)
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=2)
-parser.add_argument('--test_batch_size', type=int, default=10)
-parser.add_argument('--nepochs', type=int, default=500)
+parser.add_argument('--batch_size', type=int, default=50)
+parser.add_argument('--test_batch_size', type=int, default=100)
+parser.add_argument('--nepochs', type=int, default=100)
 parser.add_argument('--data_root', type=str, default="./")  # TODO: set when on cluster
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
@@ -212,9 +212,10 @@ class GenDynamics(hk.Module):
 
     def __call__(self, y, t):
         # use time-dependent dynamics
-        y = jnp.reshape(y, (-1, self.latent_dim))
-        y_t = jnp.concatenate((y, jnp.ones((y.shape[0], 1)) * t), axis=1)
-        return self.model(y_t)
+        # y = jnp.reshape(y, (-1, self.latent_dim))
+        # y_t = jnp.concatenate((y, jnp.ones((y.shape[0], 1)) * t), axis=1)
+        # return self.model(y_t)
+        return self.model(y)
 
 
 def wrap_module(module, *module_args, **module_kwargs):
@@ -236,7 +237,7 @@ def initialization_data(rec_dim, gen_dim, data_dim):
     """
     data = {
         "gru": (jnp.zeros(rec_dim), jnp.zeros(rec_dim), jnp.zeros((2 * data_dim, ))),  # double data dim for mask
-        # "gru_rnn": (jnp.zeros(data_dim + 1), jnp.zeros(2 * rec_dim)),
+        "gru_rnn": (jnp.zeros(rec_dim), jnp.zeros(rec_dim), jnp.zeros((2 * data_dim + 1, ))),  # 2x+1 for mask and delta
         "rec_dynamics": (jnp.zeros(rec_dim), 0.),
         "rec_to_gen": (jnp.zeros(rec_dim), jnp.zeros(rec_dim)),
         "gen_dynamics": (jnp.zeros(gen_dim), 0.),
@@ -277,7 +278,7 @@ def init_model(rec_ode_kwargs,
                gen_ode_kwargs,
                rec_dim=40,
                gen_dim=20,
-               data_dim=41,
+               data_dim=37,
                rec_layers=3,
                gen_layers=3,
                dynamics_units=50,
@@ -294,18 +295,17 @@ def init_model(rec_ode_kwargs,
         "b_init": jnp.zeros
     }
 
-    gru = hk.transform(wrap_module(LatentGRU,
-                                   latent_dim=rec_dim,
-                                   n_units=gru_units,
-                                   **init_kwargs))
-    gru_params = gru.init(rng, *initialization_data_["gru"])
+    # gru = hk.transform(wrap_module(LatentGRU,
+    #                                latent_dim=rec_dim,
+    #                                n_units=gru_units,
+    #                                **init_kwargs))
+    # gru_params = gru.init(rng, *initialization_data_["gru"])
 
-    # gru_rnn = hk.transform(wrap_module(hk.GRU,
-    #                                    hidden_size=2 * rec_dim,
-    #                                    w_i_init=hk.initializers.RandomNormal(mean=0, stddev=0.1),
-    #                                    w_h_init=hk.initializers.RandomNormal(mean=0, stddev=0.1),
-    #                                    b_init=jnp.zeros))
-    # gru_rnn_params = gru_rnn.init(rng, *initialization_data_["gru_rnn"])
+    gru_rnn = hk.transform(wrap_module(LatentGRU,
+                                       latent_dim=rec_dim,
+                                       n_units=gru_units,
+                                       **init_kwargs))
+    gru_rnn_params = gru_rnn.init(rng, *initialization_data_["gru_rnn"])
 
     rec_dynamics = hk.transform(wrap_module(RecDynamics,
                                             latent_dim=rec_dim,
@@ -315,9 +315,10 @@ def init_model(rec_ode_kwargs,
     rec_dynamics_params = rec_dynamics.init(rng, *initialization_data_["rec_dynamics"])
     rec_dynamics_wrap = lambda x, t, params: rec_dynamics.apply(params, x, t)
 
+    # note: the ODE-RNN version uses double
     rec_to_gen = hk.transform(wrap_module(lambda: hk.Sequential([
         lambda x, y: jnp.concatenate((x, y), axis=-1),
-        hk.Linear(100, **init_kwargs),
+        hk.Linear(50, **init_kwargs),
         jnp.tanh,
         hk.Linear(2 * gen_dim, **init_kwargs)
     ])))
@@ -336,8 +337,8 @@ def init_model(rec_ode_kwargs,
     gen_to_data_params = gen_to_data.init(rng, initialization_data_["gen_to_data"])
 
     init_params = {
-        "gru": gru_params,
-        # "gru_rnn": gru_rnn_params,
+        # "gru": gru_params,
+        "gru_rnn": gru_rnn_params,
         "rec_dynamics": rec_dynamics_params,
         "rec_to_gen": rec_to_gen_params,
         "gen_dynamics": gen_dynamics_params,
@@ -353,11 +354,11 @@ def init_model(rec_ode_kwargs,
         data_mask = jnp.concatenate((data, mask), axis=-1)
 
         # ode-rnn encoder
-        final_y, final_y_std, rec_r, rec_nfes = \
-            jax.vmap(partial(ode_rnn, count_nfe_), in_axes=(None, 0, None))(params, data_mask, data_timesteps)
-        # ode encoder
         # final_y, final_y_std, rec_r, rec_nfes = \
-        #     jax.vmap(rnn, in_axes=(None, 0, 0))(params, data, timesteps)
+        #     jax.vmap(partial(ode_rnn, count_nfe_), in_axes=(None, 0, None))(params, data_mask, data_timesteps)
+        # ode encoder
+        final_y, final_y_std, rec_r, rec_nfes = \
+            jax.vmap(rnn, in_axes=(None, 0, None))(params, data_mask, data_timesteps)
 
         # translate
         z0 = rec_to_gen.apply(params["rec_to_gen"], final_y, final_y_std)
@@ -448,22 +449,19 @@ def init_model(rec_ode_kwargs,
         """
         ODE-RNN model.
         """
-
         # concatenate time_delta
         delta = jnp.expand_dims(jnp.concatenate((timesteps[1:] - timesteps[:-1], jnp.zeros(1))), axis=1)
         data_delta = jnp.concatenate((data, delta), axis=1)
 
-        init_state = jnp.zeros(2 * rec_dim)
+        init_state = jnp.zeros(rec_dim), jnp.zeros(rec_dim)
 
-        def scan_fun(prev_state, next_input):
-            out, next_state = gru_rnn.apply(params["gru_rnn"], next_input, prev_state)
-            return next_state, out
-        state, out = lax.scan(scan_fun, init_state, data_delta)
-        last_out = out[-1]
+        def scan_fun(prev_state, xi):
+            yi_mean, yi_std = prev_state
+            yi_mean, yi_std = gru_rnn.apply(params["gru_rnn"], yi_mean, yi_std, xi)
+            return (yi_mean, yi_std), None
+        (final_y_mean, final_y_std), _ = lax.scan(scan_fun, init_state, data_delta[::-1])
 
-        final_y, final_y_std = last_out[..., :rec_dim], last_out[..., rec_dim:]
-
-        return final_y, final_y_std, 0., jnp.zeros(data.shape[0] - 1)
+        return final_y_mean, final_y_std, 0., jnp.zeros(data.shape[0] - 1)
 
     model = {
         "forward": partial(forward, False),
