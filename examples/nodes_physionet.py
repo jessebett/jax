@@ -109,7 +109,6 @@ def sol_recursive(f, z, t):
   (y0, [y1, y2, y3h]) = jet(g, (z_t, ), ((y0, y1, y2h), ))
   (y0, [y1, y2, y3, y4h]) = jet(g, (z_t, ), ((y0, y1, y2, y3h), ))
 
-  # TODO: shape this correctly! this will fail silently
   return (jnp.reshape(y0[:-1], z_shape), [jnp.reshape(y1[:-1], z_shape),
                                           jnp.reshape(y2[:-1], z_shape),
                                           jnp.reshape(y3[:-1], z_shape)])
@@ -286,8 +285,6 @@ def init_model(rec_ode_kwargs,
     """
     Instantiates transformed submodules of model and their parameters.
     """
-
-    # TODO: change the initialization data
     initialization_data_ = initialization_data(rec_dim,
                                                gen_dim,
                                                data_dim)
@@ -392,6 +389,7 @@ def init_model(rec_ode_kwargs,
             z, gen_r = z_r, 0.
         else:
             z, gen_r = z_r
+            gen_r = gen_r[:, :, -1]  # take only regularization at final time point
 
         # decode latent to data, vmapping over batch and timepoints
         pred = jax.vmap(jax.vmap(partial(gen_to_data.apply, params["gen_to_data"]), in_axes=1, out_axes=1))(z)
@@ -495,7 +493,6 @@ def _likelihood(preds, data, mask):
         Log-Likelihood of one sample.
         """
         return -((data_ - mu) ** 2) / (2 * std ** 2) - jnp.log(std) - jnp.log(2 * jnp.pi) / 2
-    # TODO: is this numerically stable? does this broadcast correctly?
     return jnp.sum(sample_likelihood(data[None] * mask, preds * mask), axis=[1, 2, 3]) / jnp.sum(mask)
 
 
@@ -503,7 +500,6 @@ def _mse(preds, data, mask):
     """
     Return mean squared error w/ mask.
     """
-    # TODO: does this broadcast correctly, is it stable?
     return jnp.mean(jnp.sum(jnp.square(data[None] * mask - preds * mask), axis=[1, 2, 3]) / jnp.sum(mask))
 
 
@@ -531,7 +527,6 @@ def loss_fn(forward, params, batch, kl_coef):
     """
     The loss function for training.
     """
-    # TODO: unpack the batch
     preds, rec_r, gen_r, z0_params, nfe = forward(params,
                                                   batch["observed_data"],
                                                   batch["observed_tp"],
@@ -541,7 +536,6 @@ def loss_fn(forward, params, batch, kl_coef):
     kl_ = _kl_div(z0_params)
     rec_reg_ = _reg_loss_fn(rec_r)
     gen_reg_ = _reg_loss_fn(gen_r)
-    # TODO: check broadcasting
     return -logsumexp(likelihood_ - kl_coef * kl_, axis=0) + lam_rec * rec_reg_ + lam_gen * gen_reg_
 
 
@@ -594,7 +588,6 @@ def run():
         likelihood_ = _likelihood(preds, batch["observed_data"], batch["observed_mask"])
         mse_ = _mse(preds, batch["observed_data"], batch["observed_mask"])
         kl_ = _kl_div(z0_params)
-        # TODO: does this broadcast incorrectly?
         return -logsumexp(likelihood_ - kl_coef * kl_, axis=0), likelihood_, kl_, mse_, rec_r, gen_r
 
     def evaluate_loss(opt_state, ds_test, kl_coef):
