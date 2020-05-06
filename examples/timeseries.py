@@ -444,6 +444,13 @@ def init_physionet_data(rng, parse_args):
                             download=True,
                             quantization=0.016,   # TODO: make this 0 (it's only there for speed)
                             n_samples=n_samples)
+    # remove time-invariant features and Patient ID
+    remove_params = ['Age', 'Gender', 'Height', 'ICUType']
+    params_inds = [dataset_obj.params_dict[param_name]
+                   for ind, param_name in enumerate(dataset_obj.params) if param_name not in remove_params]
+    for ind, ex in enumerate(dataset_obj.data):
+        record_id, tt, vals, mask = ex
+        dataset_obj.data[ind] = (tt, vals[:, params_inds], mask[:, params_inds])
     n_samples = len(dataset_obj)
 
     def _split_train_test(data, train_frac=0.8):
@@ -564,7 +571,7 @@ def get_data_min_max(records):
 
     data_min, data_max = None, None
 
-    for b, (record_id, tt, vals, mask) in enumerate(records):
+    for b, (tt, vals, mask) in enumerate(records):
         if b % 100 == 0:
             print(b, len(records))
         n_features = vals.shape[-1]
@@ -600,8 +607,7 @@ def process_batch(batch,
                   data_min=None,
                   data_max=None):
     """
-    Expects a batch of time series d ata in the form of (record_id, tt, vals, mask) where
-        - record_id is a patient id
+    Expects a batch of time series data in the form of (tt, vals, mask) where
         - tt is a 1-dimensional tensor containing T time values of observations.
         - vals is a (T, D) tensor containing observed values for D variables.
         - mask is a (T, D) tensor containing 1 where values were observed and 0 otherwise.
@@ -610,17 +616,17 @@ def process_batch(batch,
         combined_vals: (M, T, D) tensor containing the observed values.
         combined_mask: (M, T, D) tensor containing 1 where values were observed and 0 otherwise.
     """
-    D = batch[0][2].shape[1]
+    D = batch[0][1].shape[1]
 
     # get union of timepoints
-    combined_tt, inverse_indices = onp.unique(onp.concatenate([ex[1] for ex in batch]),
+    combined_tt, inverse_indices = onp.unique(onp.concatenate([ex[0] for ex in batch]),
                                               return_inverse=True)
 
     offset = 0
     combined_vals = onp.zeros([len(batch), len(combined_tt), D])
     combined_mask = onp.zeros([len(batch), len(combined_tt), D])
 
-    for b, (record_id, tt, vals, mask) in enumerate(batch):
+    for b, (tt, vals, mask) in enumerate(batch):
 
         indices = inverse_indices[offset:offset + len(tt)]
         offset += len(tt)
