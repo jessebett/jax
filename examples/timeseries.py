@@ -466,6 +466,18 @@ def init_physionet_data(rng, parse_args):
     # TODO: this might have infs in it for no observed values?
     data_min, data_max = get_data_min_max(dataset_obj)
 
+    processed_dataset = process_batch(train_dataset, data_min=data_min, data_max=data_max)
+
+    def get_batch_from_processed(inds):
+        """
+        Get batch from processed data (i.e. union timepoints beforehand).
+        """
+        keys_to_ind = ["observed_data", "data_to_predict", "observed_mask", "mask_predicted_data"]
+        batch_dict = processed_dataset
+        for key in keys_to_ind:
+            batch_dict[key] = batch_dict[key][inds]
+        return batch_dict
+
     num_train = len(train_dataset)
     assert num_train % parse_args.batch_size == 0
     num_train_batches = num_train // parse_args.batch_size
@@ -492,8 +504,9 @@ def init_physionet_data(rng, parse_args):
                 epoch_inds = inds
             for i in range(num_batches):
                 batch_inds = onp.array(epoch_inds[i * batch_size: (i + 1) * batch_size])
-                batch_dataset = train_dataset[batch_inds]
-                yield process_batch(batch_dataset, data_min=data_min, data_max=data_max)
+                yield get_batch_from_processed(batch_inds)
+                # batch_dataset = train_dataset[batch_inds]
+                # yield process_batch(batch_dataset, data_min=data_min, data_max=data_max)
 
     # TODO: use the actual test set to see that
     ds_train = gen_data(parse_args.batch_size)
@@ -526,18 +539,21 @@ def split_data_interp(data_dict):
     """
     Split data into observed and to predict for interpolation task.
     """
-    # TODO: not sure if we need both copy and casting, or either for that matter
-    split_dict = {"observed_data": jnp.array(data_dict["data"].copy(), dtype=jnp.float64),
-                  "observed_tp": jnp.array(data_dict["time_steps"].copy(), dtype=jnp.float64),
-                  "data_to_predict": jnp.array(data_dict["data"].copy(), dtype=jnp.float64),
-                  "tp_to_predict": jnp.array(data_dict["time_steps"].copy(), dtype=jnp.float64),
+    # TODO: need to copy if we want to do extrapolation
+    data_ = jnp.array(data_dict["data"], dtype=jnp.float64)
+    time_ = jnp.array(data_dict["time_steps"], dtype=jnp.float64)
+    split_dict = {"observed_data": data_,
+                  "observed_tp": time_,
+                  "data_to_predict": data_,
+                  "tp_to_predict": time_,
                   "observed_mask": None,
                   "mask_predicted_data": None
                   }
 
     if "mask" in data_dict and data_dict["mask"] is not None:
-        split_dict["observed_mask"] = jnp.array(data_dict["mask"].copy(), dtype=jnp.float64)
-        split_dict["mask_predicted_data"] = jnp.array(data_dict["mask"].copy(), dtype=jnp.float64)
+        mask_ = jnp.array(data_dict["mask"].copy(), dtype=jnp.float64)
+        split_dict["observed_mask"] = mask_
+        split_dict["mask_predicted_data"] = mask_
 
     return split_dict
 
