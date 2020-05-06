@@ -5,10 +5,13 @@ Generate synthetic dataset. Modified from https://github.com/YuliaRubanova/laten
 import jax
 import jax.numpy as jnp
 
+import numpy as onp
+
 import os
 import errno
 import tarfile
 import pickle
+import random
 
 
 def makedir_exist_ok(dirpath):
@@ -281,9 +284,6 @@ class PhysioNet:
 
     params_dict = {k: i for i, k in enumerate(params)}
 
-    labels = ["SAPS-I", "SOFA", "Length_of_stay", "Survival", "In-hospital_death"]
-    labels_dict = {k: i for i, k in enumerate(labels)}
-
     def __init__(self,
                  root,
                  download=False,
@@ -426,69 +426,201 @@ class PhysioNet:
     def __len__(self):
         return len(self.data)
 
-    def get_label(self, record_id):
-        return self.labels[record_id]
-
     def __repr__(self):
         fmt_str = 'Dataset ' + self.__class__.__name__ + '\n'
         fmt_str += '    Number of datapoints: {}\n'.format(self.__len__())
-        fmt_str += '    Split: {}\n'.format('train' if self.train is True else 'test')
         fmt_str += '    Root Location: {}\n'.format(self.root)
         fmt_str += '    Quantization: {}\n'.format(self.quantization)
         fmt_str += '    Reduce: {}\n'.format(self.reduce)
         return fmt_str
 
 
-def init_physionet_data(root):
+def init_physionet_data(rng, parse_args):
     """
-    Initialize physionet data.
+    Initialize physionet data for training and testing.
     """
-    data = PhysioNet(root=root,            # TODO: this needs to be set correctly from nodes_latent
-                     download=True,
-                     quantization=0.016,   # TODO: make this 0 (it's only there for speed)
-                     n_samples=16000).data
+    n_samples = None
+    dataset_obj = PhysioNet(root=parse_args.data_root,
+                            download=True,
+                            quantization=0.016,   # TODO: make this 0 (it's only there for speed)
+                            n_samples=n_samples)
+    n_samples = len(dataset_obj)
 
-    # TODO: train/test split data
-    #   they use an sklearn function for this
+    def _split_train_test(data, train_frac=0.8):
+        data_train = data[:int(n_samples * train_frac)]
+        data_test = data[int(n_samples * train_frac):]
+        return data_train, data_test
+
+    dataset = onp.array(dataset_obj[:n_samples])
+
+    random.Random(0).shuffle(dataset)
+    train_dataset, test_dataset = _split_train_test(dataset)
+
+    # TODO: this might have infs in it for no observed values?
+    data_min, data_max = get_data_min_max(dataset_obj)
+
+    num_train = len(train_dataset)
+    assert num_train % parse_args.batch_size == 0
+    num_train_batches = num_train // parse_args.batch_size
+
+    assert num_train % parse_args.test_batch_size == 0
+    num_test_batches = num_train // parse_args.test_batch_size
+
+    # make sure we always save the model on the last iteration
+    assert num_train_batches * parse_args.nepochs % parse_args.save_freq == 0
+
+    def gen_data(batch_size, shuffle=True):
+        """
+        Generator for train data.
+        """
+        key = rng
+        num_batches = num_train // batch_size
+        inds = jnp.arange(num_train)
+
+        while True:
+            if shuffle:
+                key, = jax.random.split(key, num=1)
+                epoch_inds = jax.random.shuffle(key, inds)
+            else:
+                epoch_inds = inds
+            for i in range(num_batches):
+                batch_inds = onp.array(epoch_inds[i * batch_size: (i + 1) * batch_size])
+                batch_dataset = train_dataset[batch_inds]
+                yield process_batch(batch_dataset, data_min=data_min, data_max=data_max)
+
+    # TODO: use the actual test set to see that
+    ds_train = gen_data(parse_args.batch_size)
+    ds_test = gen_data(parse_args.test_batch_size, shuffle=False)
+
+    meta = {
+        "num_batches": num_train_batches,
+        "num_test_batches": num_test_batches
+    }
+
+    return ds_train, ds_test, meta
 
 
-def variable_time_collate_fn(batch,
-                             args,
-                             data_type="train",
-                             data_min=None,
-                             data_max=None):
+def normalize_masked_data(data, mask, att_min, att_max):
     """
-    Expects a batch of time series data in the form of (record_id, tt, vals, mask, labels) where
+    Normalize masked data.
+    """
+    # we don't want to divide by zero
+    att_max[att_max == 0] = 1
+
+    data_norm = (data - att_min) / att_max
+
+    # set masked out elements back to zero
+    data_norm[mask == 0] = 0
+
+    return data_norm
+
+
+def split_data_interp(data_dict):
+    """
+    Split data into observed and to predict for interpolation task.
+    """
+    # TODO: not sure if we need both copy and casting, or either for that matter
+    split_dict = {"observed_data": jnp.array(data_dict["data"].copy(), dtype=jnp.float64),
+                  "observed_tp": jnp.array(data_dict["time_steps"].copy(), dtype=jnp.float64),
+                  "data_to_predict": jnp.array(data_dict["data"].copy(), dtype=jnp.float64),
+                  "tp_to_predict": jnp.array(data_dict["time_steps"].copy(), dtype=jnp.float64),
+                  "observed_mask": None,
+                  "mask_predicted_data": None
+                  }
+
+    if "mask" in data_dict and data_dict["mask"] is not None:
+        split_dict["observed_mask"] = jnp.array(data_dict["mask"].copy(), dtype=jnp.float64)
+        split_dict["mask_predicted_data"] = jnp.array(data_dict["mask"].copy(), dtype=jnp.float64)
+
+    return split_dict
+
+
+def add_mask(data_dict):
+    """
+    Add mask to data.
+    """
+    data = data_dict["observed_data"]
+    mask = data_dict["observed_mask"]
+
+    if mask is None:
+        mask = jnp.ones_like(data)
+
+    data_dict["observed_mask"] = mask
+    return data_dict
+
+
+def get_data_min_max(records):
+    """
+    Get min and max for each feature across the dataset.
+    """
+
+    cache_path = os.path.join(records.processed_folder, "minmax_" + str(records.quantization) + '.pt')
+
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as cache_file:
+            data = pickle.load(cache_file)
+        data_min, data_max = data
+        return data_min, data_max
+
+    data_min, data_max = None, None
+
+    for b, (record_id, tt, vals, mask) in enumerate(records):
+        if b % 100 == 0:
+            print(b, len(records))
+        n_features = vals.shape[-1]
+
+        batch_min = []
+        batch_max = []
+        for i in range(n_features):
+            non_missing_vals = vals[:, i][mask[:, i] == 1]
+            if len(non_missing_vals) == 0:
+                batch_min.append(jnp.inf)
+                batch_max.append(-jnp.inf)
+            else:
+                batch_min.append(jnp.min(non_missing_vals))
+                batch_max.append(jnp.max(non_missing_vals))
+
+        batch_min = jnp.stack(batch_min)
+        batch_max = jnp.stack(batch_max)
+
+        if (data_min is None) and (data_max is None):
+            data_min = batch_min
+            data_max = batch_max
+        else:
+            data_min = jnp.minimum(data_min, batch_min)
+            data_max = jnp.maximum(data_max, batch_max)
+
+    with open(cache_path, "wb") as cache_file:
+        pickle.dump((data_min, data_max), cache_file)
+
+    return data_min, data_max
+
+
+def process_batch(batch,
+                  data_min=None,
+                  data_max=None):
+    """
+    Expects a batch of time series d ata in the form of (record_id, tt, vals, mask) where
         - record_id is a patient id
         - tt is a 1-dimensional tensor containing T time values of observations.
         - vals is a (T, D) tensor containing observed values for D variables.
         - mask is a (T, D) tensor containing 1 where values were observed and 0 otherwise.
-        - labels is a list of labels for the current patient, if labels are available. Otherwise None.
     Returns:
         combined_tt: The union of all time observations.
         combined_vals: (M, T, D) tensor containing the observed values.
         combined_mask: (M, T, D) tensor containing 1 where values were observed and 0 otherwise.
     """
     D = batch[0][2].shape[1]
-    combined_tt, inverse_indices = torch.unique(torch.cat([ex[1] for ex in batch]), sorted=True, return_inverse=True)
-    combined_tt = combined_tt.to(device)
+
+    # get union of timepoints
+    combined_tt, inverse_indices = onp.unique(onp.concatenate([ex[1] for ex in batch]),
+                                              return_inverse=True)
 
     offset = 0
-    combined_vals = torch.zeros([len(batch), len(combined_tt), D]).to(device)
-    combined_mask = torch.zeros([len(batch), len(combined_tt), D]).to(device)
+    combined_vals = onp.zeros([len(batch), len(combined_tt), D])
+    combined_mask = onp.zeros([len(batch), len(combined_tt), D])
 
-    combined_labels = None
-    N_labels = 1
-
-    combined_labels = torch.zeros(len(batch), N_labels) + torch.tensor(float('nan'))
-    combined_labels = combined_labels.to(device = device)
-
-    for b, (record_id, tt, vals, mask, labels) in enumerate(batch):
-        tt = tt.to(device)
-        vals = vals.to(device)
-        mask = mask.to(device)
-        if labels is not None:
-            labels = labels.to(device)
+    for b, (record_id, tt, vals, mask) in enumerate(batch):
 
         indices = inverse_indices[offset:offset + len(tt)]
         offset += len(tt)
@@ -496,22 +628,21 @@ def variable_time_collate_fn(batch,
         combined_vals[b, indices] = vals
         combined_mask[b, indices] = mask
 
-        if labels is not None:
-            combined_labels[b] = labels
+    combined_vals = normalize_masked_data(combined_vals, combined_mask, att_min=data_min, att_max=data_max)
 
-    combined_vals, _, _ = utils.normalize_masked_data(combined_vals, combined_mask,
-        att_min = data_min, att_max = data_max)
+    # normalize times to be in [0, 1]
+    if onp.amax(combined_tt) != 0.:
+        combined_tt /= onp.amax(combined_tt)
 
-    if torch.max(combined_tt) != 0.:
-        combined_tt = combined_tt / torch.max(combined_tt)
-
+    # TODO: explicit float64 casting, otherwise it inherits np dtype, which in itself is weird
+    #  if we use float32 this might not need to be changed anyway, might just throw a warning
     data_dict = {
-        "data": combined_vals,
-        "time_steps": combined_tt,
-        "mask": combined_mask,
-        "labels": combined_labels}
+        "data": jnp.array(combined_vals, dtype=jnp.float64),
+        "time_steps": jnp.array(combined_tt, dtype=jnp.float64),
+        "mask": jnp.array(combined_mask, dtype=jnp.float64)
+    }
 
-    data_dict = utils.split_and_subsample_batch(data_dict, args, data_type = data_type)
+    data_dict = add_mask(split_data_interp(data_dict))
     return data_dict
 
 
@@ -582,12 +713,10 @@ def init_periodic_data(rng, parse_args):
             for i in range(num_batches):
                 batch_inds = epoch_inds[i * batch_size: (i + 1) * batch_size]
                 if subsample is not None:
-                    # TODO: if we want to do proportional subsampling I don't think we can vmap
                     yield jax.vmap(get_subsample)(jax.random.split(key, num=batch_size), train_y[batch_inds])
                 else:
                     yield train_y[batch_inds], jnp.repeat(timesteps[None], batch_size, axis=0)
 
-    # TODO: jit these!
     ds_train = gen_data(parse_args.batch_size, subsample=parse_args.subsample)
     ds_test = gen_data(parse_args.test_batch_size, shuffle=False)
 
@@ -694,4 +823,4 @@ def init_periodic_gap_data(rng, parse_args):
 
 if __name__ == "__main__":
     # TODO: set this
-    init_physionet_data()
+    init_physionet_data(root="./")
