@@ -26,7 +26,7 @@ config.update("jax_enable_x64", True)
 
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=50)
-parser.add_argument('--test_batch_size', type=int, default=100)
+parser.add_argument('--test_batch_size', type=int, default=1600)
 parser.add_argument('--nepochs', type=int, default=100)
 parser.add_argument('--data_root', type=str, default="./")  # TODO: set when on cluster
 parser.add_argument('--lr', type=float, default=1e-2)
