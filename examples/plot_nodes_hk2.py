@@ -9,14 +9,14 @@ import argparse
 
 import jax
 
-# import matplotlib as mpl
-# import matplotlib.pyplot as plt
+import matplotlib as mpl
+import matplotlib.pyplot as plt
 import numpy as onp
 
 from nodes_hk2 import init_model, init_data, _reg_loss_fn
 
 # TODO: set this to absolute path
-dirname = "/h/jkelly/jessebett/jax/examples/2020-05-02-22-08-30"
+dirname = "2020-05-02-22-08-30"
 reg = "r2"
 num_blocks = 0
 
@@ -69,10 +69,11 @@ def get_info(lam):
     # log-log and log-linear both look good
     nfe = nfe
     # reg_val = meta["info"][itr]["loss_reg"]
+    reg_val = meta["info"][itr]["loss_reg"]
     loss = meta["info"][itr]["loss"]
 
     meta_file.close()
-    return nfe, loss
+    return nfe, reg_val
 
 
 def pareto_plot_nfe():
@@ -112,10 +113,10 @@ def pareto_plot_nfe():
                 pareto_front.append(pair)
     pf_X = [pair[0] for pair in pareto_front]
     pf_Y = [pair[1] for pair in pareto_front]
-    ax.plot(pf_X, pf_Y, c='0.35')
+    # ax.plot(pf_X, pf_Y, c='0.35')
 
     ax.set_xlabel("Average Number of Function Evaluations")
-    ax.set_ylabel("Unregularized Training Loss")
+    ax.set_ylabel("Mean Regularization")
 
     norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
     cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
@@ -124,8 +125,8 @@ def pareto_plot_nfe():
     plt.gcf().subplots_adjust(right=0.88, left=0.13)
     # plt.gcf().subplots_adjust(right=0.88)
 
-    plt.savefig("%s/loss_nfe_%s_pareto.pdf" % (dirname, reg))
-    plt.savefig("%s/loss_nfe_%s_pareto.png" % (dirname, reg))
+    plt.savefig("%s/nfe_reg_%s_pareto.pdf" % (dirname, reg))
+    plt.savefig("%s/nfe_reg_%s_pareto.png" % (dirname, reg))
     plt.clf()
     plt.close(fig)
 
@@ -409,13 +410,14 @@ def r_over_training():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser('Neural ODE')
-    parser.add_argument('--lam', type=float, default=0)
-    parse_args = parser.parse_args()
+    # parser = argparse.ArgumentParser('Neural ODE')
+    # parser.add_argument('--lam', type=float, default=0)
+    # parse_args = parser.parse_args()
+    #
+    # get_info(parse_args.lam)
 
-    get_info(parse_args.lam)
     # nfe_r()
-    # pareto_plot_nfe()
+    pareto_plot_nfe()
     # histogram_nfe()
     # pareto_nfe_r()
     # r_corr()
