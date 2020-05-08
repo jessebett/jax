@@ -439,46 +439,58 @@ def init_physionet_data(rng, parse_args):
     """
     Initialize physionet data for training and testing.
     """
-    n_samples = None
-    dataset_obj = PhysioNet(root=parse_args.data_root,
-                            download=True,
-                            quantization=0.016,   # TODO: make this 0 (it's only there for speed)
-                            n_samples=n_samples)
-    # remove time-invariant features and Patient ID
-    remove_params = ['Age', 'Gender', 'Height', 'ICUType']
-    params_inds = [dataset_obj.params_dict[param_name]
-                   for ind, param_name in enumerate(dataset_obj.params) if param_name not in remove_params]
-    for ind, ex in enumerate(dataset_obj.data):
-        record_id, tt, vals, mask = ex
-        dataset_obj.data[ind] = (tt, vals[:, params_inds], mask[:, params_inds])
-    n_samples = len(dataset_obj)
+    # n_samples = None
+    # dataset_obj = PhysioNet(root=parse_args.data_root,
+    #                         download=True,
+    #                         quantization=0.016,   # TODO: make this 0 (it's only there for speed)
+    #                         n_samples=n_samples)
+    # # remove time-invariant features and Patient ID
+    # remove_params = ['Age', 'Gender', 'Height', 'ICUType']
+    # params_inds = [dataset_obj.params_dict[param_name]
+    #                for ind, param_name in enumerate(dataset_obj.params) if param_name not in remove_params]
+    # for ind, ex in enumerate(dataset_obj.data):
+    #     record_id, tt, vals, mask = ex
+    #     dataset_obj.data[ind] = (tt, vals[:, params_inds], mask[:, params_inds])
+    # n_samples = len(dataset_obj)
+    #
+    # def _split_train_test(data, train_frac=0.8):
+    #     data_train = data[:int(n_samples * train_frac)]
+    #     data_test = data[int(n_samples * train_frac):]
+    #     return data_train, data_test
+    #
+    # dataset = onp.array(dataset_obj[:n_samples])
+    #
+    # random.Random(parse_args.seed).shuffle(dataset)
+    # train_dataset, test_dataset = _split_train_test(dataset)
+    #
+    # # TODO: this might have infs in it for no observed values?
+    # data_min, data_max = get_data_min_max(dataset_obj)
+    #
+    # processed_dataset = process_batch(train_dataset, data_min=data_min, data_max=data_max)
+    #
+    # with open(os.path.join(parse_args.data_root, "PhysioNet/processed/final.pt"), 'wb') as processed_file:
+    #     pickle.dump(processed_dataset, processed_file, protocol=4)
 
-    def _split_train_test(data, train_frac=0.8):
-        data_train = data[:int(n_samples * train_frac)]
-        data_test = data[int(n_samples * train_frac):]
-        return data_train, data_test
+    with open(os.path.join(parse_args.data_root, "PhysioNet/processed/final.pt"), 'rb') as processed_file:
+        processed_dataset = pickle.load(processed_file)
 
-    dataset = onp.array(dataset_obj[:n_samples])
-
-    random.Random(0).shuffle(dataset)
-    train_dataset, test_dataset = _split_train_test(dataset)
-
-    # TODO: this might have infs in it for no observed values?
-    data_min, data_max = get_data_min_max(dataset_obj)
-
-    processed_dataset = process_batch(train_dataset, data_min=data_min, data_max=data_max)
+    for key in ["observed_tp", "tp_to_predict"]:
+        processed_dataset[key] = jnp.array(processed_dataset[key], dtype=jnp.float64)
 
     def get_batch_from_processed(inds):
         """
         Get batch from processed data (i.e. union timepoints beforehand).
         """
         keys_to_ind = ["observed_data", "data_to_predict", "observed_mask", "mask_predicted_data"]
-        batch_dict = processed_dataset
+        other_keys = ["observed_tp", "tp_to_predict"]
+        batch_dict = {}
+        for key in other_keys:
+            batch_dict[key] = processed_dataset[key]
         for key in keys_to_ind:
-            batch_dict[key] = batch_dict[key][inds]
+            batch_dict[key] = jnp.array(processed_dataset[key][inds], dtype=jnp.float64)
         return batch_dict
 
-    num_train = len(train_dataset)
+    num_train = len(processed_dataset["observed_mask"])
     assert num_train % parse_args.batch_size == 0
     num_train_batches = num_train // parse_args.batch_size
 
@@ -539,9 +551,8 @@ def split_data_interp(data_dict):
     """
     Split data into observed and to predict for interpolation task.
     """
-    # TODO: need to copy if we want to do extrapolation
-    data_ = jnp.array(data_dict["data"], dtype=jnp.float64)
-    time_ = jnp.array(data_dict["time_steps"], dtype=jnp.float64)
+    data_ = data_dict["data"]
+    time_ = data_dict["time_steps"]
     split_dict = {"observed_data": data_,
                   "observed_tp": time_,
                   "data_to_predict": data_,
@@ -551,25 +562,11 @@ def split_data_interp(data_dict):
                   }
 
     if "mask" in data_dict and data_dict["mask"] is not None:
-        mask_ = jnp.array(data_dict["mask"].copy(), dtype=jnp.float64)
+        mask_ = data_dict["mask"]
         split_dict["observed_mask"] = mask_
         split_dict["mask_predicted_data"] = mask_
 
     return split_dict
-
-
-def add_mask(data_dict):
-    """
-    Add mask to data.
-    """
-    data = data_dict["observed_data"]
-    mask = data_dict["observed_mask"]
-
-    if mask is None:
-        mask = jnp.ones_like(data)
-
-    data_dict["observed_mask"] = mask
-    return data_dict
 
 
 def get_data_min_max(records):
@@ -664,7 +661,7 @@ def process_batch(batch,
         "mask": jnp.array(combined_mask, dtype=jnp.float64)
     }
 
-    data_dict = add_mask(split_data_interp(data_dict))
+    data_dict = split_data_interp(data_dict)
     return data_dict
 
 
