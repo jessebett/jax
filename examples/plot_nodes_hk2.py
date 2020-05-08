@@ -16,8 +16,8 @@ import numpy as onp
 from nodes_hk2 import init_model, init_data, _reg_loss_fn
 
 # TODO: set this to absolute path
-dirname = "2020-05-01-12-02-58"
-reg = "r3"
+dirname = "/h/jkelly/jessebett/jax/examples/2020-05-02-22-08-30"
+reg = "r2"
 num_blocks = 0
 
 forward, model = init_model()
