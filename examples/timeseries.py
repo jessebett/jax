@@ -439,37 +439,37 @@ def init_physionet_data(rng, parse_args):
     """
     Initialize physionet data for training and testing.
     """
-    # n_samples = None
-    # dataset_obj = PhysioNet(root=parse_args.data_root,
-    #                         download=True,
-    #                         quantization=0.016,   # TODO: make this 0 (it's only there for speed)
-    #                         n_samples=n_samples)
-    # # remove time-invariant features and Patient ID
-    # remove_params = ['Age', 'Gender', 'Height', 'ICUType']
-    # params_inds = [dataset_obj.params_dict[param_name]
-    #                for ind, param_name in enumerate(dataset_obj.params) if param_name not in remove_params]
-    # for ind, ex in enumerate(dataset_obj.data):
-    #     record_id, tt, vals, mask = ex
-    #     dataset_obj.data[ind] = (tt, vals[:, params_inds], mask[:, params_inds])
-    # n_samples = len(dataset_obj)
-    #
-    # def _split_train_test(data, train_frac=0.8):
-    #     data_train = data[:int(n_samples * train_frac)]
-    #     data_test = data[int(n_samples * train_frac):]
-    #     return data_train, data_test
-    #
-    # dataset = onp.array(dataset_obj[:n_samples])
-    #
-    # random.Random(parse_args.seed).shuffle(dataset)
-    # train_dataset, test_dataset = _split_train_test(dataset)
-    #
-    # # TODO: this might have infs in it for no observed values?
-    # data_min, data_max = get_data_min_max(dataset_obj)
-    #
-    # processed_dataset = process_batch(train_dataset, data_min=data_min, data_max=data_max)
-    #
-    # with open(os.path.join(parse_args.data_root, "PhysioNet/processed/final.pt"), 'wb') as processed_file:
-    #     pickle.dump(processed_dataset, processed_file, protocol=4)
+    n_samples = None
+    dataset_obj = PhysioNet(root=parse_args.data_root,
+                            download=True,
+                            quantization=0.016,   # TODO: make this 0 (it's only there for speed)
+                            n_samples=n_samples)
+    # remove time-invariant features and Patient ID
+    remove_params = ['Age', 'Gender', 'Height', 'ICUType']
+    params_inds = [dataset_obj.params_dict[param_name]
+                   for ind, param_name in enumerate(dataset_obj.params) if param_name not in remove_params]
+    for ind, ex in enumerate(dataset_obj.data):
+        record_id, tt, vals, mask = ex
+        dataset_obj.data[ind] = (tt, vals[:, params_inds], mask[:, params_inds])
+    n_samples = len(dataset_obj)
+
+    def _split_train_test(data, train_frac=0.8):
+        data_train = data[:int(n_samples * train_frac)]
+        data_test = data[int(n_samples * train_frac):]
+        return data_train, data_test
+
+    dataset = onp.array(dataset_obj[:n_samples])
+
+    random.Random(parse_args.seed).shuffle(dataset)
+    train_dataset, test_dataset = _split_train_test(dataset)
+
+    # TODO: this might have infs in it for no observed values?
+    data_min, data_max = get_data_min_max(dataset_obj)
+
+    processed_dataset = process_batch(train_dataset, data_min=data_min, data_max=data_max)
+
+    with open(os.path.join(parse_args.data_root, "PhysioNet/processed/final.pt"), 'wb') as processed_file:
+        pickle.dump(processed_dataset, processed_file, protocol=4)
 
     with open(os.path.join(parse_args.data_root, "PhysioNet/processed/final.pt"), 'rb') as processed_file:
         processed_dataset = pickle.load(processed_file)
@@ -656,9 +656,9 @@ def process_batch(batch,
     # TODO: explicit float64 casting, otherwise it inherits np dtype, which in itself is weird
     #  if we use float32 this might not need to be changed anyway, might just throw a warning
     data_dict = {
-        "data": jnp.array(combined_vals, dtype=jnp.float64),
-        "time_steps": jnp.array(combined_tt, dtype=jnp.float64),
-        "mask": jnp.array(combined_mask, dtype=jnp.float64)
+        "data": combined_vals,
+        "time_steps": combined_tt,
+        "mask": combined_mask
     }
 
     data_dict = split_data_interp(data_dict)
