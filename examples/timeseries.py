@@ -341,9 +341,9 @@ class PhysioNet:
                     lines = f.readlines()
                     prev_time = 0
                     tt = [0.]
-                    vals = [jnp.zeros(len(self.params))]
-                    mask = [jnp.zeros(len(self.params))]
-                    nobs = [jnp.zeros(len(self.params))]
+                    vals = [onp.zeros(len(self.params))]
+                    mask = [onp.zeros(len(self.params))]
+                    nobs = [onp.zeros(len(self.params))]
                     for line_num, l in enumerate(lines[1:]):
                         # print(line_num, len(lines[1:]))
                         total += 1
@@ -357,9 +357,9 @@ class PhysioNet:
 
                         if time != prev_time:
                             tt.append(time)
-                            vals.append(jnp.zeros(len(self.params)))
-                            mask.append(jnp.zeros(len(self.params)))
-                            nobs.append(jnp.zeros(len(self.params)))
+                            vals.append(onp.zeros(len(self.params)))
+                            mask.append(onp.zeros(len(self.params)))
+                            nobs.append(onp.zeros(len(self.params)))
                             prev_time = time
 
                         if param in self.params_dict:
@@ -367,18 +367,22 @@ class PhysioNet:
                             if self.reduce == 'average' and n_observations > 0:
                                 prev_val = vals[-1][self.params_dict[param]]
                                 new_val = (prev_val * n_observations + float(val)) / (n_observations + 1)
-                                vals[-1] = jax.ops.index_update(vals[-1],
-                                                                jax.ops.index[self.params_dict[param]], new_val)
+                                # vals[-1] = jax.ops.index_update(vals[-1],
+                                #                                 jax.ops.index[self.params_dict[param]], new_val)
+                                vals[-1][self.params_dict[param]] = new_val
                             else:
-                                vals[-1] = jax.ops.index_update(vals[-1],
-                                                                jax.ops.index[self.params_dict[param]], float(val))
-                            mask[-1] = jax.ops.index_update(mask[-1], jax.ops.index[self.params_dict[param]], 1)
-                            nobs[-1] = jax.ops.index_add(nobs[-1], jax.ops.index[self.params_dict[param]], 1)
+                                # vals[-1] = jax.ops.index_update(vals[-1],
+                                #                                 jax.ops.index[self.params_dict[param]], float(val))
+                                vals[-1][self.params_dict[param]] = float(val)
+                            # mask[-1] = jax.ops.index_update(mask[-1], jax.ops.index[self.params_dict[param]], 1)
+                            mask[-1][self.params_dict[param]] = 1
+                            # nobs[-1] = jax.ops.index_add(nobs[-1], jax.ops.index[self.params_dict[param]], 1)
+                            nobs[-1][self.params_dict[param]] += 1
                         else:
                             assert param == 'RecordID', 'Read unexpected param {}'.format(param)
-                tt = jnp.array(tt)
-                vals = jnp.stack(vals)
-                mask = jnp.stack(mask)
+                tt = onp.array(tt)
+                vals = onp.stack(vals)
+                mask = onp.stack(mask)
 
                 patients.append((record_id, tt, vals, mask))
 
@@ -442,7 +446,7 @@ def init_physionet_data(rng, parse_args):
     n_samples = None
     dataset_obj = PhysioNet(root=parse_args.data_root,
                             download=True,
-                            quantization=0.016,   # TODO: make this 0 (it's only there for speed)
+                            quantization=1.,   # TODO: make this 0 (it's only there for speed)
                             n_samples=n_samples)
     # remove time-invariant features and Patient ID
     remove_params = ['Age', 'Gender', 'Height', 'ICUType']
@@ -468,11 +472,11 @@ def init_physionet_data(rng, parse_args):
 
     processed_dataset = process_batch(train_dataset, data_min=data_min, data_max=data_max)
 
-    with open(os.path.join(parse_args.data_root, "PhysioNet/processed/final.pt"), 'wb') as processed_file:
+    with open(os.path.join(parse_args.data_root, "PhysioNet/processed/final2.pt"), 'wb') as processed_file:
         pickle.dump(processed_dataset, processed_file, protocol=4)
 
-    with open(os.path.join(parse_args.data_root, "PhysioNet/processed/final.pt"), 'rb') as processed_file:
-        processed_dataset = pickle.load(processed_file)
+    # with open(os.path.join(parse_args.data_root, "PhysioNet/processed/final2.pt"), 'rb') as processed_file:
+    #     processed_dataset = pickle.load(processed_file)
 
     for key in ["observed_tp", "tp_to_predict"]:
         processed_dataset[key] = jnp.array(processed_dataset[key], dtype=jnp.float64)
