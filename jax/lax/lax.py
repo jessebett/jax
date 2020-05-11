@@ -36,7 +36,7 @@ from .. import dtypes
 from .. import lazy
 from .. import lib
 from ..config import flags
-from ..core import _canonicalize_dimension, Primitive
+from ..core import Primitive
 from ..abstract_arrays import (UnshapedArray, ShapedArray, ConcreteArray,
                                AbstractToken, array_types, make_shaped_array,
                                raise_to_shaped, abstract_token, canonicalize_shape)
@@ -79,7 +79,7 @@ def broadcast_shapes(*shapes):
   if not onp.all((shapes == result_shape) | (shapes == 1)):
     raise ValueError("Incompatible shapes for broadcasting: {}"
                      .format(tuple(map(tuple, shapes))))
-  return tuple(map(_canonicalize_dimension, result_shape))
+  return canonicalize_shape(result_shape)
 
 def _identity(x): return x
 
@@ -175,9 +175,6 @@ def atan2(x: Array, y: Array) -> Array:
 
 def betainc(a: Array, b: Array, x: Array) -> Array:
   r"""Elementwise regularized incomplete beta integral."""
-  a = _brcast(_brcast(a, b), x)
-  b = _brcast(b, a)
-  x = _brcast(x, a)
   return regularized_incomplete_beta_p.bind(a, b, x)
 
 def lgamma(x: Array) -> Array:
@@ -190,11 +187,15 @@ def digamma(x: Array) -> Array:
 
 def igamma(a: Array, x: Array) -> Array:
   r"""Elementwise regularized incomplete gamma function."""
-  return igamma_p.bind(_brcast(a, x), _brcast(x, a))
+  return igamma_p.bind(a, x)
 
 def igammac(a: Array, x: Array) -> Array:
   r"""Elementwise complementary regularized incomplete gamma function."""
-  return igammac_p.bind(_brcast(a, x), _brcast(x, a))
+  return igammac_p.bind(a, x)
+
+def igamma_grad_a(a: Array, x: Array) -> Array:
+  r"""Elementwise derivative of the regularized incomplete gamma function."""
+  return igamma_grad_a_p.bind(a, x)
 
 def bessel_i0e(x: Array) -> Array:
   r"""Exponentially scaled modified Bessel function of order 0:
@@ -520,10 +521,7 @@ def conv_general_dilated(
   (for a 2D convolution).
   """
   dnums: ConvDimensionNumbers
-  if isinstance(dimension_numbers, ConvDimensionNumbers):
-    dnums = dimension_numbers
-  else:
-    dnums = conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+  dnums = conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
   if lhs_dilation is None:
     lhs_dilation = (1,) * (lhs.ndim - 2)
   elif isinstance(padding, str) and not len(lhs_dilation) == lhs_dilation.count(1):
@@ -664,6 +662,10 @@ def broadcast_in_dim(operand: Array, shape: Shape,
   return broadcast_in_dim_p.bind(
       operand, shape=tuple(shape),
       broadcast_dimensions=tuple(broadcast_dimensions))
+
+def broadcast_to_rank(x: Array, rank: int) -> Array:
+  """Adds leading dimensions of ``1`` to give ``x`` rank ``rank``."""
+  return broadcast(x, (1,) * (rank - x.ndim))
 
 def reshape(operand: Array, new_sizes: Shape,
             dimensions: Optional[Sequence[int]] = None) -> Array:
@@ -1234,10 +1236,11 @@ def iota(dtype: DType, size: int) -> Array:
   <https://www.tensorflow.org/xla/operation_semantics#iota>`_
   operator.
   """
-  size = int(size)
+  size = size if type(size) is masking.Poly else int(size)
+  shape = canonicalize_shape((size,))
   dtype = dtypes.canonicalize_dtype(dtype)
-  lazy_expr = lazy.iota(dtype, size)
-  aval = ShapedArray((size,), dtype)
+  lazy_expr = lazy.iota(dtype, shape[0])
+  aval = ShapedArray(shape, dtype)
   return xla.DeviceArray(aval, None, lazy_expr, xla.DeviceConstant())
 
 def broadcasted_iota(dtype: DType, shape: Shape, dimension: int) -> Array:
@@ -1696,7 +1699,6 @@ def standard_primitive(shape_rule, dtype_rule, name, translation_rule=None):
   prim.def_impl(partial(xla.apply_primitive, prim))
   prim.def_abstract_eval(partial(standard_abstract_eval, prim, shape_rule, dtype_rule))
   xla.translations[prim] = translation_rule or partial(standard_translate, name)
-  masking.shape_rules[prim] = shape_rule
   return prim
 
 
@@ -1778,6 +1780,26 @@ def naryop(result_dtype, accepted_dtypes, name, translation_rule=None):
   return prim
 standard_naryop = partial(naryop, _input_dtype)
 
+
+def _broadcast_translate(translate: Callable):
+  # Decorator for translation rules which adds explicit broadcasting of
+  # positional arguments. This is necessary only for a handful of primitives
+  # whose XLA implementations do not support broadcasting.
+  def _broadcast_array(array, array_shape, result_shape):
+    if array_shape == result_shape:
+      return array
+    bcast_dims = tuple(range(len(result_shape) - len(array_shape),
+                             len(result_shape)))
+    result = xops.BroadcastInDim(array, result_shape, bcast_dims)
+    return result
+
+  def _broadcasted_translation_rule(c, *args, **kwargs):
+    shapes = [c.GetShape(arg).dimensions() for arg in args]
+    result_shape = broadcast_shapes(*shapes)
+    args = [_broadcast_array(arg, arg_shape, result_shape)
+            for arg, arg_shape in zip(args, shapes)]
+    return translate(c, *args, **kwargs)
+  return _broadcasted_translation_rule
 
 # NOTE(mattjj): this isn't great for orchestrate fwd mode because it means JVPs
 # get two extra ops in them: a reshape and a broadcast_in_dim (or sometimes just
@@ -1896,7 +1918,9 @@ ad.defjvp(atanh_p,
           lambda g, x: mul(g, reciprocal((_one(x) - x) * (_one(x) + x))))
 
 regularized_incomplete_beta_p = standard_naryop(
-    [_float, _float, _float], 'regularized_incomplete_beta')
+    [_float, _float, _float], 'regularized_incomplete_beta',
+    translation_rule=_broadcast_translate(
+      partial(standard_translate, 'regularized_incomplete_beta')))
 
 def betainc_gradx(g, a, b, x):
   lbeta = lgamma(a) + lgamma(b) - lgamma(a + b)
@@ -1917,26 +1941,32 @@ ad.defjvp(lgamma_p, lambda g, x: mul(g, digamma(x)))
 
 digamma_p = standard_unop(_float, 'digamma')
 
-igamma_p = standard_naryop([_float, _float], 'igamma')
+igamma_p = standard_naryop(
+  [_float, _float], 'igamma',
+  translation_rule=_broadcast_translate(partial(standard_translate, 'igamma')))
+igamma_grad_a_p = standard_naryop([_float, _float], 'igamma_grad_a',
+  translation_rule=_broadcast_translate(partial(standard_translate,
+                                               'igamma_grad_a')))
 
 def igamma_gradx(g, a, x):
-  return g * exp(-x + (a - 1.) * log(x) - lgamma(a))
+  return _brcast(g, a, x) * exp(-x + (a - _ones(a)) * log(x) - lgamma(a))
 
-# TODO(srvasude): Igamma and Igammac gradient aren't supported with respect to
-# a. We can reuse some of the reparameterization code in the JAX gamma sampler,
-# but better to add an XLA op for this (which will also allow TF Igamma gradient
-# code to be XLA compiled).
-def gamma_grad_not_implemented(a, b, x):
-  raise ValueError("Igamma(c) gradient with respect to `a` not supported.")
+def igamma_grada(g, a, x):
+  return _brcast(g, a, x) * igamma_grad_a(a, x)
 
-ad.defjvp(igamma_p, gamma_grad_not_implemented, igamma_gradx)
+ad.defjvp(igamma_p, igamma_grada, igamma_gradx)
 
-igammac_p = standard_naryop([_float, _float], 'igammac')
+igammac_p = standard_naryop(
+  [_float, _float], 'igammac',
+  translation_rule=_broadcast_translate(partial(standard_translate, 'igammac')))
 
 def igammac_gradx(g, a, x):
   return -igamma_gradx(g, a, x)
 
-ad.defjvp(igammac_p, gamma_grad_not_implemented, igammac_gradx)
+def igammac_grada(g, a, x):
+  return -igamma_grada(g, a, x)
+
+ad.defjvp(igammac_p, igammac_grada, igammac_gradx)
 
 bessel_i0e_p = standard_unop(_float, 'bessel_i0e')
 ad.defjvp2(bessel_i0e_p, lambda g, y, x: g * (bessel_i1e(x) - sign(x) * y))
@@ -2635,7 +2665,7 @@ def _broadcast_in_dim_impl(operand, *, shape, broadcast_dimensions):
       operand, shape=shape, broadcast_dimensions=broadcast_dimensions)
     aval = ShapedArray(shape, _dtype(operand))
     lazy_expr = lazy.broadcast(operand._lazy_expr, shape, broadcast_dimensions)
-    return xla.DeviceArray(aval, None, lazy_expr, operand.device_buffer)
+    return xla.DeviceArray(aval, operand._device, lazy_expr, operand.device_buffer)
   else:
     return xla.apply_primitive(broadcast_in_dim_p, operand, shape=shape,
                                broadcast_dimensions=broadcast_dimensions)
@@ -2845,7 +2875,7 @@ def _reshape_impl(operand, *, new_sizes, dimensions):
     if bcast_dims is not None:
       aval = ShapedArray(new_sizes, operand.dtype)
       lazy_expr = lazy.broadcast(operand._lazy_expr, new_sizes, bcast_dims)
-      return xla.DeviceArray(aval, None, lazy_expr, operand.device_buffer)
+      return xla.DeviceArray(aval, operand._device, lazy_expr, operand.device_buffer)
 
   if type(operand) is pxla.ShardedDeviceArray and dimensions is None:
     array = _reshape_sharded_device_array(operand, new_sizes, old_sizes)
@@ -2912,8 +2942,8 @@ def _reshape_sharded_device_array(array, new_sizes, old_sizes):
     if ragged: return None
     if new_sizes[0] != split_axis_size: return None
     aval = ShapedArray(new_sizes, array.dtype)
-    sharding_spec = pxla._pmap_sharding_spec(new_sizes[0], new_sizes[0],
-                                             new_sizes[1:])
+    sharding_spec = pxla._pmap_sharding_spec(
+        new_sizes[0], new_sizes[0], ShapedArray(new_sizes[1:], array.dtype), True)
     return pxla.ShardedDeviceArray(aval, sharding_spec, array.device_buffers)
 
   return None
@@ -2999,7 +3029,7 @@ def _transpose_impl(operand, *, permutation):
   if type(operand) is xla.DeviceArray:
     lazy_expr = lazy.transpose(operand._lazy_expr, permutation)
     aval = ShapedArray(lazy_expr.shape, operand.dtype)
-    return xla.DeviceArray(aval, None, lazy_expr, operand.device_buffer)
+    return xla.DeviceArray(aval, operand._device, lazy_expr, operand.device_buffer)
   else:
     return xla.apply_primitive(transpose_p, operand, permutation=permutation)
 
@@ -4689,7 +4719,6 @@ tie_in_p.def_abstract_eval(lambda x, y: raise_to_shaped(y))
 xla.translations[tie_in_p] = lambda c, x, y: y
 ad.deflinear(tie_in_p, _tie_in_transpose_rule)
 batching.primitive_batchers[tie_in_p] = _tie_in_batch_rule
-masking.shape_rules[tie_in_p] = lambda x, y: y.shape
 masking.masking_rules[tie_in_p] = lambda vals, logical_shapes: vals[1]
 
 
@@ -4964,8 +4993,6 @@ def conv_transpose_shape_tuple(lhs_shape, rhs_shape, window_strides, padding,
 
 def _check_shapelike(fun_name, arg_name, obj):
   """Check that `obj` is a shape-like value (e.g. tuple of nonnegative ints)."""
-  if (type(obj) is tuple and masking.is_polymorphic(obj)):
-    return obj
   if not isinstance(obj, (tuple, list, onp.ndarray)):
     msg = "{} {} must be of type tuple/list/ndarray, got {}."
     raise TypeError(msg.format(fun_name, arg_name, type(obj)))
@@ -4976,7 +5003,9 @@ def _check_shapelike(fun_name, arg_name, obj):
   if obj_arr.ndim != 1:
     msg = "{} {} must be rank 1, got {}."
     raise TypeError(msg.format(obj_arr.ndim))
-  if not dtypes.issubdtype(obj_arr.dtype, onp.integer):
+  try:
+    canonicalize_shape(obj_arr)
+  except TypeError:
     msg = "{} {} must have every element be an integer type, got {}."
     raise TypeError(msg.format(fun_name, arg_name, tuple(map(type, obj))))
   if not (obj_arr >= 0).all():
@@ -5052,13 +5081,16 @@ def conv_dimension_numbers(lhs_shape, rhs_shape, dimension_numbers):
   Args:
     lhs_shape: tuple of nonnegative integers, shape of the convolution input.
     rhs_shape: tuple of nonnegative integers, shape of the convolution kernel.
-    dimension_numbers: None or a tuple/list of strings, following the
-      convolution dimension number specification format in xla_client.py.
+    dimension_numbers: None or a tuple/list of strings or a ConvDimensionNumbers
+      object following the convolution dimension number specification format in
+      xla_client.py.
 
   Returns:
     A `ConvDimensionNumbers` object that represents `dimension_numbers` in the
     canonical form used by lax functions.
   """
+  if isinstance(dimension_numbers, ConvDimensionNumbers):
+    return dimension_numbers
   if len(lhs_shape) != len(rhs_shape):
     msg = "convolution requires lhs and rhs ndim to be equal, got {} and {}."
     raise TypeError(msg.format(len(lhs_shape), len(rhs_shape)))

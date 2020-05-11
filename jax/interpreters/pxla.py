@@ -47,7 +47,7 @@ from .. import linear_util as lu
 from .. import lazy
 from ..abstract_arrays import (ConcreteArray, ShapedArray, array_types,
                                raise_to_shaped)
-from ..util import (partial, unzip2, prod, safe_map, safe_zip,
+from ..util import (partial, unzip2, unzip3, prod, safe_map, safe_zip,
                     extend_name_stack, wrap_name)
 from ..lib import xla_bridge as xb
 from ..lib import xla_client as xc
@@ -141,10 +141,10 @@ def spec_to_indices(shape: Tuple[int, ...],
 
   # `product` will always return a sequence of tuples. Skip the tuples if each
   # index is a single element.
-  if len(indices_per_axis) > 1:
-    indices = list(product(*indices_per_axis))
-  else:
+  if len(indices_per_axis) == 1:
     indices = list(indices_per_axis[0])
+  else:
+    indices = list(product(*indices_per_axis))
 
   return tuple(i for i in indices
                for _ in range(sharding_spec.replication_factor))
@@ -196,6 +196,7 @@ def shard_args(devices: Sequence[xb.xla_client.Device],
         buffers[r][a] = (buf if buf.device() == devices[r]
                          else buf.copy_to_device(devices[r]))
     else:
+      arg = xla.canonicalize_dtype(arg)
       bufs = shard_arg_handlers[type(arg)](arg, devices, indices[a])
       for r, buf in enumerate(bufs):
         buffers[r][a] = buf
@@ -210,7 +211,42 @@ def _shard_array(x, devices, indices):
   return [xla.device_put(x[i], d) for (i, d) in zip(indices, devices)]
 for _t in array_types:
   shard_arg_handlers[_t] = _shard_array
-shard_arg_handlers[xla.DeviceArray] = _shard_array
+
+def _shard_device_array(x, devices, indices):
+  start_indices, limit_indices, removed_dims = map(tuple, unzip3(
+      _as_slice_indices(x, idx) for idx in indices))
+  shards = x._multi_slice(start_indices, limit_indices, removed_dims)
+  return [xla.device_put(s, d) for s, d in zip(shards, devices)]
+shard_arg_handlers[xla.DeviceArray] = _shard_device_array
+
+# NOTE(skye): we could refactor to generate _multi_slice parameters directly
+# from the input ShardingSpec, rather than the indices. However, this would
+# require duplicating the ordering logic of spec_to_indices, which is more
+# subtle and more likely to change than the index logic we have to support here.
+def _as_slice_indices(arr: xla.DeviceArray, idx: Index) -> Tuple[
+    Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
+  """Returns start_indices, limit_indices, removed_dims"""
+  start_indices = [0] * arr.ndim
+  limit_indices = list(arr.shape)
+  removed_dims = []
+
+  tuple_idx = idx if isinstance(idx, tuple) else (idx,)
+  for dim, sub_idx in enumerate(tuple_idx):
+    if isinstance(sub_idx, int):
+      start_indices[dim] = sub_idx
+      limit_indices[dim] = sub_idx + 1
+      removed_dims.append(dim)
+    elif sub_idx == slice(None):
+      continue
+    else:
+      assert isinstance(sub_idx, slice)
+      assert isinstance(sub_idx.start, int)
+      assert isinstance(sub_idx.stop, int)
+      start_indices[dim] = sub_idx.start
+      limit_indices[dim] = sub_idx.stop
+
+  return tuple(start_indices), tuple(limit_indices), tuple(removed_dims) # type: ignore
+
 
 def shard_aval(size, aval):
   try:
@@ -339,11 +375,15 @@ def apply_parallel_primitive(prim, *args, **params):
   # look up information in the dynamic axis env.
   dynamic_axis_env = _thread_local_state.dynamic_axis_env
   axis_name = params.pop('axis_name')
-  logical_size = lambda frame: frame.hard_size * (frame.soft_size or 1)
-  if isinstance(axis_name, (list, tuple)):
-    shape = tuple(logical_size(dynamic_axis_env[name]) for name in axis_name)
+  axis_index_groups = params.pop('axis_index_groups')
+  if axis_index_groups is not None:
+    shape = (len(axis_index_groups[0]),)
   else:
-    shape = (logical_size(dynamic_axis_env[axis_name]),)
+    logical_size = lambda frame: frame.hard_size * (frame.soft_size or 1)
+    if isinstance(axis_name, (list, tuple)):
+      shape = tuple(logical_size(dynamic_axis_env[name]) for name in axis_name)
+    else:
+      shape = (logical_size(dynamic_axis_env[axis_name]),)
   return parallel_pure_rules[prim](*args, shape=shape, **params)
 
 parallel_pure_rules: Dict[core.Primitive, Callable] = {}
@@ -459,10 +499,10 @@ class ShardedDeviceArray(xla.DeviceArray):
     # providing sharding_spec. It assumes that any pre-existing callers are
     # creating pmap-style ShardedDeviceArrays.
     if device_buffers is None:
-      assert isinstance(sharding_spec[0], xb.xla_client._xla.PyLocalBuffer)
       device_buffers = sharding_spec
+      sharded_aval = ShapedArray(aval.shape[1:], aval.dtype)
       sharding_spec = _pmap_sharding_spec(aval.shape[0], aval.shape[0],
-                                          aval.shape[1:])
+                                          sharded_aval, True)
 
     # TODO(skye): assert invariants. Keep performance in mind though.
     if indices is None:
@@ -563,12 +603,13 @@ def xla_pmap_impl(fun: lu.WrappedFun, *args, backend, axis_name, axis_size, glob
                   devices, name, mapped_invars):
   abstract_args = map(xla.abstractify, args)
   compiled_fun = parallel_callable(fun, backend, axis_name, axis_size,
-                                   global_axis_size, devices, name, *abstract_args)
+                                   global_axis_size, devices, name, mapped_invars,
+                                   *abstract_args)
   return compiled_fun(*args)
 
 @lu.cache
 def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
-                      devices, name, *avals):
+                      devices, name, mapped_invars, *avals):
   if devices is not None and len(devices) == 0:
     raise ValueError("'devices' argument to pmap must be non-empty, or None.")
 
@@ -614,13 +655,15 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
     with extend_dynamic_axis_env(axis_name, dummy._trace, global_axis_size):
       return fun.call_wrapped(*args)
 
-  sharded_avals = tuple(map(partial(shard_aval, axis_size), avals))
+  sharded_avals = tuple(shard_aval(axis_size, aval) if m else aval
+                        for m, aval in zip(mapped_invars, avals))
   pvals = [pe.PartialVal.unknown(aval) for aval in sharded_avals]
-  # We add a dummy first invar, to carry the trace details to `dynamic_fun`
+  # We add a dummy first invar, to carry the trace  details to `dynamic_fun`
   pval = pe.PartialVal.unknown(core.abstract_unit)  # dummy value for axis env
   jaxpr, out_pvals, consts = pe.trace_to_jaxpr(
       dynamic_fun, [pval] + pvals, instantiate=False, stage_out=True, bottom=True)
   jaxpr.invars = jaxpr.invars[1:]  # ignore dummy
+  jaxpr, uses_outfeed = xla.apply_outfeed_rewriter(jaxpr)
 
   out_pvs, out_consts = unzip2(out_pvals)
 
@@ -704,9 +747,8 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
   compiled = backend.compile(built, compile_options=compile_options)
 
   input_sharding_specs = [_pmap_sharding_spec(num_local_replicas, axis_size,
-                                              aval.shape)
-                          if aval is not core.abstract_unit else None
-                          for aval in sharded_avals]
+                                              aval, m)
+                          for m, aval in zip(mapped_invars, sharded_avals)]
   input_indices = [spec_to_indices(aval.shape, spec)
                    if spec is not None else None
                    for aval, spec in zip(avals, input_sharding_specs)]
@@ -715,7 +757,7 @@ def parallel_callable(fun, backend, axis_name, axis_size, global_axis_size,
   handle_outs = _pvals_to_results_handler(axis_size, num_local_replicas,
                                           out_pvals, compiled.local_devices(),
                                           backend)
-  return partial(execute_replicated, compiled, backend, handle_args,
+  return partial(execute_replicated, compiled, uses_outfeed, backend, handle_args,
                  handle_outs)
 
 multi_host_supported_collectives: Set[core.Primitive] = set()
@@ -772,7 +814,7 @@ def replicate(val, axis_size, nrep, devices=None, backend=None):
   # TODO(jekbradbury): use ShardingSpec.replication_factor instead
   aval = xla.abstractify(val)  # type: ShapedArray
   replicated_aval = ShapedArray((axis_size,) + aval.shape, aval.dtype)
-  sharding_spec = _pmap_sharding_spec(nrep, axis_size, aval.shape)
+  sharding_spec = _pmap_sharding_spec(nrep, axis_size, aval, True)
   device_buffers = [xla.device_put(val, d) for d in devices]
   return ShardedDeviceArray(replicated_aval, sharding_spec, device_buffers)
 
@@ -798,22 +840,31 @@ def _pval_to_result_handler(axis_size, nrep, pval, devices, backend):
     return lambda _: bcast_const
   else:
     if pv is not core.abstract_unit:
-      sharding_spec = _pmap_sharding_spec(nrep, axis_size, pv.shape)
+      sharding_spec = _pmap_sharding_spec(nrep, axis_size, pv, True)
       indices = spec_to_indices((axis_size,) + pv.shape, sharding_spec)
     else:
       sharding_spec = indices = None
     return aval_to_result_handler(axis_size, sharding_spec, indices, pv)
 
-def _pmap_sharding_spec(nrep, axis_size, sharded_shape):
+def _pmap_sharding_spec(nrep, axis_size, sharded_aval, mapped):
+  if sharded_aval is core.abstract_unit:
+    return None
   replication_factor, ragged = divmod(nrep, axis_size)
   assert not ragged
-  return ShardingSpec(
-      shards_per_axis=(axis_size,) + (1,) * len(sharded_shape),
-      is_axis_materialized=(False,) + (True,) * len(sharded_shape),
-      replication_factor=replication_factor)
+  if mapped:
+    return ShardingSpec(
+        shards_per_axis=(axis_size,) + (1,) * len(sharded_aval.shape),
+        is_axis_materialized=(False,) + (True,) * len(sharded_aval.shape),
+        replication_factor=replication_factor)
+  else:
+    return ShardingSpec(
+        shards_per_axis=(1,) * len(sharded_aval.shape),
+        is_axis_materialized=(True,) * len(sharded_aval.shape),
+        replication_factor=replication_factor * axis_size)
 
 
-def execute_replicated(compiled, backend, in_handler, out_handler, *args):
+def execute_replicated(compiled, uses_outfeed, backend, in_handler, out_handler, *args):
+  xla.check_before_outfeed_execution(uses_outfeed)
   input_bufs = in_handler(args)
   out_bufs = compiled.ExecuteOnLocalDevices(list(input_bufs))
   return out_handler(out_bufs)

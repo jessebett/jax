@@ -14,9 +14,10 @@
 
 
 from collections import defaultdict
+from functools import reduce
 import itertools as it
 import operator as op
-from typing import Any, Callable, Dict, Sequence, Type
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Type, Tuple
 
 from absl import logging
 import numpy as onp
@@ -42,6 +43,16 @@ from . import masking
 
 xe = xc._xla
 xops = xc._xla.ops
+
+# Types
+Backend = Any  # xc.LocalBackend (why does mypy not like this?)
+Device = Any  # xc.Device
+PyLocalBuffer = Any
+
+XlaOp = Any  # xla_extension.XlaOp
+XlaShape = Any # xla_client.Shape
+XlaComputationBuilder = Any  # xla_bridge._JaxComputationBuilder
+XlaExecutable = Any # xla_extension.LocalExecutable
 
 FLAGS = flags.FLAGS
 flags.DEFINE_bool('jax_debug_nans',
@@ -82,13 +93,13 @@ xla_shape_handlers: Dict[Type[core.AbstractValue], Callable] = {
     ConcreteArray: _make_array_shape,
 }
 
-def aval_to_result_handler(device, aval):
+def aval_to_result_handler(device: Optional[Device], aval: core.ShapedArray):
   try:
     return xla_result_handlers[type(aval)](device, aval)
   except KeyError as err:
     raise TypeError(f"No xla_result_handler for type: {type(aval)}") from err
 
-def array_result_handler(device, aval):
+def array_result_handler(device: Optional[Device], aval: core.ShapedArray):
   return partial(DeviceArray, raise_to_shaped(aval), device, lazy.array(aval.shape))
 
 xla_result_handlers: Dict[Type[core.AbstractValue], Callable[..., Callable]] = {
@@ -97,21 +108,21 @@ xla_result_handlers: Dict[Type[core.AbstractValue], Callable[..., Callable]] = {
     ConcreteArray: array_result_handler,
 }
 
-def device_put(x, device=None):
+def device_put(x, device: Optional[Device] = None):
   x = canonicalize_dtype(x)
   try:
     return device_put_handlers[type(x)](x, device)
   except KeyError as err:
     raise TypeError(f"No device_put handler for type: {type(x)}") from err
 
-def _device_put_array(x, device):
+def _device_put_array(x, device: Optional[Device]):
   backend = xb.get_device_backend(device)
   return backend.buffer_from_pyval(x, device)
 
 def _device_put_scalar(x, device):
   return _device_put_array(dtypes.coerce_to_array(x), device)
 
-device_put_handlers: Dict[Any, Callable] = {core.Unit: _device_put_unit}
+device_put_handlers: Dict[Any, Callable[[Any, Optional[Device]], Any]] = {core.Unit: _device_put_unit}
 device_put_handlers.update((t, _device_put_array) for t in array_types)
 device_put_handlers.update((t, _device_put_scalar) for t in _scalar_types)
 
@@ -157,6 +168,41 @@ pytype_aval_mappings.update((t, make_shaped_array) for t in array_types)
 pytype_aval_mappings.update(
     (t, partial(_make_abstract_python_scalar, t)) for t in _scalar_types)
 
+# We can optionally set a Jaxpr rewriter that can be applied just before
+# compilation. This mechanism is used for compiling id_tap, we can
+# remove it once we bring the id_tap implementation into the core.
+outfeed_rewriter: Optional[Callable[[core.Jaxpr], Tuple[core.Jaxpr, bool]]] = None
+def apply_outfeed_rewriter(jaxpr: core.Jaxpr) -> Tuple[core.Jaxpr, bool]:
+  if outfeed_rewriter is not None:
+    return outfeed_rewriter(jaxpr)
+  else:
+    return jaxpr, False
+
+outfeed_primitives: Set[core.Primitive] = set()
+def jaxpr_uses_outfeed(jaxpr: core.Jaxpr) -> bool:
+  """Finds if there are outfeed primitives anywhere inside a Jaxpr."""
+  return any(primitive_uses_outfeed(eqn.primitive, eqn.params)
+             for eqn in jaxpr.eqns)
+
+def primitive_uses_outfeed(prim: core.Primitive, params: Dict) -> bool:
+  if prim in outfeed_primitives:
+    return True
+  for param in params.values():
+    if type(param) is core.Jaxpr:
+      if jaxpr_uses_outfeed(param):
+        return True
+    elif type(param) is core.TypedJaxpr:
+      if jaxpr_uses_outfeed(param.jaxpr):
+        return True
+  return False
+
+# TODO(necula): remove this when we start the outfeed receiver automatically.
+can_execute_outfeed_computations: bool = False  # Set by outfeed_receiver
+def check_before_outfeed_execution(uses_outfeed: bool):
+  if uses_outfeed and not can_execute_outfeed_computations:
+    raise ValueError("Attempting to execute compiled code using outfeed, "
+                     "but outfeed_receiver is not started.")
+
 ### op-by-op execution
 
 def arg_spec(x):
@@ -172,10 +218,16 @@ def apply_primitive(prim, *args, **params):
   return compiled_fun(*args)
 
 @cache()
-def xla_primitive_callable(prim, *arg_specs, **params):
+def xla_primitive_callable(prim, *arg_specs: Tuple[core.AbstractValue,
+                                                   Optional[Device]], **params):
   avals, arg_devices = unzip2(arg_specs)
   device = _device_from_arg_devices(arg_devices)
   backend = xb.get_device_backend(device)
+  if primitive_uses_outfeed(prim, params):
+    # We use the _xla_callable path, where we pre-process the primitives
+    def prim_fun(*args):
+      return prim.bind(*args, **params)
+    return _xla_callable(lu.wrap_init(prim_fun), device, None, "prim", *arg_specs)
   aval_out = prim.abstract_eval(*avals, **params)
   if not prim.multiple_results:
     handle_result = aval_to_result_handler(device, aval_out)
@@ -205,7 +257,7 @@ def xla_primitive_callable(prim, *arg_specs, **params):
   else:
     return partial(_execute_replicated_primitive, prim, compiled, handle_result)
 
-def _device_from_arg_devices(devices):
+def _device_from_arg_devices(devices: Sequence[Optional[Device]]) -> Optional[Device]:
   """Given devices of inputs, determine where to perform a computation.
 
   Args:
@@ -254,6 +306,7 @@ def primitive_computation(prim, axis_env, backend, tuple_args, *avals, **params)
     raise RuntimeError(msg) from e
 
 def primitive_subcomputation(prim, *avals, **params):
+  return primitive_computation(prim, AxisEnv(1), None, False, *avals, **params)
   return primitive_computation(prim, AxisEnv(1), None, False, *avals, **params)
 
 def _execute_compiled_primitive(prim, compiled, result_handler, *args):
@@ -341,7 +394,13 @@ def jaxpr_subcomp(c, jaxpr, backend, axis_env, consts, name_stack, *args):
                  map(aval, eqn.invars), backend, *in_nodes, **new_params)
     elif eqn.primitive in parallel_translations:
       replica_groups = axis_groups(axis_env, eqn.params['axis_name'])
-      new_params = {k: v for k, v in eqn.params.items() if k != 'axis_name'}
+      axis_index_groups = eqn.params.get('axis_index_groups', None)
+      if axis_index_groups is not None:
+        replica_groups = [[axis_group[i] for i in axis_index_group]
+                          for axis_group in replica_groups
+                          for axis_index_group in axis_index_groups]
+      new_params = {k: v for k, v in eqn.params.items()
+                    if k not in ('axis_name', 'axis_index_groups')}
       rule = parallel_translations[eqn.primitive]
       ans = rule(c, *in_nodes, replica_groups=replica_groups, platform=platform,
                  **new_params)
@@ -477,18 +536,18 @@ def _xla_callable(fun: lu.WrappedFun, device, backend, name, *arg_specs):
   pvals: Sequence[pe.PartialVal] = [pe.PartialVal.unknown(aval) for aval in abstract_args]
   jaxpr, pvals, consts = pe.trace_to_jaxpr(
       fun, pvals, instantiate=False, stage_out=True, bottom=True)
-
+  jaxpr, uses_outfeed = apply_outfeed_rewriter(jaxpr)
   _map(prefetch, it.chain(consts, jaxpr_literals(jaxpr)))
 
   nreps = jaxpr_replicas(jaxpr)
   device = _xla_callable_device(nreps, backend, device, arg_devices)
+  backend = device.platform if device else backend
   result_handlers = tuple(map(partial(_pval_to_result_handler, device), pvals))
 
   # Computations that only produce constants and/or only rearrange their inputs,
   # which are often produced from partial evaluation, don't need compilation,
   # and don't need to force their (potentially lazy) arguments.
   if not jaxpr.eqns:
-    device = device or xb.get_backend(None).get_default_device_assignment(1)[0]
     return partial(_execute_trivial, jaxpr, device, consts, result_handlers)
 
   log_priority = logging.WARNING if FLAGS.jax_log_compiles else logging.DEBUG
@@ -521,11 +580,10 @@ def _xla_callable(fun: lu.WrappedFun, device, backend, name, *arg_specs):
   options.tuple_arguments = tuple_args
   backend = xb.get_backend(backend)
   compiled = backend.compile(built, compile_options=options)
-
   if nreps == 1:
-    return partial(_execute_compiled, compiled, result_handlers)
+    return partial(_execute_compiled, compiled, uses_outfeed, result_handlers)
   else:
-    return partial(_execute_replicated, compiled, result_handlers)
+    return partial(_execute_replicated, compiled, uses_outfeed, result_handlers)
 
 def _xla_callable_device(nreps, backend, device, arg_devices):
   if nreps > 1:
@@ -566,14 +624,18 @@ def _pval_to_result_handler(device, pval):
   else:
     return aval_to_result_handler(device, pv)
 
-def _execute_compiled(compiled, handlers, *args):
+def _execute_compiled(compiled: XlaExecutable, uses_outfeed: bool,
+                      handlers, *args):
+  check_before_outfeed_execution(uses_outfeed)
   device, = compiled.local_devices()
   input_bufs = [device_put(x, device) for x in args if x is not token]
   out_bufs = compiled.Execute(input_bufs)
   if FLAGS.jax_debug_nans: check_nans(xla_call_p, out_bufs)
   return [handler(out_buf) for handler, out_buf in zip(handlers, out_bufs)]
 
-def _execute_replicated(compiled, handlers, *args):
+def _execute_replicated(compiled: XlaExecutable, uses_outfeed: bool,
+                        handlers, *args):
+  check_before_outfeed_execution(uses_outfeed)
   input_bufs = [
       [device_put(x, device) for x in args if x is not token]
       for device in compiled.local_devices()]
@@ -581,7 +643,7 @@ def _execute_replicated(compiled, handlers, *args):
   if FLAGS.jax_debug_nans: check_nans(xla_call_p, out_bufs)
   return [handler(out_buf) for handler, out_buf in zip(handlers, out_bufs)]
 
-def _execute_trivial(jaxpr, device, consts, handlers, *args):
+def _execute_trivial(jaxpr, device: Optional[Device], consts, handlers, *args):
   env = {core.unitvar: core.unit}
   _map(env.setdefault, jaxpr.invars, args)
   _map(env.setdefault, jaxpr.constvars, consts)
@@ -748,7 +810,12 @@ class DeviceArray(DeviceValue):
   __slots__ = ["_npy_value", "_device", "_lazy_expr"]
   __array_priority__ = 100
 
-  def __init__(self, aval, device, lazy_expr, device_buffer):
+  # DeviceArray has methods that are dynamically populated in lax_numpy.py,
+  # and this annotation is needed to make pytype happy.
+  _HAS_DYNAMIC_ATTRIBUTES = True
+
+  def __init__(self, aval: core.ShapedArray, device: Optional[Device],
+               lazy_expr: lazy.LazyExpr, device_buffer: PyLocalBuffer):
     self.aval = aval
     self.device_buffer = device_buffer
     self._device = device
@@ -759,6 +826,7 @@ class DeviceArray(DeviceValue):
       assert type(aval) is ShapedArray
       npy_value = self._value
       assert npy_value.dtype == aval.dtype and npy_value.shape == aval.shape
+      assert (device is None) or device is device_buffer.device()
 
   @property
   def _value(self):
@@ -914,21 +982,31 @@ def _device_array_constant_handler(c, val, canonicalize_types=True):
     return lazy.stage_lexpr(c, val._lazy_expr, base_val)
 xb.register_constant_handler(DeviceArray, _device_array_constant_handler)
 
-def _device_put_device_array(x, device):
+def _device_put_device_array(x: DeviceArray, device: Optional[Device]):
   x = _copy_device_array_to_device(x, device)
   return _force(x).device_buffer
 device_put_handlers[DeviceArray] = _device_put_device_array
 
-def _copy_device_array_to_device(x, device):
-  if is_device_constant(x):
+def _copy_device_array_to_device(x: DeviceArray, device: Optional[xc.Device]) -> DeviceArray:
+  if device is None:
+    # no copying to be done because there's no target specified
+    return x
+  elif is_device_constant(x):
+    # create a new DeviceArray with the same lazy expr, no copying
     return DeviceArray(x.aval, device, x._lazy_expr, DeviceConstant(device))
   elif xb.get_device_backend(device).platform == x.device_buffer.platform():
-    if device is None or x.device_buffer.device() == device:
-      return x
+    # source and target platforms are the same
+    if x.device_buffer.device() == device:
+      # no copying to be done because source equals target
+      if x._device == device:
+        return x
+      else:
+        moved_buf = x.device_buffer  # We need to change stickyness
     else:
+      # move the buffer with a device-to-device copy
       moved_buf = x.device_buffer.copy_to_device(device)
   else:
-    # Buffers from different XLA backends are passed through the host.
+    # buffers from different XLA backends are passed through the host.
     backend = xb.get_device_backend(device)
     moved_buf = backend.buffer_from_pyval(x.device_buffer.to_py(), device)
   return DeviceArray(x.aval, device, x._lazy_expr, moved_buf)
@@ -940,15 +1018,16 @@ def _force(x: DeviceArray) -> DeviceArray:
     # force x on the device where it lives, but preserve stickiness on result
     if x._device:
       device = x._device
-      sticky = True
     else:
       device = x.device_buffer.device()
-      sticky = False
-    force_fun = _lazy_force_computation(sticky, x.aval, device, x._lazy_expr)
-    return force_fun(x)
+    force_fun = _lazy_force_computation(x.aval, device, x._lazy_expr)
+    result = force_fun(x)
+    return DeviceArray(x.aval, x._device, lazy.array(x.aval.shape), result)
 
 @cache()
-def _lazy_force_computation(sticky, aval, device, lexpr) -> Callable[[DeviceArray], DeviceArray]:
+def _lazy_force_computation(aval: core.ShapedArray,
+                            device: Device, lexpr: lazy.LazyExpr
+                            ) -> Callable[[DeviceArray], PyLocalBuffer]:
   c = xb.make_computation_builder("lazy_force")
   if lazy.is_constant(lexpr):
     param = None
@@ -969,19 +1048,17 @@ def _lazy_force_computation(sticky, aval, device, lexpr) -> Callable[[DeviceArra
   backend = xb.get_device_backend(device)
   compiled = backend.compile(built_c, compile_options=options)
 
-  result_device = device if sticky else None
-  handler = partial(DeviceArray, aval, result_device, lazy.array(aval.shape))
   force_fun: Callable[[DeviceValue], DeviceArray]
   if lazy.is_constant(lexpr):
     def force_fun(_):
-      return handler(compiled.Execute([])[0])
+      return compiled.Execute([])[0]
   else:
     def force_fun(x):
-      return handler(compiled.Execute([x.device_buffer])[0])
+      return compiled.Execute([x.device_buffer])[0]
   return force_fun
 
 
-def _device_put_impl(x, device=None):
+def _device_put_impl(x, device: Optional[Device] = None):
   if type(x) is DeviceArray:
     return _copy_device_array_to_device(x, device)
 
@@ -990,14 +1067,13 @@ def _device_put_impl(x, device=None):
   except TypeError as err:
     raise TypeError(
         f"Argument '{x}' of type {type(x)} is not a valid JAX type") from err
-  handler = aval_to_result_handler(device, a)
+  handler = aval_to_result_handler(device, a)  # type: ignore[arg-type]
   return handler(device_put(x, device))
 
 device_put_p = core.Primitive('device_put')
 device_put_p.def_impl(_device_put_impl)
 pe.custom_partial_eval_rules[device_put_p] = lambda trace, x, **params: x
 ad.deflinear(device_put_p, lambda cotangent, **kwargs: [cotangent])
-masking.shape_rules[device_put_p] = lambda x, **_: x.shape
 masking.defvectorized(device_put_p)
 
 
