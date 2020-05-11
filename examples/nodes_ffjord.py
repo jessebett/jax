@@ -132,7 +132,7 @@ def get_epsilon(key, shape):
     # # normal
     # return jax.random.normal(key, shape)
     # rademacher
-    return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float64)
+    return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float64) * 2 - 1
 
 
 class ForwardPreODE(hk.Module):
