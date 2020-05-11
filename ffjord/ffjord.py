@@ -77,7 +77,7 @@ def ffjord_dynamics(ffjord_state, t, eps, args):
     # dz_dt = f(z)
     # J = jacfwd(f)(z)
     # dlogp_dt = np.trace(J)
-    return np.hstack([dz_dt, dlogp_dt])
+    return np.hstack([dz_dt, -dlogp_dt])
 
 
 def ffjord_log_density(params, x, D, rng):
@@ -86,7 +86,8 @@ def ffjord_log_density(params, x, D, rng):
     ffjord_out = odeint(ffjord_dynamics, init_state, np.array([0., 1.]), eps, params)[1]
     z, dlogp = ffjord_out[:-1], ffjord_out[-1]
     logpz = standard_normal_logpdf(z)
-    return logpz + dlogp
+    logpx = logpz - dlogp
+    return logpx
 
 
 def batch_likelihood(params, data, rng):
@@ -120,7 +121,7 @@ def reg_dynamics(reg_aug_state, t, eps, params):
     return np.hstack([dz_dt, r3])
 
 
-def reg_log_density(params,x,D,rng, lam = 1.):
+def reg_log_density(params,x,D,rng, lam = 1):
     init_ffjord_state = np.hstack([x, 0.])
     init_reg_state = 0.
     init_aug_reg_state = np.hstack([init_ffjord_state,init_reg_state])
@@ -132,10 +133,11 @@ def reg_log_density(params,x,D,rng, lam = 1.):
     z = aug_reg_out[:-2]
     dlogp = aug_reg_out[-2:-1]
     logpz = standard_normal_logpdf(z)
+    logpx = logpz - dlogp
 
     reg_out = aug_reg_out[-1]
 
-    return logpz + dlogp + lam * reg_out
+    return logpx - lam * reg_out
 
 def batch_reg_likelihood(params, data, rng):
     N, D = np.shape(data)
@@ -155,7 +157,11 @@ if __name__ == "__main__":
     @jit
     def objective(params, t):
         rng = random.PRNGKey(t)
-        # return -batch_likelihood(params, data, rng)
+        return -batch_likelihood(params, data, rng)
+
+    @jit
+    def reg_objective(params, t):
+        rng = random.PRNGKey(t)
         return -batch_reg_likelihood(params, data, rng)
 
     # Set up figure.
@@ -178,6 +184,7 @@ if __name__ == "__main__":
 
     def callback(params, t):
         print("Iteration {} log-likelihood: {}".format(t, -objective(params, t)))
+        print("Iteration {} reg-objective: {}".format(t, -reg_objective(params, t)))
         # print("testing grads")
         # test_grads()
 
@@ -205,7 +212,7 @@ if __name__ == "__main__":
     @jit
     def update(i, opt_state):
         params = get_params(opt_state)
-        gradient = grad(objective)(params, i)
+        gradient = grad(reg_objective)(params, i)
         return opt_update(i, gradient, opt_state)
 
     # Main loop.
