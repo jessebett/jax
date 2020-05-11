@@ -25,7 +25,7 @@ from jax.config import config
 config.update("jax_enable_x64", True)
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=400)
+parser.add_argument('--batch_size', type=int, default=200)
 parser.add_argument('--test_batch_size', type=int, default=500)
 parser.add_argument('--nepochs', type=int, default=500)
 parser.add_argument('--lr', type=float, default=1e-3)
@@ -39,8 +39,8 @@ parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4'], default='none')
-parser.add_argument('--test_freq', type=int, default=3750)
-parser.add_argument('--save_freq', type=int, default=3750)
+parser.add_argument('--test_freq', type=int, default=2)
+parser.add_argument('--save_freq', type=int, default=7500)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--resnet', action="store_true")
@@ -230,7 +230,8 @@ def initialization_data(input_shape):
     """
     Data for initializing the modules.
     """
-    input_shape = (1, ) + input_shape[1:]
+    # use the batch size to allocate memory
+    input_shape = (parse_args.test_batch_size, ) + input_shape[1:]
     data = {
         "pre_ode": aug_init(jnp.zeros(input_shape))[:-1],
         "ode": aug_init(jnp.zeros(input_shape))[:-1]
