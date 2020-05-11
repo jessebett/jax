@@ -43,7 +43,7 @@ class ODETest(jtu.JaxTestCase):
 
     y0, tspace = np.array(y0), np.array(tspace)
     jax_fun = partial(fun, np)
-    jax_result = odeint(jax_fun, y0, tspace, *args)
+    jax_result = odeint(jax_fun, y0, tspace, *args)[0]
 
     self.assertAllClose(jax_result, scipy_result, check_dtypes=False, atol=tol, rtol=tol)
 
@@ -53,7 +53,7 @@ class ODETest(jtu.JaxTestCase):
       theta, omega = y
       return [omega, -m * omega - g * _np.sin(theta)]
 
-    integrate = partial(odeint, partial(pend, np))
+    integrate = lambda *args: partial(odeint, partial(pend, np))(*args)[0]
 
     y0 = [np.pi - 0.1, 0.0]
     ts = np.linspace(0., 1., 11)
@@ -72,7 +72,7 @@ class ODETest(jtu.JaxTestCase):
     def dynamics(_np, y, t):
       return _np.array([y[1] * -t, -1 * y[1] - 9.8 * _np.sin(y[0])])
 
-    integrate = partial(odeint, partial(dynamics, np))
+    integrate = lambda *args: partial(odeint, partial(dynamics, np))(*args)[0]
 
     y0 = [np.pi - 0.1, 0.0]
     ts = np.linspace(0., 1., 11)
@@ -89,7 +89,7 @@ class ODETest(jtu.JaxTestCase):
     def decay(_np, y, t, arg1, arg2):
         return -_np.sqrt(t) - y + arg1 - _np.mean((y + arg2)**2)
 
-    integrate = partial(odeint, partial(decay, np))
+    integrate = lambda *args: partial(odeint, partial(decay, np))(*args)[0]
 
     rng = onp.random.RandomState(0)
     args = (rng.randn(3), rng.randn(3))
@@ -109,7 +109,7 @@ class ODETest(jtu.JaxTestCase):
     def swoop(_np, y, t, arg1, arg2):
       return _np.array(y - _np.sin(t) - _np.cos(t) * arg1 + arg2)
 
-    integrate = partial(odeint, partial(swoop, np))
+    integrate = lambda *args: partial(odeint, partial(swoop, np))(*args)[0]
 
     ts = np.array([0.1, 0.2])
     tol = 1e-1 if num_float_bits(onp.float64) == 32 else 1e-3
@@ -135,7 +135,7 @@ class ODETest(jtu.JaxTestCase):
     def f(x, y):
       y0 = np.array([x, y])
       t = np.array([0., 5.])
-      y = odeint(dx_dt, y0, t)
+      y = odeint(dx_dt, y0, t)[0]
       return y[-1].sum()
 
     def g(x):
@@ -145,7 +145,7 @@ class ODETest(jtu.JaxTestCase):
 
       # Run ODE twice
       t = np.array([0., 5.])
-      y = jax.vmap(lambda y0: odeint(dx_dt, y0, t))(y0_arr)
+      y = jax.vmap(lambda y0: odeint(dx_dt, y0, t)[0])(y0_arr)
       return y[:,-1].sum()
 
     ans = jax.grad(g)(2.)  # don't crash
