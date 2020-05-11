@@ -468,12 +468,13 @@ def run():
     print("Reg: %s\tLambda %.4e" % (reg, lam))
     print("Reg: %s\tLambda %.4e" % (reg, lam), file=sys.stderr)
 
+    # init the model first so that jax gets enough GPU memory before TFDS
+    forward, model = init_model()
+    grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
+
     ds_train, ds_test_eval, meta = init_data()
     num_batches = meta["num_batches"]
     num_test_batches = meta["num_test_batches"]
-
-    forward, model = init_model()
-    grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
 
     def lr_schedule(itr):
         """
