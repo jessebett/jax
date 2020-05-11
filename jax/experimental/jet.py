@@ -414,3 +414,8 @@ def _select_taylor_rule(primal_in, series_in, **params):
   return primal_out, series_out
 jet_rules[lax.select_p] = _select_taylor_rule
 
+def _zeros_like_rule(primal_in, series_in, **params):
+  primal_out = lax.zeros_like_array(*primal_in, **params)
+  series_out = [lax.zeros_like_array(*terms_in, **params) for terms_in in zip(*series_in)]
+  return primal_out, series_out
+jet_rules[ad_util.zeros_like_p] = _zeros_like_rule

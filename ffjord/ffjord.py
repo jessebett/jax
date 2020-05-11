@@ -21,7 +21,11 @@
 from functools import partial
 import matplotlib.pyplot as plt
 
-from jax.api import jit, grad, vmap, jvp, jacfwd
+from jax.config import config
+config.update("jax_enable_x64", True)
+
+from jax.api import jit, grad, vmap, jvp, jacfwd, vjp
+from jax.experimental.jet import jet
 from jax import random
 from jax.experimental import optimizers
 from jax.experimental.ode import odeint
@@ -64,9 +68,12 @@ def ffjord_dynamics(ffjord_state, t, eps, args):
     # eps must be drawn from a distribution with zero mean and
     # identity covariance.
     f = lambda z: nn_dynamics(z, t, args)
-    dz_dt, jac_times_eps = jvp(f, (z,), (eps,))
+    # dz_dt, jac_times_eps = jvp(f, (z,), (eps,))
+    dz_dt, pullback = vjp(f,z)
+    eps_times_jac = pullback(eps)
     # dz_dt = f(z)
-    dlogp_dt = np.dot(eps, jac_times_eps)
+    # dlogp_dt = np.dot(eps, jac_times_eps)
+    dlogp_dt = np.dot(eps_times_jac[0], eps)
     # dz_dt = f(z)
     # J = jacfwd(f)(z)
     # dlogp_dt = np.trace(J)
@@ -105,17 +112,36 @@ def reg_dynamics(reg_aug_state, t, eps, params):
     ffjord_state, reg_state = reg_aug_state[:-1], reg_aug_state[-1]
     def _ffjord_dyn(z,t):
         return ffjord_dynamics(z, t, eps, params)
-    return _ffjord_dyn(ffjord_state,0.)
+    def _reg_dyn(z,t):
+        return sol_recursive(_ffjord_dyn, z,t)
+    dz_dt, dnz_dtn = sol_recursive(_ffjord_dyn, ffjord_state, t)
+    y1, y2 = dnz_dtn
+    r3 = np.linalg.norm(y2)
+    return np.hstack([dz_dt, r3])
 
-def reg_log_density(params,x,D,rng):
+
+def reg_log_density(params,x,D,rng, lam = 1.):
     init_ffjord_state = np.hstack([x, 0.])
     init_reg_state = 0.
     init_aug_reg_state = np.hstack([init_ffjord_state,init_reg_state])
 
     eps = random.normal(rng, (D,))
 
-    return reg_dynamics(init_aug_reg_state,0.,eps,params)
+    aug_reg_out = odeint(reg_dynamics, init_aug_reg_state, np.array([0.,1.]),eps,params)[1]
 
+    z = aug_reg_out[:-2]
+    dlogp = aug_reg_out[-2:-1]
+    logpz = standard_normal_logpdf(z)
+
+    reg_out = aug_reg_out[-1]
+
+    return logpz + dlogp + lam * reg_out
+
+def batch_reg_likelihood(params, data, rng):
+    N, D = np.shape(data)
+    rngs = random.split(rng, N)
+    batch_density = vmap(reg_log_density, in_axes=(None, 0, None, 0))
+    return np.mean(batch_density(params, data, D, rngs))
 
 
 
@@ -129,7 +155,8 @@ if __name__ == "__main__":
     @jit
     def objective(params, t):
         rng = random.PRNGKey(t)
-        return -batch_likelihood(params, data, rng)
+        # return -batch_likelihood(params, data, rng)
+        return -batch_reg_likelihood(params, data, rng)
 
     # Set up figure.
     fig = plt.figure(figsize=(8,8), facecolor='white')
@@ -151,6 +178,8 @@ if __name__ == "__main__":
 
     def callback(params, t):
         print("Iteration {} log-likelihood: {}".format(t, -objective(params, t)))
+        # print("testing grads")
+        # test_grads()
 
         ffjord_dist = lambda x, params: np.exp(ffjord_log_density(params, x, D, rng))
 
@@ -184,5 +213,5 @@ if __name__ == "__main__":
     for t in range(10000):
         opt_state = update(t, opt_state)
         params = get_params(opt_state)
-        if t % 50 == 1: callback(params, t)
+        if t % 2 == 1: callback(params, t)
     plt.show(block=True)

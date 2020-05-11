@@ -28,6 +28,8 @@ from jax.experimental.jet import jet, fact, zero_series
 from jax.tree_util import tree_map
 from jax import lax
 from jax.experimental.ode import odeint
+from jax.api import jvp
+from jax.ad_util import zeros_like_jaxval
 
 from jax.config import config
 config.parse_flags_with_absl()
@@ -226,6 +228,8 @@ class JetTest(jtu.JaxTestCase):
   def test_acosh(self):      self.unary_check(lax.acosh, lims=[-100, 100])
   @jtu.skip_on_devices("tpu")
   def test_atanh(self):      self.unary_check(lax.atanh, lims=[-1, 1])
+  @jtu.skip_on_devices("tpu")
+  def test_zeros_like(self): self.unary_check(zeros_like_jaxval)
 
   @jtu.skip_on_devices("tpu")
   def test_div(self):   self.binary_check(lambda x, y: x / y, lims=[0.8, 4.0])
@@ -334,6 +338,76 @@ class JetTest(jtu.JaxTestCase):
     primal_in = init_state
     terms_in = [random.normal(rng,primal_in.shape) for _ in range(3)]
     self.check_jet(dynamics_closure, (primal_in,), (terms_in,), atol=1e-4, rtol=1e-4)
+
+  def test_ffjord_dynamics(self):
+
+    rng = random.PRNGKey(0)
+    D = 2
+    BS = 13
+    x = random.normal(rng,(BS,D))
+
+    # ========= Functions to define a neural network. =========
+
+    def init_random_params(scale, layer_sizes, rng=random.PRNGKey(0)):
+      return [(scale * random.normal(rng, (m, n)),
+               scale * random.normal(rng, (n,)))  # Todo: use different rng at each layer
+              for m, n, in zip(layer_sizes[:-1], layer_sizes[1:])]
+
+    def sigmoid(z):
+      """
+      Numerically stable sigmoid.
+      """
+      return 1/(1 + np.exp(-z))
+
+    def mlp(params, input):
+        # Evaluate a multi-layer perceptron on a single input vector.
+        for w, b in params:
+            output = np.dot(input, w) + b
+            input = sigmoid(output)
+        return output
+
+    def nn_dynamics(z, t, args):
+        return mlp(args, np.hstack([z, t]))
+
+    def aug_dynamics(ffjord_state, t, args):
+        z = ffjord_state[:-1]
+        D = np.shape(z)[0]
+        # Hutchinson's estimator of the trace of the Jacobian of f.
+        # eps must be drawn from a distribution with zero mean and
+        # identity covariance.
+        eps = random.normal(rng, (D,))
+        f = lambda z: nn_dynamics(z, t, args)
+        dz_dt, jac_times_eps = jvp(f, (z,), (eps,))
+        # dz_dt, pullback = vjp(f,z)
+        # eps_times_jac = pullback(eps)
+        # dz_dt = f(z)
+        dlogp_dt = np.dot(eps, jac_times_eps)
+        # dlogp_dt = np.dot(eps_times_jac[0], eps)
+        # dz_dt = f(z)
+        # J = jacfwd(f)(z)
+        # dlogp_dt = np.trace(J)
+        return np.hstack([dz_dt, dlogp_dt])
+
+    init_params = init_random_params(0.1, [D + 1, 50, 100, D])
+    init_state = np.hstack([x[0,:], 0.])
+    t_test = np.array([0.5])
+    # aug_out = odeint(aug_dynamics, init_state, np.array([0., 1.]), init_params)[1]
+
+    # def dynamics_closure(z):
+    #     return aug_dynamics(z,t_test, init_params)
+    #
+    # primal_in = init_state
+    # terms_in = [random.normal(rng,primal_in.shape) for _ in range(3)]
+    # self.check_jet(dynamics_closure, (primal_in,), (terms_in,), atol=1e-4, rtol=1e-4)
+    def dynamics_closure(z, t):
+        return aug_dynamics(z,t[0], init_params)
+
+    primal_in = (init_state, t_test)
+    term1_in = [random.normal(rng,primal_in[0].shape) for _ in range(3)]
+    term2_in = [random.normal(rng,primal_in[1].shape) for _ in range(3)]
+    terms_in = (term1_in, term2_in)
+    # import ipdb; ipdb.set_trace()
+    self.check_jet(dynamics_closure, primal_in, terms_in, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == '__main__':
