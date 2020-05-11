@@ -17,15 +17,19 @@ from jax.experimental import optimizers
 from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 
+from jax.scipy.special import expit as sigmoid
+
+import matplotlib.pyplot as plt
+
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=200)
-parser.add_argument('--test_batch_size', type=int, default=10000)
+parser.add_argument('--batch_size', type=int, default=1000)
+parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=200)
 parser.add_argument('--lr', type=float, default=1e-2)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=0)
-parser.add_argument('--atol', type=float, default=1e-3)
-parser.add_argument('--rtol', type=float, default=1e-3)
+parser.add_argument('--atol', type=float, default=1.4e-8)
+parser.add_argument('--rtol', type=float, default=1.4e-8)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=-1.)
@@ -53,67 +57,80 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
+vmap = False
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
     "rtol": parse_args.rtol,
-    "method": parse_args.method,
-    "init_step": parse_args.init_step
+    # "method": parse_args.method,
+    # "init_step": parse_args.init_step
 }
 
 
 # some primitive functions
-def sigmoid(z):
-  """
-  Numerically stable sigmoid.
-  """
-  return 1/(1 + jnp.exp(-z))
+# def sigmoid(z):
+#   """
+#   Numerically stable sigmoid.
+#   """
+#   return 1/(1 + jnp.exp(-z))
+
+act = lambda x: x
 
 
 def sol_recursive(f, z, t):
   """
   Recursively compute higher order derivatives of dynamics of ODE.
   """
-  def g(z):
+  z_shape = z.shape
+  z_t = jnp.concatenate((jnp.ravel(z), jnp.array([t])))
+
+  def g(z_t):
     """
     Closure to expand z.
     """
-    return f(z, t)
+    z, t = jnp.reshape(z_t[:-1], z_shape), z_t[-1]
+    dz = jnp.ravel(f(z, t))
+    dt = jnp.array([1.])
+    dz_t = jnp.concatenate((dz, dt))
+    return dz_t
 
-  (y0, [y1h]) = jet(g, (z, ), ((jnp.ones_like(z), ), ))
-  (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
-  (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
+  (y0, [y1h]) = jet(g, (z_t, ), ((jnp.ones_like(z_t), ), ))
+  (y0, [y1, y2h]) = jet(g, (z_t, ), ((y0, y1h,), ))
+  (y0, [y1, y2, y3h]) = jet(g, (z_t, ), ((y0, y1, y2h), ))
+  # (y0, [y1, y2, y3, y4h]) = jet(g, (z_t, ), ((y0, y1, y2, y3h), ))
 
-  return (y0, [y1, y2])
+  return jnp.reshape(y0[:-1], z_shape), [jnp.reshape(y1[:-1], z_shape), jnp.reshape(y0[:-1], z_shape)]
+  # return y0[0], [y1[0], y2[0]]
+  # return y0[0], [y1[0]]
 
 
 class MLPDynamics(hk.Module):
     """
-    Dynamics for ODE as an MLP.
+    NN_Dynamics for ODE as an MLP.
     """
 
     def __init__(self, dim):
         super(MLPDynamics, self).__init__()
         self.dim = dim
         self.hidden_dim = 100
-        self.lin1 = hk.Linear(self.hidden_dim)
+        # self.lin1 = hk.Linear(self.hidden_dim)
         self.lin2 = hk.Linear(self.dim)
 
     def __call__(self, x, t):
         # vmapping means x will be a single batch element, so need to expand dims at 0
         x = jnp.reshape(x, (-1, self.dim))
 
-        out = sigmoid(x)
-        tt = jnp.ones_like(x[:, :1]) * t
-        t_out = jnp.concatenate([tt, out], axis=-1)
-        out = self.lin1(t_out)
+        out = act(x)
+        # tt = jnp.ones_like(out[:, :1]) * t
+        # t_out = jnp.concatenate([tt, out], axis=-1)
+        # out = self.lin1(out)
 
-        out = sigmoid(out)
-        tt = jnp.ones_like(out[:, :1]) * t
-        t_out = jnp.concatenate([tt, out], axis=-1)
-        out = self.lin2(t_out)
+        out = act(out)
+        # tt = jnp.ones_like(out[:, :1]) * t
+        # t_out = jnp.concatenate([tt, out], axis=-1)
+        out = self.lin2(out)
 
-        return out
+        return out / (1 + t)
 
 
 def wrap_module(module, *module_args, **module_kwargs):
@@ -141,6 +158,7 @@ def init_model():
     """
     Instantiates transformed submodules of model and their parameters.
     """
+    ts = jnp.array([0., 1.])
     ode_dim = 1
 
     initialization_data_ = initialization_data()
@@ -152,7 +170,7 @@ def init_model():
     if reg:
         def reg_dynamics(y, t, params):
             """
-            Dynamics of regularization for ODE integration.
+            NN_Dynamics of regularization for ODE integration.
             """
             if reg == "none":
                 return jnp.zeros(y.shape[0])
@@ -164,15 +182,16 @@ def init_model():
 
         def aug_dynamics(yr, t, params):
             """
-            Dynamics augmented with regularization.
+            NN_Dynamics augmented with regularization.
             """
             y, r = yr
             dydt = dynamics_wrap(y, t, params)
             drdt = reg_dynamics(y, t, params)
             return dydt, drdt
         if vmap:
+            # TODO: not sure if this is right, look at nodes_hk2.py
             nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, aug_init(y0, 1), t, params, **ode_kwargs)[0],
-                               (0, 0, None), 0)
+                               (0, None, None), 1)
         else:
             nodeint = lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params, **ode_kwargs)[0]
     else:
@@ -182,7 +201,14 @@ def init_model():
         else:
             nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0]
 
-    def ode(params, inputs, input_ts):
+    def ode(params, inputs):
+        """
+        Apply the ODE block.
+        """
+        out_ode, out_ode_r = nodeint(inputs, ts, params)
+        return out_ode, out_ode_r
+
+    def plot_ode(params, inputs, input_ts):
         """
         Apply the ODE block.
         """
@@ -197,11 +223,11 @@ def init_model():
             unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
 
         @jax.jit
-        def nfe_fn(params, inputs, input_ts, targets):
+        def nfe_fn(params, inputs, targets):
             """
             Function to return NFE.
             """
-            f_nfe = unreg_nodeint(inputs, input_ts, params)
+            f_nfe = unreg_nodeint(inputs, ts, params)
             return jnp.mean(f_nfe)
 
     else:
@@ -211,7 +237,8 @@ def init_model():
     model = {
         "forward": ode,
         "params": dynamics_params,
-        "nfe": nfe_fn
+        "nfe": nfe_fn,
+        "plot_ode": plot_ode
     }
 
     return model
@@ -241,12 +268,12 @@ def _weight_fn(params):
     return 0.5 * jnp.sum(jnp.square(flat_params))
 
 
-def loss_fn(forward, params, inputs, input_ts, targets):
+def loss_fn(forward, params, inputs, targets):
     """
     The loss function for training.
     """
-    preds, regs = forward(params, inputs, input_ts)
-    loss_ = _loss_fn(preds, targets)
+    preds, regs = forward(params, inputs)
+    loss_ = _loss_fn(preds[-1, :, 0], targets)
     reg_ = _reg_loss_fn(regs)
     weight_ = _weight_fn(params)
     return loss_ + lam * reg_ + lam_w * weight_
@@ -256,14 +283,13 @@ def init_data():
     """
     Initialize data.
     """
-    num_train = 10000
+    num_train = 1000
 
     assert num_train % parse_args.batch_size == 0
     num_train_batches = num_train // parse_args.batch_size
 
-    test_batch_size = parse_args.test_batch_size if odenet else 10000
-    assert num_train % test_batch_size == 0
-    num_test_batches = num_train // test_batch_size
+    assert num_train % parse_args.test_batch_size == 0
+    num_test_batches = num_train // parse_args.test_batch_size
 
     # make sure we always save the model on the last iteration
     assert num_train_batches * parse_args.nepochs % parse_args.save_freq == 0
@@ -273,28 +299,10 @@ def init_data():
         "num_test_batches": num_test_batches
     }
 
-    def true_dynamics(t):
-        """
-        The true dynamics function from which to generate data.
-        """
-        return jnp.sin(t)
-
-    # parameters of data
-    ode_dim = 1
-    batch_t = 10
-    inputs_range = jnp.array([-1., 1.])
-    ts = jnp.array([0., 5., 20., 25.])
-
-    us = 2 * jax.random.uniform(rng, (num_train, batch_t))  # uniform samples to be transformed
-    input_ts = jnp.where(us <= 1,
-                         ts[0] + (ts[1] - ts[0]) * us,
-                         ts[2] + (ts[3] - ts[2]) * (us - 1))
-
-    inputs = jax.random.uniform(rng, (num_train, ode_dim),
-                                minval=inputs_range[0],
-                                maxval=inputs_range[1])
-
-    targets = jnp.expand_dims(jax.vmap(true_dynamics)(input_ts), axis=2)
+    true_y0_range = 1
+    true_fn = lambda x: 2 * x
+    inputs = jnp.linspace(-true_y0_range, true_y0_range, num_train)[None].T
+    targets = true_fn(inputs[:, 0])
 
     def gen_train_data(batch_size):
         """
@@ -308,25 +316,23 @@ def init_data():
             epoch_inds = jax.random.shuffle(subkey, inds)
             for i in range(num_batches):
                 batch_inds = epoch_inds[i * batch_size: (i + 1) * batch_size]
-                batch_inputs, batch_ts, batch_targets = inputs[batch_inds], input_ts[batch_inds], targets[batch_inds]
-                yield batch_inputs, batch_ts, batch_targets
+                batch_inputs, batch_targets = inputs[batch_inds], targets[batch_inds]
+                yield batch_inputs, batch_targets
 
     def gen_test_data(batch_size):
         """
         Generator for test data, so doesn't shuffle.
         """
-        key = rng
         num_batches = num_train // batch_size
         inds = jnp.arange(num_train)
         while True:
-            key, subkey = jax.random.split(key)
             for i in range(num_batches):
                 batch_inds = inds[i * batch_size: (i + 1) * batch_size]
-                batch_inputs, batch_ts, batch_targets = inputs[batch_inds], input_ts[batch_inds], targets[batch_inds]
-                yield batch_inputs, batch_ts, batch_targets
+                batch_inputs, batch_targets = inputs[batch_inds], targets[batch_inds]
+                yield batch_inputs, batch_targets
 
     ds_train = gen_train_data(parse_args.batch_size)
-    ds_train_eval = gen_test_data(test_batch_size)
+    ds_train_eval = gen_test_data(parse_args.test_batch_size)
 
     return ds_train, ds_train_eval, meta
 
@@ -353,7 +359,10 @@ def run():
                         lambda _: lax.cond(_epoch < 100, 1e-2, id, 0,
                                            lambda _: lax.cond(_epoch < 140, 1e-3, id, 1e-4, id)))
 
-    opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
+    # opt_init, opt_update, get_params = optimizers.momentum(step_size=lr_schedule, mass=0.9)
+    # opt_init, opt_update, get_params = optimizers.momentum(step_size=1e-1, mass=0.9)
+    opt_init, opt_update, get_params = optimizers.adam(step_size=1e-1)
+    # opt_init, opt_update, get_params = optimizers.rmsprop(step_size=1e-1, gamma=0.99)
     opt_state = opt_init(model["params"])
 
     @jax.jit
@@ -369,9 +378,9 @@ def run():
         Convenience function for calculating losses separately.
         """
         params = get_params(_opt_state)
-        inputs, input_ts, targets = _batch
-        preds, regs = forward(params, inputs, input_ts)
-        loss_ = _loss_fn(preds, targets)
+        inputs, targets = _batch
+        preds, regs = forward(params, inputs)
+        loss_ = _loss_fn(preds[-1, :, 0], targets)
         reg_ = _reg_loss_fn(regs)
         total_loss_ = loss_ + lam * reg_
         return total_loss_, loss_, reg_
@@ -403,6 +412,21 @@ def run():
 
         return jnp.mean(sep_loss_aug_), jnp.mean(sep_loss_), jnp.mean(sep_loss_reg_), jnp.mean(nfe)
 
+    loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, ds_train_eval)
+    print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
+                'Loss {:.6f} | r {:.6f} | NFE {:.6f}'.format(0, loss_aug_, loss_, loss_reg_, nfe_)
+    print(print_str)
+    inputs, _ = next(ds_train_eval)
+    input_ts = jnp.linspace(0., 1., num=100)
+    out, _ = model["plot_ode"](get_params(opt_state), inputs, input_ts)
+    fig, ax = plt.subplots()
+
+    for ex_num in range(10):
+        ax.plot(input_ts, out[:, ex_num * 100, 0], c="blue")
+    plt.savefig("{:08d}.png".format(0))
+    plt.clf()
+    plt.close(fig)
+
     itr = 0
     info = collections.defaultdict(dict)
     for epoch in range(parse_args.nepochs):
@@ -414,12 +438,24 @@ def run():
             opt_state = update(itr, opt_state, batch)
 
             if itr % parse_args.test_freq == 0:
-                loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, ds_train_eval)
+                with jax.disable_jit():
+                    loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, ds_train_eval)
 
                 print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
                             'Loss {:.6f} | r {:.6f} | NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_, nfe_)
 
                 print(print_str)
+
+                inputs, _ = next(ds_train_eval)
+                input_ts = jnp.linspace(0., 1., num=100)
+                out, _ = model["plot_ode"](get_params(opt_state), inputs, input_ts)
+                fig, ax = plt.subplots()
+
+                for ex_num in range(10):
+                    ax.plot(input_ts, out[:, ex_num * 100, 0], c="blue")
+                plt.savefig("{:08d}.png".format(itr))
+                plt.clf()
+                plt.close(fig)
 
                 outfile = open("%s/reg_%s_lam_%.4e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
                 outfile.write(print_str + "\n")

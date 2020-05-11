@@ -63,6 +63,7 @@ odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
 num_blocks = parse_args.num_blocks
+parse_args.subsample = None
 ode_kwargs = {
     "atol": parse_args.atol,
     "rtol": parse_args.rtol,
@@ -97,6 +98,7 @@ def sol_recursive(f, z, t):
     """
     return f(z, t)
 
+  # TODO: fix this for time-inhomogeneous!
   (y0, [y1h]) = jet(g, (z, ), ((jnp.ones_like(z), ), ))
   (y0, [y1, y2h]) = jet(g, (z, ), ((y0, y1h,), ))
   (y0, [y1, y2, y3h]) = jet(g, (z, ), ((y0, y1, y2h), ))
@@ -234,7 +236,7 @@ def augment_dynamics(dynamics, sign=1):
     # TODO: check if stuff is cached here
     def reg_dynamics(y, t, params):
         """
-        Dynamics of regularization.
+        NN_Dynamics of regularization.
         """
         if reg == "none":
             return 0.
@@ -246,7 +248,7 @@ def augment_dynamics(dynamics, sign=1):
 
     def aug_dynamics(yr, t, params):
         """
-        Dynamics augmented with regularization.
+        NN_Dynamics augmented with regularization.
         """
         y, r = yr
         dydt = dynamics(y, t, params)
@@ -257,13 +259,13 @@ def augment_dynamics(dynamics, sign=1):
 
 def init_model(rec_ode_kwargs,
                gen_ode_kwargs,
-               rec_dim=20,
-               gen_dim=10,
-               data_dim=1,
-               rec_layers=1,
-               gen_layers=1,
-               dynamics_units=100,
-               gru_units=100,):
+               rec_dim=40,
+               gen_dim=20,
+               data_dim=37,  # TODO: based on len(params) (take away the 4 time-invariant, not sure where these are removed)
+               rec_layers=3,
+               gen_layers=3,
+               dynamics_units=50,
+               gru_units=50):
     """
     Instantiates transformed submodules of model and their parameters.
     """

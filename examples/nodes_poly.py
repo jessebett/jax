@@ -10,8 +10,8 @@ from jax.experimental.jet import jet
 from jax.experimental import optimizers
 
 from jax.config import config
-config.update("jax_debug_nans", True)
-# config.update("jax_enable_x64", True)
+# config.update("jax_debug_nans", True)
+config.update("jax_enable_x64", True)
 
 import matplotlib as mpl
 import matplotlib.font_manager
@@ -62,7 +62,8 @@ def true_dyn(z, t):
     """
     True dynamics to learn.
     """
-    return true_degree * _int_pow(t, true_degree - 1)
+    return sum(coef * (i + 1) * _int_pow(t, i) for i, coef in enumerate(true_coefs[1:]))
+    # return 10 * _int_pow(t, 4) - 135 * _int_pow(t, 3) + 680 * _int_pow(t, 2) - 1515 * t + 1260
 
 
 def dyn(z, t, params):
@@ -75,7 +76,7 @@ def dyn(z, t, params):
 
 def aug_dyn(z_r, t, params):
     """
-    Dynamics augmented with regularization.
+    NN_Dynamics augmented with regularization.
     """
     z, r = z_r
     dz = dyn(z, t, params)
@@ -86,12 +87,16 @@ def aug_dyn(z_r, t, params):
     return dz, dr
 
 
-true_degree = 2
-dyn_degree = 4  # degree of the predicted solution, x-1 degree of dynamics
+# true_coefs = [1261, -1515, 680, -135, 10]  # from degree 0 to highest degree
+true_coefs = [-629.5, 600, -190, 20]
+true_fn = lambda t: sum(coef * _int_pow(t, i) for i, coef in enumerate(true_coefs))
+dyn_degree = 3  # degree of the predicted solution, x-1 degree of dynamics
 rng = jax.random.PRNGKey(0)
-params = jax.random.normal(rng, (dyn_degree, )) * 0.001
-t_endpoints = 0., 1.
-ts = jnp.linspace(*t_endpoints, num=4)
+# params = jax.random.normal(rng, (dyn_degree, )) * 0.001
+params = jnp.array([600, -190 * 2, 20 * 3], dtype=jnp.float64)
+t_endpoints = 2.85, 3.5
+y0 = true_fn(t_endpoints[0])
+ts = jnp.linspace(*t_endpoints, num=5)
 
 
 @jax.jit
@@ -99,8 +104,8 @@ def loss(params):
     """
     Loss for training.
     """
-    true_soln = odeint(true_dyn, 0., ts)[0]
-    pred_soln, rs = odeint(aug_dyn, (0., 0.), ts, params)[0]
+    true_soln = odeint(true_dyn, y0, ts)[0]
+    pred_soln, rs = odeint(aug_dyn, (y0, 0.), ts, params)[0]
     return jnp.mean(lax.square(true_soln - pred_soln)) + lam * jnp.mean(rs)
 
 
@@ -109,17 +114,18 @@ def sep_losses(params):
     """
     Separate out different losses.
     """
-    true_soln = odeint(true_dyn, 0., ts)[0]
-    pred_soln, rs = odeint(aug_dyn, (0., 0.), ts, params)[0]
+    true_soln = odeint(true_dyn, y0, ts)[0]
+    pred_soln, rs = odeint(aug_dyn, (y0, 0.), ts, params)[0]
     diff = jnp.mean(lax.square(true_soln - pred_soln))
     reg = jnp.mean(rs)
     return diff + lam * reg, diff, reg
 
 
 grad_fn = jax.grad(loss)
-lam = 1
-lr = 1e-2
-opt_init, opt_update, get_params = optimizers.momentum(step_size=lr, mass=0.9)
+lam = 0
+lr = 1e-3
+# opt_init, opt_update, get_params = optimizers.momentum(step_size=lr, mass=0.9)
+opt_init, opt_update, get_params = optimizers.adam(step_size=lr)
 opt_state = opt_init(params)
 
 
@@ -131,9 +137,9 @@ def update(itr, opt_state):
     return opt_update(itr, grad_fn(get_params(opt_state)), opt_state)
 
 
-for itr in range(10000):
+for itr in range(100000):
     opt_state = update(itr, opt_state)
-    if itr % 1000 == 0:
+    if itr % 10000 == 0:
         total_loss_, loss_, reg_ = sep_losses(get_params(opt_state))
         print(total_loss_, loss_, reg_)
 
@@ -144,11 +150,11 @@ print(params)
 fig, ax = plt.subplots()
 
 plot_ts = jnp.linspace(*t_endpoints, num=1000)
-true_soln = odeint(true_dyn, 0., plot_ts)[0]
-pred_soln, rs = odeint(aug_dyn, (0., 0.), plot_ts, params)[0]
-learned_soln = odeint(true_dyn, 0., ts)[0]
+true_soln = odeint(true_dyn, y0, plot_ts)[0]
+pred_soln, rs = odeint(aug_dyn, (y0, 0.), plot_ts, params)[0]
+learned_soln = odeint(true_dyn, y0, ts)[0]
 
-nfe = odeint(dyn, 0., plot_ts, params)[1]
+nfe = odeint(dyn, y0, plot_ts, params)[1]
 print(nfe)
 
 
@@ -166,7 +172,7 @@ print(jnp.mean(jnp.abs(analytic_pred(plot_ts) - pred_soln)))
 ax.plot(plot_ts, pred_soln,
         label="pred: z(t) = %.2ft + %.2ft^2 + %.2ft^3 + %.2ft^4" % (params[0], params[1], params[2], params[3]),
         c="orange")
-ax.plot(plot_ts, true_soln, '--', label="true: z(t) = t^2",
+ax.plot(plot_ts, true_soln, '--', label="true: z(t) = t^4 ... ",
         c="blue")
 ax.scatter(ts, learned_soln, label="training points: MSE = %.2e" % loss_, c="blue")
 
@@ -181,6 +187,6 @@ plt.xlabel("t")
 plt.ylabel("z(t)")
 
 plt.title("Regularizing %.2f * d^3z(t)/dt^3, NFE: %d, init_step: 0.1" % (lam, nfe))
-plt.savefig("dyn.png")
+plt.savefig("new_dyn.png")
 plt.clf()
 plt.close(fig)
