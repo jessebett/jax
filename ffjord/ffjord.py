@@ -60,7 +60,7 @@ def nn_dynamics(z, t, args):
 
 def ffjord_sample(params, D, rng):
     z = random.normal(rng, D)
-    return odeint(nn_dynamics, z, np.array([1., 0.]), params)  # Todo: reverse time
+    return odeint(nn_dynamics, z, np.array([1., 0.]), params)[0]  # Todo: reverse time
 
 def ffjord_dynamics(ffjord_state, t, eps, args):
     z = ffjord_state[:-1]
@@ -83,7 +83,7 @@ def ffjord_dynamics(ffjord_state, t, eps, args):
 def ffjord_log_density(params, x, D, rng):
     init_state = np.hstack([x, 0.])
     eps = random.normal(rng, (D,))
-    ffjord_out = odeint(ffjord_dynamics, init_state, np.array([0., 1.]), eps, params)[1]
+    ffjord_out = odeint(ffjord_dynamics, init_state, np.array([0., 1.]), eps, params)[0][1]
     z, dlogp = ffjord_out[:-1], ffjord_out[-1]
     logpz = standard_normal_logpdf(z)
     logpx = logpz - dlogp
@@ -121,14 +121,14 @@ def reg_dynamics(reg_aug_state, t, eps, params):
     return np.hstack([dz_dt, r3])
 
 
-def reg_log_density(params,x,D,rng, lam = 1):
+def reg_log_density(params,x,D,rng, lam = 0):
     init_ffjord_state = np.hstack([x, 0.])
     init_reg_state = 0.
     init_aug_reg_state = np.hstack([init_ffjord_state,init_reg_state])
 
     eps = random.normal(rng, (D,))
 
-    aug_reg_out = odeint(reg_dynamics, init_aug_reg_state, np.array([0.,1.]),eps,params)[1]
+    aug_reg_out = odeint(reg_dynamics, init_aug_reg_state, np.array([0.,1.]),eps,params)[0][1]
 
     z = aug_reg_out[:-2]
     dlogp = aug_reg_out[-2:-1]
@@ -145,7 +145,24 @@ def batch_reg_likelihood(params, data, rng):
     batch_density = vmap(reg_log_density, in_axes=(None, 0, None, 0))
     return np.mean(batch_density(params, data, D, rngs))
 
+# ========= Define an intractable unnormalized density =========
 
+def ffjord_log_density_and_nfe(params, x, D, rng):
+    init_state = np.hstack([x, 0.])
+    eps = random.normal(rng, (D,))
+    ffjord_sol, nfe = odeint(ffjord_dynamics, init_state, np.array([0., 1.]), eps, params)
+    ffjord_out = ffjord_sol[1]
+    z, dlogp = ffjord_out[:-1], ffjord_out[-1]
+    logpz = standard_normal_logpdf(z)
+    logpx = logpz - dlogp
+    return logpx, nfe
+
+def batch_likelihood_and_nfe(params, data, rng):
+    N, D = np.shape(data)
+    rngs = random.split(rng, N)
+    batch_density_and_nfe = vmap(ffjord_log_density_and_nfe, in_axes=(None, 0, None, 0))
+    batch_log_x, nfe = batch_density_and_nfe(params, data, D, rngs)
+    return np.mean(batch_log_x), np.mean(nfe)
 
 # ========= Define an intractable unnormalized density =========
 
@@ -163,6 +180,12 @@ if __name__ == "__main__":
     def reg_objective(params, t):
         rng = random.PRNGKey(t)
         return -batch_reg_likelihood(params, data, rng)
+
+    @jit
+    def objective_and_nfe(params, t):
+        rng = random.PRNGKey(t)
+        batch_log_x, nfe = batch_likelihood_and_nfe(params, data, rng)
+        return -batch_log_x, nfe
 
     # Set up figure.
     fig = plt.figure(figsize=(8,8), facecolor='white')
@@ -183,7 +206,7 @@ if __name__ == "__main__":
         check_grads(_vffjord, (params,), 1, modes=["rev"])
 
     def callback(params, t):
-        print("Iteration {} log-likelihood: {}".format(t, -objective(params, t)))
+        print("Iteration {} log-likelihood: {}".format(t, objective_and_nfe(params, t)))
         print("Iteration {} reg-objective: {}".format(t, -reg_objective(params, t)))
         # print("testing grads")
         # test_grads()
