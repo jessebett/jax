@@ -37,7 +37,7 @@ parser.add_argument('--rtol', type=float, default=1.4e-8)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
-parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4'], default='none')
+parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default='none')
 parser.add_argument('--test_freq', type=int, default=640)
 parser.add_argument('--save_freq', type=int, default=640)
 parser.add_argument('--dirname', type=str, default='tmp')
@@ -108,10 +108,12 @@ def sol_recursive(f, z, t):
   (y0, [y1, y2h]) = jet(g, (z_t, ), ((y0, y1h,), ))
   (y0, [y1, y2, y3h]) = jet(g, (z_t, ), ((y0, y1, y2h), ))
   (y0, [y1, y2, y3, y4h]) = jet(g, (z_t, ), ((y0, y1, y2, y3h), ))
+  (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z_t, ), ((y0, y1, y2, y3, y4h), ))
 
   return (jnp.reshape(y0[:-1], z_shape), [jnp.reshape(y1[:-1], z_shape),
                                           jnp.reshape(y2[:-1], z_shape),
-                                          jnp.reshape(y3[:-1], z_shape)])
+                                          jnp.reshape(y3[:-1], z_shape),
+                                          jnp.reshape(y4[:-1], z_shape)])
 
 
 class LatentGRU(hk.Module):
