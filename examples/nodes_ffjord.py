@@ -71,12 +71,19 @@ ode_kwargs = {
     # "init_step": parse_args.init_step
 }
 
+# jax.nn.softplus jet will fail because of convert element type
+# logaddexp will fail because no lax.max primitive implemented
+# TODO: maybe use jax.nn.softplus when not doing jet?
+# softplus = jax.nn.softplus
+softplus = lambda x: jnp.where(x >= 0,
+                               x + jnp.log1p(jnp.exp(-x)),
+                               jnp.log1p(jnp.exp(x)))
+
 
 def sol_recursive(f, z, t):
   """
   Recursively compute higher order derivatives of dynamics of ODE.
   """
-  # TODO: check if this is right
   z_shape = z.shape
   z_t = jnp.concatenate((jnp.ravel(z), jnp.array([t])))
 
@@ -92,12 +99,8 @@ def sol_recursive(f, z, t):
 
   (y0, [y1h]) = jet(g, (z_t, ), ((jnp.ones_like(z_t), ), ))
   (y0, [y1, y2h]) = jet(g, (z_t, ), ((y0, y1h,), ))
-  (y0, [y1, y2, y3h]) = jet(g, (z_t, ), ((y0, y1, y2h), ))
-  (y0, [y1, y2, y3, y4h]) = jet(g, (z_t, ), ((y0, y1, y2, y3h), ))
 
-  return (jnp.reshape(y0[:-1], z_shape), [jnp.reshape(y1[:-1], z_shape),
-                                          jnp.reshape(y2[:-1], z_shape),
-                                          jnp.reshape(y3[:-1], z_shape)])
+  return (jnp.reshape(y0[:-1], z_shape), [jnp.reshape(y1[:-1], z_shape)])
 
 
 # set up modules
@@ -180,7 +183,7 @@ class NN_Dynamics(hk.Module):
         layers = []
         activation_fns = []
         base_layer = ConcatConv2D
-        nonlinearity = jax.nn.softplus
+        nonlinearity = softplus
 
         for dim_out, stride in zip(hidden_dims + (input_shape[-1],), strides):
             if stride is None:
@@ -269,7 +272,7 @@ def init_model():
             # do r3 regularization
             y0, y_n = sol_recursive(lambda _y, _t: dynamics_wrap(_y, _t, params), y, t)
             r = y_n[-1]
-            return jnp.mean(r ** 2, axis=[axis_ for axis_ in range(1, r.ndim)])
+            return jnp.mean(jnp.square(r), axis=[axis_ for axis_ in range(1, r.ndim)])
 
     def ffjord_dynamics(yp, t, eps, params):
         """
