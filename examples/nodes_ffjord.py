@@ -39,14 +39,13 @@ parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4'], default='none')
-parser.add_argument('--test_freq', type=int, default=2)
-parser.add_argument('--save_freq', type=int, default=2)
+parser.add_argument('--test_freq', type=int, default=7500)
+parser.add_argument('--save_freq', type=int, default=7500)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--resnet', action="store_true")
 parser.add_argument('--no_count_nfe', action="store_true")
-parser.add_argument('--num_blocks', type=int, default=6)
-parser.add_argument('--load_ckpt', type=str, default=None)
+parser.add_argument('--ckpt_freq', type=int, default=1800)  # 3 itrs/sec, 6 epochs/10mins
+parser.add_argument('--ckpt_path', type=str, default="./ck.pt")
 parse_args = parser.parse_args()
 
 
@@ -60,10 +59,10 @@ lam_w = parse_args.lam_w
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
-count_nfe = False if parse_args.no_count_nfe is True else True
+count_nfe = not parse_args.no_count_nfe
 vmap = False if parse_args.no_vmap is True else True
 vmap = False
-num_blocks = parse_args.num_blocks
+num_blocks = 0
 ode_kwargs = {
     "atol": parse_args.atol,
     "rtol": parse_args.rtol,
@@ -492,16 +491,17 @@ def run():
         return lax.cond(_epoch < 250, parse_args.lr * iter_frac, id, 1e-4, id)
 
     opt_init, opt_update, get_params = optimizers.adam(step_size=lr_schedule)
-    if parse_args.load_ckpt:
-        file_ = open(parse_args.load_ckpt, 'rb')
-        init_params = pickle.load(file_)
-        file_.close()
+    if os.path.exists(parse_args.ckpt_path):
+        outfile = open(parse_args.ckpt_path, 'rb')
+        state_dict = pickle.load(outfile)
+        outfile.close()
 
-        # parse itr from the checkpoint
-        load_itr = int(os.path.basename(parse_args.load_ckpt).split("_")[-2])
+        init_params = state_dict["params"]
+        load_itr = state_dict["itr"]
     else:
         init_params = model["params"]
         load_itr = 0
+
     opt_state = opt_init(init_params)
 
     @jax.jit
@@ -563,9 +563,12 @@ def run():
 
             itr += 1
 
-            if parse_args.load_ckpt:
-                if itr <= load_itr:
-                    continue
+            # skip the iterations we've already done
+            # this is the easiest way to get to the current opt state while preserving reproducibility
+            # in particular it ensures the same data, and won't overwrite anything we've already done!
+            if itr <= load_itr:
+                continue
+
             opt_state = update(itr, opt_state, key, batch)
 
             if itr % parse_args.test_freq == 0:
@@ -595,6 +598,15 @@ def run():
             outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_iter.txt" % (dirname, reg, lam, num_blocks), "a")
             outfile.write("Iter: {:04d}\n".format(itr))
             outfile.close()
+
+            if itr % parse_args.ckpt_freq == 0:
+                state_dict = {
+                    "params": get_params(opt_state),
+                    "itr": itr,
+                }
+                outfile = open(parse_args.ckpt_path, 'wb')
+                pickle.dump(state_dict, outfile)
+                outfile.close()
     meta = {
         "info": info,
         "args": parse_args
