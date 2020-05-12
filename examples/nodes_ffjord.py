@@ -446,11 +446,11 @@ def init_data():
     # make sure we always save the model on the last iteration
     assert num_batches * parse_args.nepochs % parse_args.save_freq == 0
 
-    ds_train = ds_train.map(noise_and_normalize_img, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-    ds_test = ds_test.map(normalize_img, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+    ds_train = ds_train.map(noise_and_normalize_img)
+    ds_test = ds_test.map(normalize_img)
 
     ds_train = ds_train.cache().repeat().shuffle(1000, seed=seed).batch(parse_args.batch_size)
-    ds_test_eval = ds_test.batch(parse_args.test_batch_size).cache().repeat()
+    ds_test_eval = ds_test.batch(parse_args.test_batch_size).repeat()
 
     ds_train, ds_test_eval = tfds.as_numpy(ds_train), tfds.as_numpy(ds_test_eval)
 
