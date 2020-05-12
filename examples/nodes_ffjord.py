@@ -234,7 +234,7 @@ def initialization_data(input_shape):
     input_shape = (parse_args.test_batch_size, ) + input_shape[1:]
     data = {
         "pre_ode": aug_init(jnp.zeros(input_shape))[:-1],
-        "ode": aug_init(jnp.zeros(input_shape))[:-1]
+        "ode": aug_init(jnp.zeros(input_shape))[:-2] + (0., )
     }
     return data
 
@@ -417,8 +417,9 @@ def init_data():
                                              shuffle_files=True,
                                              with_info=True,
                                              as_supervised=True,
-                                             read_config=tfds.ReadConfig(shuffle_seed=parse_args.seed))
-    # TODO: check test set accuracy?
+                                             read_config=tfds.ReadConfig(shuffle_seed=parse_args.seed,
+                                                                         try_autocache=False))
+
     num_train = ds_info.splits['train'].num_examples
     num_test = ds_info.splits['test'].num_examples
 
