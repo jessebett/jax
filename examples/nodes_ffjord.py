@@ -39,8 +39,8 @@ parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4'], default='none')
-parser.add_argument('--test_freq', type=int, default=5)
-parser.add_argument('--save_freq', type=int, default=5)
+parser.add_argument('--test_freq', type=int, default=1)
+parser.add_argument('--save_freq', type=int, default=1)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--no_count_nfe', action="store_true")
@@ -556,6 +556,18 @@ def run():
     info = collections.defaultdict(dict)
 
     key = rng
+
+    loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, key, ds_test_eval)
+
+    print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
+                'Loss {:.6f} | r {:.6f} | NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_, nfe_)
+
+    print(print_str)
+
+    outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
+    outfile.write(print_str + "\n")
+    outfile.close()
+
     for epoch in range(parse_args.nepochs):
         for i in range(num_batches):
             key, = jax.random.split(key, num=1)
