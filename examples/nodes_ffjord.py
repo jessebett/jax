@@ -537,7 +537,7 @@ def run():
         for test_batch_num in range(num_test_batches):
             _key, _key2 = jax.random.split(_key, num=2)
             test_batch = next(ds_eval)[0]
-            test_batch = (test_batch.astype(jnp.float64) + jax.random.uniform(_key2, shape=test_batch.shape)) / 255.
+            test_batch = (test_batch.astype(jnp.float64) + jax.random.uniform(_key2, shape=test_batch.shape)) / 256.
 
             test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, test_batch, _key)
 
@@ -577,7 +577,7 @@ def run():
         for i in range(num_batches):
             key, key2 = jax.random.split(key, num=2)
             batch = next(ds_train)[0]
-            batch = (batch.astype(jnp.float64) + jax.random.uniform(key2, shape=batch.shape)) / 255.
+            batch = (batch.astype(jnp.float64) + jax.random.uniform(key2, shape=batch.shape)) / 256.
 
             itr += 1
 
