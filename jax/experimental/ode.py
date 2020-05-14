@@ -494,12 +494,64 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
   """
   return _odeint_wrapper(func, rtol, atol, mxstep, y0, t, *args)
 
+def odeint_aux(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
+  """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
+
+  Args:
+    func: function to evaluate the time derivative of the solution `y` at time
+      `t` as `func(y, t, *args)`, producing the same shape/structure as `y0`.
+    y0: array or pytree of arrays representing the initial value for the state.
+    t: array of float times for evaluation, like `np.linspace(0., 10., 101)`,
+      in which the values must be strictly increasing.
+    *args: tuple of additional arguments for `func`.
+    rtol: float, relative local error tolerance for solver (optional).
+    atol: float, absolute local error tolerance for solver (optional).
+    mxstep: int, maximum number of steps to take for each timepoint (optional).
+
+  Returns:
+    Values of the solution `y` (i.e. integrated system values) at each time
+    point in `t`, represented as an array (or pytree of arrays) with the same
+    shape/structure as `y0` except with a new leading axis of length `len(t)`.
+  """
+  return _odeint_aux_wrapper(func, rtol, atol, mxstep, y0, t, *args)
+
+def odeint_sepaux(fwd_func, rev_func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
+  """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
+
+  Args:
+    func: function to evaluate the time derivative of the solution `y` at time
+      `t` as `func(y, t, *args)`, producing the same shape/structure as `y0`.
+    y0: array or pytree of arrays representing the initial value for the state.
+    t: array of float times for evaluation, like `np.linspace(0., 10., 101)`,
+      in which the values must be strictly increasing.
+    *args: tuple of additional arguments for `func`.
+    rtol: float, relative local error tolerance for solver (optional).
+    atol: float, absolute local error tolerance for solver (optional).
+    mxstep: int, maximum number of steps to take for each timepoint (optional).
+
+  Returns:
+    Values of the solution `y` (i.e. integrated system values) at each time
+    point in `t`, represented as an array (or pytree of arrays) with the same
+    shape/structure as `y0` except with a new leading axis of length `len(t)`.
+  """
+  return _odeint_sepaux_wrapper(fwd_func, rev_func, rtol, atol, mxstep, y0, t, *args)
+
 @partial(jax.jit, static_argnums=(0, 1, 2, 3))
 def _odeint_wrapper(func, rtol, atol, mxstep, y0, ts, *args):
   y0, unravel = ravel_pytree(y0)
   func = ravel_first_arg(func, unravel)
   out, nfe = _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args)
   return jax.vmap(unravel)(out), nfe
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3))
+def _odeint_aux_wrapper(func, rtol, atol, mxstep, y0, ts, *args):
+  return _dopri5_odeint_aux(func, rtol, atol, mxstep, y0, ts, *args)
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
+def _odeint_sepaux_wrapper(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args):
+  fwd_func = ravel_first_arg(fwd_func, ravel_pytree(y0[0])[1])
+  rev_func = ravel_first_arg(rev_func, ravel_pytree(y0)[1])
+  return _dopri5_odeint_sepaux(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args)
 
 def _euler_odeint(func, num_steps, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
@@ -562,6 +614,66 @@ def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   carry, ys = lax.scan(scan_fun, init_carry, ts[1:])
   nfe = carry[-1]
   return np.concatenate((y0[None], ys)), nfe
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
+def _dopri5_odeint_aux(func, rtol, atol, mxstep, y0, ts, *args):
+  y0, unravel = ravel_pytree(y0)
+  func = ravel_first_arg(func, unravel)
+
+  func_ = lambda y, t: func(y, t, *args)
+
+  def scan_fun(carry, target_t):
+
+    def cond_fun(state):
+      i, _, _, t, dt, _, _ = state
+      return (t < target_t) & (i < mxstep) & (dt > 0)
+
+    def body_fun(state):
+      i, y, f, t, dt, last_t, interp_coeff = state
+      next_y, next_f, next_y_error, k = runge_kutta_step(func_, y, f, t, dt)
+      next_t = t + dt
+      error_ratios = error_ratio(next_y_error, rtol, atol, y, next_y)
+      new_interp_coeff = interp_fit_dopri(y, next_y, k, dt)
+      dt = optimal_step_size(dt, error_ratios)
+
+      new = [i + 1, next_y, next_f, next_t, dt,      t, new_interp_coeff]
+      old = [i + 1,      y,      f,      t, dt, last_t,     interp_coeff]
+      return map(partial(np.where, np.all(error_ratios <= 1.)), new, old)
+
+    nfe = carry[-1]
+    n_steps, *carry_ = lax.while_loop(cond_fun, body_fun, [0] + carry[:-1])
+    carry = carry_ + [nfe + 6 * n_steps]
+    _, _, t, _, last_t, interp_coeff = carry[:-1]
+    relative_output_time = (target_t - last_t) / (t - last_t)
+    y_target = np.polyval(interp_coeff, relative_output_time)
+    return carry, y_target
+
+  f0 = func_(y0, ts[0])
+  # init_nfe = 1.
+  # dt = 0.1
+  init_nfe = 2.
+  dt = initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0)
+  interp_coeff = np.array([y0] * 5)
+  init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff, init_nfe]
+  carry, ys = lax.scan(scan_fun, init_carry, ts[1:])
+  nfe = carry[-1]
+  out = np.concatenate((y0[None], ys))
+  return jax.vmap(unravel)(out), nfe
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
+def _dopri5_odeint_sepaux(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args):
+  flat_y0, unravel = ravel_pytree(y0[0])
+  flat_out, nfe = _dopri5_odeint(fwd_func, rtol, atol, mxstep, flat_y0, ts, *args)
+  out = jax.vmap(unravel)(flat_out)
+  def aug_init(y):
+    """
+    Initialize dynamics with 0 for logpx and regs.
+    TODO: this is copied from nodes_ffjord.py
+    """
+    batch_size = y.shape[0]
+    return y, np.zeros((batch_size, 1)), np.zeros((batch_size, 1))
+  return jax.vmap(aug_init)(out), nfe
 
 def _heun_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
@@ -921,6 +1033,26 @@ def _odeint_fwd(func, rtol, atol, mxstep, y0, ts, *args):
   ys, nfe = _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args)
   return (ys, nfe), (ys, ts, args)
 
+def _odeint_aux_fwd(func, rtol, atol, mxstep, y0, ts, *args):
+  def aug_init(y):
+    """
+    Initialize dynamics with 0 for logpx and regs.
+    TODO: this is copied from nodes_ffjord.py
+    """
+    batch_size = y.shape[0]
+    return y, np.zeros((batch_size, 1)), np.zeros((batch_size, 1))
+  # this doesn't fully implement the finlay trick since we're still paying the price of evaluating
+  # the augmented dynamics, but we're only integrating it's unaugmented portion
+  ys, nfe = _dopri5_odeint_aux(lambda y, t, *args, **kwargs: func(aug_init(y), t, *args, **kwargs)[0],
+                               rtol, atol, mxstep, y0[0], ts, *args)
+  # assumes state has two augmented variables (one for div, one for reg)
+  aug_ys = (ys, np.zeros((ys.shape[0], *y0[1].shape)), np.zeros((ys.shape[0], *y0[2].shape)))
+  return (aug_ys, nfe), (aug_ys, ts, args)
+
+def _odeint_sepaux_fwd(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args):
+  ys, nfe = _dopri5_odeint_sepaux(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args)
+  return (ys, nfe), (ys, ts, args)
+
 def _odeint_rev(func, rtol, atol, mxstep, res, g):
   ys, ts, args = res
   g, _ = g
@@ -958,11 +1090,66 @@ def _odeint_rev(func, rtol, atol, mxstep, res, g):
   ts_bar = np.concatenate([np.array([t0_bar]), rev_ts_bar[::-1]])
   return (y_bar, ts_bar, *args_bar)
 
+def _odeint_aux_rev(func, rtol, atol, mxstep, res, g):
+  aug_ys, ts, args = res
+
+  # we want to ravel the tuple after indexing each of its elements in time
+  # too difficult, and not worth it since it's less efficient
+  ys, unravel = ravel_pytree(aug_ys)
+  func = ravel_first_arg(func, unravel)
+  aug_g, _ = g
+  g, _ = ravel_pytree(aug_g)  # don't need the unravel, it's the same one for ys
+
+  def aug_dynamics(augmented_state, t, *args):
+    """Original system augmented with vjp_y, vjp_t and vjp_args."""
+    y, y_bar, *_ = augmented_state
+    # `t` here is negatice time, so we need to negate again to get back to
+    # normal time. See the `odeint` invocation in `scan_fun` below.
+    y_dot, vjpfun = jax.vjp(func, y, -t, *args)
+    return (-y_dot, *vjpfun(y_bar))
+
+  y_bar = g[-1]
+  ts_bar = []
+  t0_bar = 0.
+
+  def scan_fun(carry, i):
+    y_bar, t0_bar, args_bar = carry
+    # Compute effect of moving measurement time
+    t_bar = np.dot(func(ys[i], ts[i], *args), g[i])
+    t0_bar = t0_bar - t_bar
+    # Run augmented system backwards to previous observation
+    _, y_bar, t0_bar, args_bar = odeint(
+        aug_dynamics, (ys[i], y_bar, t0_bar, args_bar),
+        np.array([-ts[i], -ts[i - 1]]),
+        *args, rtol=rtol, atol=atol, mxstep=mxstep)[0]
+    y_bar, t0_bar, args_bar = tree_map(op.itemgetter(1), (y_bar, t0_bar, args_bar))
+    # Add gradient from current output
+    y_bar = y_bar + g[i - 1]
+    return (y_bar, t0_bar, args_bar), t_bar
+
+  init_carry = (g[-1], 0., tree_map(np.zeros_like, args))
+  (y_bar, t0_bar, args_bar), rev_ts_bar = lax.scan(
+      scan_fun, init_carry, np.arange(len(ts) - 1, 0, -1))
+  ts_bar = np.concatenate([np.array([t0_bar]), rev_ts_bar[::-1]])
+  y_bar = unravel(y_bar)
+  return (y_bar, ts_bar, *args_bar)
+
+def _odeint_sepaux_rev(fwd_func, rev_func, rtol, atol, mxstep, res, g):
+  flatten_func = jax.vmap(lambda pytree: ravel_pytree(pytree)[0])  # flatten everything but time dim
+  flat_res = flatten_func(res[0])
+  flat_g = flatten_func(g[0])
+  result = _odeint_rev(rev_func, rtol, atol, mxstep, (flat_res, *res[1:]), (flat_g, g[1]))
+
+  unravel = ravel_pytree(tree_map(op.itemgetter(0), res[0]))[1]
+  return (unravel(result[0]), *result[1:])
+
 methods = {
   "dopri5": _dopri5_odeint,
   "adams": _adams_odeint
 }
 _dopri5_odeint.defvjp(_odeint_fwd, _odeint_rev)
+_dopri5_odeint_sepaux.defvjp(_odeint_sepaux_fwd, _odeint_sepaux_rev)
+# _dopri5_odeint_aux.defvjp(_odeint_aux_fwd, _odeint_aux_rev)
 # _adams_odeint.defvjp(partial(_odeint_fwd, _adams_odeint), partial(_odeint_rev, "adams"))
 
 def pend(np, y, _, m, g):

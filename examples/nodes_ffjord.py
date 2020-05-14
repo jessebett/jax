@@ -16,7 +16,7 @@ from jax import lax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint
+from jax.experimental.ode import odeint, odeint_sepaux
 from jax.experimental.jet import jet
 from jax.scipy.special import expit as sigmoid
 from jax.scipy.special import logit
@@ -25,8 +25,8 @@ from jax.config import config
 config.update("jax_enable_x64", True)
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=200)
-parser.add_argument('--test_batch_size', type=int, default=200)
+parser.add_argument('--batch_size', type=int, default=2)
+parser.add_argument('--test_batch_size', type=int, default=2)
 parser.add_argument('--nepochs', type=int, default=500)
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--warmup_itrs', type=float, default=1e3)
@@ -292,7 +292,17 @@ def init_model():
         dy, dp = ffjord_dynamics((y, p), t, eps, params)
         dr = reg_dynamics(y, t, params)
         return dy, dp, dr
+    # nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+    #                                                         aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
     nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+
+    def ode_aux(params, y, delta_logp, eps):
+        """
+        Apply the ODE block.
+        """
+        ys, delta_logps, rs = nodeint_aux(reg_init(y, delta_logp), ts, eps, params)
+        return ys[-1], delta_logps[-1], rs[-1]
 
     def ode(params, y, delta_logp, eps):
         """
@@ -302,6 +312,7 @@ def init_model():
         return ys[-1], delta_logps[-1], rs[-1]
 
     if count_nfe:
+        # TODO: w/ finlay trick this is not true NFE
         if vmap:
             unreg_nodeint = jax.vmap(lambda z, delta_logp, t, eps, params:
                                      odeint(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1],
@@ -324,15 +335,16 @@ def init_model():
     else:
         nfe_fn = None
 
-    # return a dictionary of the three components of the model
-    model = {"model": {
-        "pre_ode": pre_ode_fn,
-        "ode": ode
-    }, "params": {
-        "pre_ode": pre_ode_params,
-        "ode": dynamics_params
-    }, "nfe": nfe_fn
-    }
+    def forward_aux(key, params, _images):
+        """
+        Forward pass of the model.
+        """
+        eps = get_epsilon(key, _images.shape)
+
+        z, detla_logp = pre_ode_fn(params["pre_ode"], *aug_init(_images)[:-1])
+        z, delta_logp, regs = ode_aux(params["ode"], z, detla_logp, eps)
+
+        return z, delta_logp, regs
 
     def forward(key, params, _images):
         """
@@ -345,7 +357,17 @@ def init_model():
 
         return z, delta_logp, regs
 
-    return forward, model
+    model = {"model": {
+        "pre_ode": pre_ode_fn,
+        "ode": ode
+    }, "params": {
+        "pre_ode": pre_ode_params,
+        "ode": dynamics_params
+    }, "nfe": nfe_fn,
+        "forward": forward
+    }
+
+    return forward_aux, model
 
 
 def aug_init(y):
@@ -425,21 +447,6 @@ def init_data():
     num_train = ds_info.splits['train'].num_examples
     num_test = ds_info.splits['test'].num_examples
 
-    def noise_and_normalize_img(img, label):
-        """
-        Add noise to and normalize image.
-        """
-        # TODO: based on python interpreter test random.uniform has a state
-        noise = tf.random.uniform(tf.shape(img), seed=parse_args.seed, dtype=tf.dtypes.float64)
-        return (tf.cast(img, tf.float64) + noise) / 255., label
-
-    def normalize_img(img, label):
-        """
-        Add noise to and normalize image.
-        """
-        # TODO: based on python interpreter test random.uniform has a state
-        return (tf.cast(img, tf.float64)) / 255., label
-
     # make sure all batches are the same size to minimize jit compilation cache
     assert num_train % parse_args.batch_size == 0
     num_batches = num_train // parse_args.batch_size
@@ -448,9 +455,6 @@ def init_data():
 
     # make sure we always save the model on the last iteration
     assert num_batches * parse_args.nepochs % parse_args.save_freq == 0
-
-    ds_train = ds_train.map(noise_and_normalize_img)
-    ds_test = ds_test.map(normalize_img)
 
     ds_train = ds_train.cache().repeat().shuffle(1000, seed=seed).batch(parse_args.batch_size)
     ds_test_eval = ds_test.batch(parse_args.test_batch_size).repeat()
@@ -518,7 +522,7 @@ def run():
         """
         Convenience function for calculating losses separately.
         """
-        z, delta_logp, regs = forward(_key, get_params(_opt_state), _batch)
+        z, delta_logp, regs = model["forward"](_key, get_params(_opt_state), _batch)
         loss_ = _loss_fn(z, delta_logp)
         reg_ = _reg_loss_fn(regs)
         total_loss_ = loss_ + lam * reg_
@@ -531,8 +535,9 @@ def run():
         sep_loss_aug_, sep_loss_, sep_loss_reg_, nfe = [], [], [], []
 
         for test_batch_num in range(num_test_batches):
-            _key, = jax.random.split(_key, num=1)
+            _key, _key2 = jax.random.split(_key, num=2)
             test_batch = next(ds_eval)[0]
+            test_batch = (test_batch.astype(jnp.float64) + jax.random.uniform(_key2, shape=test_batch.shape)) / 255.
 
             test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, test_batch, _key)
 
@@ -570,8 +575,9 @@ def run():
 
     for epoch in range(parse_args.nepochs):
         for i in range(num_batches):
-            key, = jax.random.split(key, num=1)
+            key, key2 = jax.random.split(key, num=2)
             batch = next(ds_train)[0]
+            batch = (batch.astype(jnp.float64) + jax.random.uniform(key2, shape=batch.shape)) / 255.
 
             itr += 1
 
