@@ -8,7 +8,6 @@ import pickle
 import sys
 
 import haiku as hk
-import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import jax
@@ -39,8 +38,8 @@ parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4'], default='none')
-parser.add_argument('--test_freq', type=int, default=1)
-parser.add_argument('--save_freq', type=int, default=1)
+parser.add_argument('--test_freq', type=int, default=15000)
+parser.add_argument('--save_freq', type=int, default=15000)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--no_count_nfe', action="store_true")
@@ -292,9 +291,9 @@ def init_model():
         dy, dp = ffjord_dynamics((y, p), t, eps, params)
         dr = reg_dynamics(y, t, params)
         return dy, dp, dr
-    # nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
-    #                                                         aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+                                                            aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    # nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
     nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
 
     def ode_aux(params, y, delta_logp, eps):
@@ -537,7 +536,10 @@ def run():
         for test_batch_num in range(num_test_batches):
             _key, _key2 = jax.random.split(_key, num=2)
             test_batch = next(ds_eval)[0]
-            test_batch = (test_batch.astype(jnp.float64) + jax.random.uniform(_key2, shape=test_batch.shape)) / 256.
+            test_batch = (test_batch.astype(jnp.float64) + jax.random.uniform(_key2,
+                                                                              minval=1e-15,
+                                                                              maxval=1 - 1e-15,
+                                                                              shape=test_batch.shape)) / 256.
 
             test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, test_batch, _key)
 
@@ -562,28 +564,17 @@ def run():
 
     key = rng
 
-    loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, key, ds_test_eval)
-
-    print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
-                'Loss {:.6f} | r {:.6f} | NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_, nfe_)
-
-    print(print_str)
-
-    outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
-    outfile.write(print_str + "\n")
-    outfile.close()
-
     for epoch in range(parse_args.nepochs):
         for i in range(num_batches):
             key, key2 = jax.random.split(key, num=2)
             batch = next(ds_train)[0]
-            batch = (batch.astype(jnp.float64) + jax.random.uniform(key2, shape=batch.shape)) / 256.
+            batch = (batch.astype(jnp.float64) + jax.random.uniform(key2,
+                                                                    minval=1e-15,
+                                                                    maxval=1 - 1e-15,
+                                                                    shape=batch.shape)) / 256.
 
             itr += 1
 
-            # skip the iterations we've already done
-            # this is the easiest way to get to the current opt state while preserving reproducibility
-            # in particular it ensures the same data, and won't overwrite anything we've already done!
             if itr <= load_itr:
                 continue
 
