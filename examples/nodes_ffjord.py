@@ -43,7 +43,7 @@ parser.add_argument('--save_freq', type=int, default=15000)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--no_count_nfe', action="store_true")
-parser.add_argument('--ckpt_freq', type=int, default=1800)  # 3 itrs/sec, 6 epochs/10mins
+parser.add_argument('--ckpt_freq', type=int, default=600)  # 1 itr/sec, 6 epochs/10mins
 parser.add_argument('--ckpt_path', type=str, default="./ck.pt")
 parse_args = parser.parse_args()
 
