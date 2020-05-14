@@ -32,8 +32,8 @@ parser.add_argument('--warmup_itrs', type=float, default=1e3)
 parser.add_argument("--max_grad_norm", type=float, default=1e10)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=0)
-parser.add_argument('--atol', type=float, default=1.4e-8)
-parser.add_argument('--rtol', type=float, default=1.4e-8)
+parser.add_argument('--atol', type=float, default=1e-5)
+parser.add_argument('--rtol', type=float, default=1e-5)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
@@ -291,9 +291,9 @@ def init_model():
         dy, dp = ffjord_dynamics((y, p), t, eps, params)
         dr = reg_dynamics(y, t, params)
         return dy, dp, dr
-    # nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
-    #                                                         aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+                                                            aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    # nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
     nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
 
     def ode_aux(params, y, delta_logp, eps):
