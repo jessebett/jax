@@ -459,8 +459,8 @@ def error_tolerance(rtol, atol, y0, y1):
 
 def error_ratio_tol(error_estimate, error_tolerance):
   err_ratio = error_estimate / error_tolerance
-  return np.square(np.max(np.abs(err_ratio)))  # (square since optimal_step_size expects squared norm)
-  # return np.mean(np.square(err_ratio))
+  # return np.square(np.max(np.abs(err_ratio)))  # (square since optimal_step_size expects squared norm)
+  return np.mean(np.square(err_ratio))
 
 def optimal_step_size(last_step, mean_error_ratio, safety=0.9, ifactor=10.0,
                       dfactor=0.2, order=5.0):
