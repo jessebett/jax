@@ -25,8 +25,8 @@ from jax.config import config
 config.update("jax_enable_x64", True)
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=2)
-parser.add_argument('--test_batch_size', type=int, default=2)
+parser.add_argument('--batch_size', type=int, default=200)
+parser.add_argument('--test_batch_size', type=int, default=200)
 parser.add_argument('--nepochs', type=int, default=500)
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--warmup_itrs', type=float, default=1e3)
