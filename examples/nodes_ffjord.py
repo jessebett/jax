@@ -494,12 +494,13 @@ def run():
         return lax.cond(_epoch < 250, parse_args.lr * iter_frac, id, 1e-4, id)
 
     opt_init, opt_update, get_params = optimizers.adam(step_size=lr_schedule)
+    unravel_opt = ravel_pytree(opt_init(model["params"]))[1]
     if os.path.exists(parse_args.ckpt_path):
         outfile = open(parse_args.ckpt_path, 'rb')
         state_dict = pickle.load(outfile)
         outfile.close()
 
-        opt_state = state_dict["opt_state"]
+        opt_state = unravel_opt(state_dict["opt_state"])
 
         load_itr = state_dict["itr"]
     else:
@@ -611,7 +612,7 @@ def run():
 
             if itr % parse_args.ckpt_freq == 0:
                 state_dict = {
-                    "opt_state": opt_state,
+                    "opt_state": ravel_pytree(opt_state)[0],
                     "itr": itr,
                 }
                 outfile = open(parse_args.ckpt_path, 'wb')
