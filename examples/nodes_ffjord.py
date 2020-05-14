@@ -499,13 +499,14 @@ def run():
         state_dict = pickle.load(outfile)
         outfile.close()
 
-        init_params = state_dict["params"]
+        opt_state = state_dict["opt_state"]
+
         load_itr = state_dict["itr"]
     else:
         init_params = model["params"]
-        load_itr = 0
+        opt_state = opt_init(init_params)
 
-    opt_state = opt_init(init_params)
+        load_itr = 0
 
     @jax.jit
     def update(_itr, _opt_state, _key, _batch):
@@ -610,7 +611,7 @@ def run():
 
             if itr % parse_args.ckpt_freq == 0:
                 state_dict = {
-                    "params": get_params(opt_state),
+                    "opt_state": opt_state,
                     "itr": itr,
                 }
                 outfile = open(parse_args.ckpt_path, 'wb')
