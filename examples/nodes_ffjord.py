@@ -291,9 +291,9 @@ def init_model():
         dy, dp = ffjord_dynamics((y, p), t, eps, params)
         dr = reg_dynamics(y, t, params)
         return dy, dp, dr
-    nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
-                                                            aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    # nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    # nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+    #                                                         aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
     nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
 
     def ode_aux(params, y, delta_logp, eps):
