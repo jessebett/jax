@@ -35,6 +35,25 @@ import jax.scipy.stats.norm as norm
 from data import gen_pinwheel
 from plot_utils import mesh_eval
 
+import argparse
+import collections
+import os
+import pickle
+import sys
+
+parser = argparse.ArgumentParser('Jet Regularized FFJORD')
+parser.add_argument('--nepochs', type=int, default=500)
+parser.add_argument('--lr', type=float, default=1e-2)
+parser.add_argument('--lam', type=float, default=0)
+parser.add_argument('--atol', type=float, default=1e-4)
+parser.add_argument('--rtol', type=float, default=1e-3)
+parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
+parser.add_argument('--plot_freq', type=int, default=0)
+parser.add_argument('--log_freq', type=int, default=1)
+parser.add_argument('--dirname', type=str, default='tmp')
+
+parsed_args = parser.parse_args()
+
 # ========= Functions to define a neural network. =========
 
 def init_random_params(scale, layer_sizes, rng=random.PRNGKey(0)):
@@ -164,10 +183,9 @@ def batch_likelihood_and_nfe(params, data, rng):
     batch_log_x, nfe = batch_density_and_nfe(params, data, D, rngs)
     return np.mean(batch_log_x), np.mean(nfe)
 
-# ========= Define an intractable unnormalized density =========
+# ========= Main Loop =========
 
-if __name__ == "__main__":
-
+def main(args):
     data, _ = gen_pinwheel(num_classes=3)
     D = data.shape[1]
 
@@ -205,12 +223,36 @@ if __name__ == "__main__":
         _vffjord = lambda p : batch_density(p,data,D,rngs)
         check_grads(_vffjord, (params,), 1, modes=["rev"])
 
-    def callback(params, t):
-        print("Iteration {} log-likelihood: {}".format(t, objective_and_nfe(params, t)))
-        print("Iteration {} reg-objective: {}".format(t, -reg_objective(params, t)))
-        # print("testing grads")
-        # test_grads()
+    def log_callback(params, t):
+        b_log_x_, nfe_ = objective_and_nfe(params,t)
+        reg_b_log_x_   = reg_objective(params,t)
 
+        print_str = 'Iter {:04d} | LL {:.6f} | ' \
+                    'Reg_LL {:.6f} | NFE {:.6f}'.format(t, -b_log_x_, reg_b_log_x_, nfe_)
+        print(print_str)
+
+
+        reg = parsed_args.reg
+        lam = parsed_args.lam
+        dirname = parsed_args.dirname
+
+        outfile = open("%s/reg_%s_lam_%.18e_info.txt" % (dirname, reg, lam), "a")
+        outfile.write(print_str + "\n")
+        outfile.close()
+
+        info[t]["ll"] = -b_log_x_
+        info[t]["ll_reg"] = -reg_b_log_x_
+        info[t]["nfe"] = nfe_
+
+        meta = {
+            "info": info,
+            "args": parsed_args
+        }
+        outfile = open("%s/reg_%s_lam_%.18e_meta.pickle" % (dirname, reg, lam), "wb")
+        pickle.dump(meta, outfile)
+        outfile.close()
+
+    def plot_callback(params,t):
         ffjord_dist = lambda x, params: np.exp(ffjord_log_density(params, x, D, rng))
 
         plt.cla()
@@ -238,10 +280,20 @@ if __name__ == "__main__":
         gradient = grad(reg_objective)(params, i)
         return opt_update(i, gradient, opt_state)
 
-    # Main loop.
-    print("Optimizing...")
-    for t in range(10000):
+    # train loop
+    print("Optimizing for {} epochs".format(parsed_args.nepochs))
+    info = collections.defaultdict(dict)
+    for t in range(args.nepochs):
         opt_state = update(t, opt_state)
         params = get_params(opt_state)
-        if t % 2 == 1: callback(params, t)
+        # Logging
+        if t % parsed_args.log_freq == 0: log_callback(params, t)
+        # Plotting
+        if parsed_args.plot_freq>0:
+            if t % parsed_args.plot_freq == 0: callback(params, t)
     plt.show(block=True)
+    #TODO: end plot
+
+
+if __name__ == "__main__":
+    main(parsed_args)
