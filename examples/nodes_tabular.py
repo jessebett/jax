@@ -386,7 +386,8 @@ def init_data():
     data = datasets.MINIBOONE()
 
     num_train = data.trn.N
-    num_test = data.tst.N
+    num_test = data.trn.N
+    # num_test = data.tst.N
 
     data.trn.x = jnp.float64(data.trn.x)
     data.tst.x = jnp.float64(data.tst.x)
@@ -419,7 +420,7 @@ def init_data():
         while True:
             for i in range(num_test_batches):
                 batch_inds = inds[i * parse_args.test_batch_size: min((i + 1) * parse_args.test_batch_size, num_test)]
-                yield data.tst.x[batch_inds]
+                yield data.trn.x[batch_inds]
 
     ds_train = gen_train_data()
     ds_test = gen_test_data()
