@@ -27,6 +27,7 @@ parser.add_argument('--batch_size', type=int, default=1000)
 parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--nepochs', type=int, default=500)  # TODO: just a guess
 parser.add_argument('--lr', type=float, default=1e-3)
+parser.add_argument('--early_stopping', type=int, default=30)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=1e-6)
 parser.add_argument('--atol', type=float, default=1.4e-8)  # 1e-8 (original values)
@@ -386,8 +387,8 @@ def init_data():
     data = datasets.MINIBOONE()
 
     num_train = data.trn.N
-    num_test = data.trn.N
-    # num_test = data.tst.N
+    # num_test = data.trn.N
+    num_test = data.tst.N
 
     data.trn.x = jnp.float64(data.trn.x)
     data.tst.x = jnp.float64(data.tst.x)
@@ -420,7 +421,7 @@ def init_data():
         while True:
             for i in range(num_test_batches):
                 batch_inds = inds[i * parse_args.test_batch_size: min((i + 1) * parse_args.test_batch_size, num_test)]
-                yield data.trn.x[batch_inds]
+                yield data.tst.x[batch_inds]
 
     ds_train = gen_train_data()
     ds_test = gen_test_data()
@@ -449,7 +450,26 @@ def run():
     num_batches = meta["num_batches"]
     num_test_batches = meta["num_test_batches"]
 
-    opt_init, opt_update, get_params = optimizers.adam(step_size=parse_args.lr)
+    lr_schedule = optimizers.piecewise_constant(boundaries=[2000, 8000],
+                                                values=[1e-3, 1e-4, 1e-5])
+    opt_init, opt_update, get_params = optimizers.adam(step_size=lr_schedule)
+
+    # def lr_schedule(i, aux_state):
+    #     """
+    #     Learning rate schedule using auxiliary state from cross-validation.
+    #     """
+    #     ndecs, n_vals_without_improvement = aux_state
+    #     if ndecs == 0 and n_vals_without_improvement > parse_args.early_stopping // 3:
+    #         ndecs = 1
+    #         lr = parse_args.lr / 10
+    #     elif ndecs == 1 and n_vals_without_improvement > parse_args.early_stopping // 3 * 2:
+    #         ndecs = 2
+    #         lr = parse_args.lr / 100
+    #     else:
+    #         lr = parse_args.lr / 10 ** ndecs
+    #     return lr, (ndecs, n_vals_without_improvement)
+    #
+    # opt_init, opt_update, get_params = optimizers.adam_aux(step_size=lr_schedule)
     unravel_opt = ravel_pytree(opt_init(model["params"]))[1]
     if os.path.exists(parse_args.ckpt_path):
         outfile = open(parse_args.ckpt_path, 'rb')
@@ -532,6 +552,8 @@ def run():
                 continue
 
             opt_state = update(itr, opt_state, key, batch)
+
+            # TODO: validation set for lr tuning
 
             if itr % parse_args.test_freq == 0:
                 loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, key, ds_test_eval)

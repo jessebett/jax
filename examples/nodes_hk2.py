@@ -498,21 +498,22 @@ def init_data():
     """
     Initialize data.
     """
-    (ds_train,), ds_info = tfds.load('mnist',
-                                     split=['train'],
+    (ds_train, ds_test), ds_info = tfds.load('mnist',
+                                     split=['train', 'test'],
                                      shuffle_files=True,
                                      as_supervised=True,
                                      with_info=True,
                                      read_config=tfds.ReadConfig(shuffle_seed=parse_args.seed))
 
     num_train = ds_info.splits['train'].num_examples
+    num_test = ds_info.splits['test'].num_examples
 
     assert num_train % parse_args.batch_size == 0
     num_batches = num_train // parse_args.batch_size
 
     test_batch_size = parse_args.test_batch_size if odenet else 10000
-    assert num_train % test_batch_size == 0
-    num_test_batches = num_train // test_batch_size
+    assert num_test % test_batch_size == 0
+    num_test_batches = num_test // test_batch_size
 
     # make sure we always save the model on the last iteration
     assert num_batches * parse_args.nepochs % parse_args.save_freq == 0
@@ -520,8 +521,12 @@ def init_data():
     ds_train = ds_train.cache()
     ds_train = ds_train.repeat()
     ds_train = ds_train.shuffle(1000, seed=seed)
-    ds_train, ds_train_eval = ds_train.batch(parse_args.batch_size), ds_train.batch(test_batch_size)
-    ds_train, ds_train_eval = tfds.as_numpy(ds_train), tfds.as_numpy(ds_train_eval)
+    ds_train = ds_train.batch(parse_args.batch_size)
+    ds_train = tfds.as_numpy(ds_train)
+    ds_train_eval = ds_test.batch(test_batch_size).repeat()
+    ds_train_eval = tfds.as_numpy(ds_train_eval)
+    # ds_train, ds_train_eval = ds_train.batch(parse_args.batch_size), ds_train.batch(test_batch_size)
+    # ds_train, ds_train_eval = tfds.as_numpy(ds_train), tfds.as_numpy(ds_train_eval)
 
     meta = {
         "num_batches": num_batches,

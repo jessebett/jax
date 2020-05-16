@@ -13,7 +13,9 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as onp
 
-from nodes_hk2 import init_model, init_data, _reg_loss_fn
+import jax.numpy as jnp
+
+from nodes_hk2 import init_model, init_data, _reg_loss_fn, _loss_fn
 
 # TODO: set this to absolute path
 dirname = "2020-05-02-22-08-30"
@@ -22,6 +24,7 @@ num_blocks = 0
 
 forward, model = init_model()
 forward = jax.jit(forward)
+_loss_fn = jax.jit(_loss_fn)
 _, ds_train_eval, meta = init_data()
 num_test_batches = meta["num_test_batches"]
 
@@ -36,6 +39,29 @@ def parse_lam(filename):
 lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (dirname, reg))))
 
 
+def sanity_check(lam):
+    """
+    Sanity check that test and train loss are diff.
+    """
+    meta_file = open("%s/reg_%s_lam_%.18e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
+    meta = pickle.load(meta_file)
+
+    itr = 96000
+    nfe_test_filename = "%s/reg_test_%s_lam_%.12e_%d_nfe.pickle" % (dirname, reg, lam, itr)
+    nfe_test_file = open(nfe_test_filename, "rb")
+    nfe_test = pickle.load(nfe_test_file)
+    nfe_test_file.close()
+
+    nfe_filename = "%s/reg_%s_lam_%.12e_%d_nfe.pickle" % (dirname, reg, lam, itr)
+    nfe_file = open(nfe_filename, "rb")
+    nfe = pickle.load(nfe_file)
+    nfe_file.close()
+
+    print()
+
+    return nfe, loss
+
+
 def get_info(lam):
     """
     Get (final NFE, final loss) pair for a given lambda.
@@ -44,7 +70,8 @@ def get_info(lam):
     meta = pickle.load(meta_file)
 
     itr = 96000
-    nfe_filename = "%s/reg_%s_lam_%.12e_%d_nfe.pickle" % (dirname, reg, lam, itr)
+    # TODO: train or test
+    nfe_filename = "%s/reg_test_%s_lam_%.12e_%d_nfe.pickle" % (dirname, reg, lam, itr)
     try:
         nfe_file = open(nfe_filename, "rb")
         nfe = pickle.load(nfe_file)
@@ -53,6 +80,7 @@ def get_info(lam):
         print("Calculating NFE for %.4e" % lam)
         param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
         params = pickle.load(param_file)
+        # TODO:  make this is jnp array of fixed size?
         nfes = []
         # nfe = 0
         for test_batch_num in range(num_test_batches):
@@ -70,10 +98,15 @@ def get_info(lam):
     nfe = nfe
     # reg_val = meta["info"][itr]["loss_reg"]
     reg_val = meta["info"][itr]["loss_reg"]
-    loss = meta["info"][itr]["loss"]
+    # TODO: train or test
+    # loss = meta["info"][itr]["loss"]
+    test_loss_filename = "%s/test_loss_%s_lam_%.18e.pickle" % (dirname, reg, lam)
+    test_loss_file = open(test_loss_filename, "rb")
+    test_loss = pickle.load(test_loss_file)
+    test_loss_file.close()
 
     meta_file.close()
-    return nfe, reg_val
+    return nfe, test_loss
 
 
 def pareto_plot_nfe():
@@ -113,10 +146,10 @@ def pareto_plot_nfe():
                 pareto_front.append(pair)
     pf_X = [pair[0] for pair in pareto_front]
     pf_Y = [pair[1] for pair in pareto_front]
-    # ax.plot(pf_X, pf_Y, c='0.35')
+    ax.plot(pf_X, pf_Y, c='0.35')
 
     ax.set_xlabel("Average Number of Function Evaluations")
-    ax.set_ylabel("Mean Regularization")
+    ax.set_ylabel("Unregularized Test Loss")
 
     norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
     cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
@@ -125,8 +158,8 @@ def pareto_plot_nfe():
     plt.gcf().subplots_adjust(right=0.88, left=0.13)
     # plt.gcf().subplots_adjust(right=0.88)
 
-    plt.savefig("%s/nfe_reg_%s_pareto.pdf" % (dirname, reg))
-    plt.savefig("%s/nfe_reg_%s_pareto.png" % (dirname, reg))
+    plt.savefig("%s/loss_nfe_test_%s_pareto.pdf" % (dirname, reg))
+    plt.savefig("%s/loss_nfe_test_%s_pareto.png" % (dirname, reg))
     plt.clf()
     plt.close(fig)
 
@@ -270,6 +303,37 @@ def get_r(lam, reg_order):
     return regs
 
 
+def get_test_loss(lam):
+    """
+    Get regularization of a particular order.
+    """
+    test_loss_filename = "%s/test_loss_%s_lam_%.18e.pickle" % (dirname, reg, lam)
+    try:
+        # print("Loading test loss %.18e" % lam)
+        test_loss_file = open(test_loss_filename, "rb")
+        test_loss = pickle.load(test_loss_file)
+        test_loss_file.close()
+    except IOError:
+        print("Calculating test loss %.18e" % lam)
+
+        itr = 96000
+        param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+        params = pickle.load(param_file)
+        losses = onp.zeros(num_test_batches)
+        for test_batch_num in range(num_test_batches):
+            print(test_batch_num)
+            test_batch = next(ds_train_eval)
+            images, labels = test_batch
+            logits, regs = forward(params, images)
+            loss_ = _loss_fn(logits, labels)
+            losses[test_batch_num] = loss_
+        test_loss = onp.mean(losses)
+        test_loss_file = open(test_loss_filename, "wb")
+        pickle.dump(test_loss, test_loss_file)
+        test_loss_file.close()
+    return test_loss
+
+
 def pareto_nfe_r():
     """
     Pareto of NFE against different orders of regularization.
@@ -410,6 +474,9 @@ def r_over_training():
 
 
 if __name__ == "__main__":
+    # for ind, lam in enumerate(lams):
+    #     print(ind, len(lams))
+    #     get_test_loss(lam)
     # parser = argparse.ArgumentParser('Neural ODE')
     # parser.add_argument('--lam', type=float, default=0)
     # parse_args = parser.parse_args()
