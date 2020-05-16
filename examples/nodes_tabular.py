@@ -78,6 +78,7 @@ softplus = lambda x: jnp.where(x >= 0,
                                x + jnp.log1p(jnp.exp(-x)),
                                jnp.log1p(jnp.exp(x)))
 
+
 def sigmoid(z):
   """
   Numerically stable sigmoid.
@@ -388,9 +389,10 @@ def init_data():
 
     num_train = data.trn.N
     # num_test = data.trn.N
-    num_test = data.tst.N
+    num_test = data.val.N
 
     data.trn.x = jnp.float64(data.trn.x)
+    data.val.x = jnp.float64(data.val.x)
     data.tst.x = jnp.float64(data.tst.x)
 
     num_batches = num_train // parse_args.batch_size + 1 * (num_train % parse_args.batch_size != 0)
@@ -413,6 +415,16 @@ def init_data():
                 batch_inds = epoch_inds[i * parse_args.batch_size: min((i + 1) * parse_args.batch_size, num_train)]
                 yield data.trn.x[batch_inds]
 
+    def gen_val_data():
+        """
+        Generator for train data.
+        """
+        inds = jnp.arange(num_test)
+        while True:
+            for i in range(num_test_batches):
+                batch_inds = inds[i * parse_args.test_batch_size: min((i + 1) * parse_args.test_batch_size, num_test)]
+                yield data.val.x[batch_inds]
+
     def gen_test_data():
         """
         Generator for train data.
@@ -424,7 +436,7 @@ def init_data():
                 yield data.tst.x[batch_inds]
 
     ds_train = gen_train_data()
-    ds_test = gen_test_data()
+    ds_test = gen_val_data()
 
     meta = {
         "dims": data.n_dims,
@@ -450,9 +462,10 @@ def run():
     num_batches = meta["num_batches"]
     num_test_batches = meta["num_test_batches"]
 
+    # TODO: tune this manually, put it on epoch boundaries
     lr_schedule = optimizers.piecewise_constant(boundaries=[2000, 8000],
                                                 values=[1e-3, 1e-4, 1e-5])
-    opt_init, opt_update, get_params = optimizers.adam(step_size=lr_schedule)
+    opt_init, opt_update, get_params = optimizers.adam(step_size=1e-3)
 
     # def lr_schedule(i, aux_state):
     #     """
