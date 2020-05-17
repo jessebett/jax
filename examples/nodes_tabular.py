@@ -6,13 +6,14 @@ import collections
 import os
 import pickle
 import sys
+import time
 
 import datasets
 
 import haiku as hk
 
 import jax
-from jax import lax
+from jax.tree_util import tree_flatten
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
@@ -25,7 +26,7 @@ config.update("jax_enable_x64", True)
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=1000)
 parser.add_argument('--test_batch_size', type=int, default=1000)
-parser.add_argument('--nepochs', type=int, default=500)  # TODO: just a guess
+parser.add_argument('--nepochs', type=int, default=500)
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--early_stopping', type=int, default=30)
 parser.add_argument('--lam', type=float, default=0)
@@ -41,7 +42,7 @@ parser.add_argument('--save_freq', type=int, default=300)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--no_count_nfe', action="store_true")
-parser.add_argument('--ckpt_freq', type=int, default=100)
+parser.add_argument('--ckpt_freq', type=int, default=60)  # divide test and save, and be divisible by num_batches
 parser.add_argument('--ckpt_path', type=str, default="./ck.pt")
 parser.add_argument('--num_layers', type=int, default=2)
 parser.add_argument('--hdim_factor', type=int, default=20)
@@ -93,7 +94,7 @@ def sol_recursive(f, z, t):
   """
   Recursively compute higher order derivatives of dynamics of ODE.
   """
-  # TODO: numerically zero? wtf??
+  # TODO: numerically zero? wtf?? (perhaps this only with buggy finlay trick)
   z_shape = z.shape
   z_t = jnp.concatenate((jnp.ravel(z), jnp.array([t])))
 
@@ -462,27 +463,10 @@ def run():
     num_batches = meta["num_batches"]
     num_test_batches = meta["num_test_batches"]
 
-    # TODO: tune this manually, put it on epoch boundaries
-    lr_schedule = optimizers.piecewise_constant(boundaries=[2000, 8000],
+    lr_schedule = optimizers.piecewise_constant(boundaries=[9000, 12750],  # 300 epochs, 425 epochs
                                                 values=[1e-3, 1e-4, 1e-5])
-    opt_init, opt_update, get_params = optimizers.adam(step_size=1e-3)
+    opt_init, opt_update, get_params = optimizers.adam(step_size=lr_schedule)
 
-    # def lr_schedule(i, aux_state):
-    #     """
-    #     Learning rate schedule using auxiliary state from cross-validation.
-    #     """
-    #     ndecs, n_vals_without_improvement = aux_state
-    #     if ndecs == 0 and n_vals_without_improvement > parse_args.early_stopping // 3:
-    #         ndecs = 1
-    #         lr = parse_args.lr / 10
-    #     elif ndecs == 1 and n_vals_without_improvement > parse_args.early_stopping // 3 * 2:
-    #         ndecs = 2
-    #         lr = parse_args.lr / 100
-    #     else:
-    #         lr = parse_args.lr / 10 ** ndecs
-    #     return lr, (ndecs, n_vals_without_improvement)
-    #
-    # opt_init, opt_update, get_params = optimizers.adam_aux(step_size=lr_schedule)
     unravel_opt = ravel_pytree(opt_init(model["params"]))[1]
     if os.path.exists(parse_args.ckpt_path):
         outfile = open(parse_args.ckpt_path, 'rb')
@@ -564,9 +548,14 @@ def run():
             if itr <= load_itr:
                 continue
 
+            update_start = time.time()
             opt_state = update(itr, opt_state, key, batch)
-
-            # TODO: validation set for lr tuning
+            tree_flatten(opt_state)[0][0].block_until_ready()
+            update_end = time.time()
+            time_str = "%d %.18f %d\n" % (itr, update_end - update_start, load_itr)
+            outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_time.txt" % (dirname, reg, lam, num_blocks), "a")
+            outfile.write(time_str)
+            outfile.close()
 
             if itr % parse_args.test_freq == 0:
                 loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, key, ds_test_eval)
