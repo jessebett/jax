@@ -8,8 +8,6 @@ import pickle
 import sys
 import time
 
-import datasets
-
 import haiku as hk
 
 import jax
@@ -22,6 +20,8 @@ from jax.experimental.jet import jet
 
 from jax.config import config
 config.update("jax_enable_x64", True)
+
+import datasets
 
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=1000)
@@ -250,9 +250,9 @@ def init_model(n_dims):
         dy, dp = ffjord_dynamics((y, p), t, eps, params)
         dr = reg_dynamics(y, t, params)
         return dy, dp, dr
-    # nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
-    #                                                         aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+                                                            aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    # nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
     nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
 
     def ode_aux(params, y, delta_logp, eps):
