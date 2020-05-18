@@ -308,7 +308,7 @@ def init_model(n_dims):
         """
         eps = get_epsilon(key, _x.shape)
 
-        z, delta_logp, regs = ode_aux(params["ode"], *aug_init(_x)[:-1], eps)
+        z, delta_logp, regs = ode(params["ode"], *aug_init(_x)[:-1], eps)
 
         return z, delta_logp, regs
 
