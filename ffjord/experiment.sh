@@ -5,7 +5,7 @@
 
 d=$(date "+%F-%H-%M-%S")
 partition=$1
-j_name=$2
+j_name=$2 # job name
 file=$3
 args=$4 # specify reg and lam
 q=$5  # TODO: high, deadline (need account), normal
@@ -33,10 +33,10 @@ bash ${j_dir}/scripts/${j_name}.sh
 # build bash script
 # TODO: input and output
 echo -n "#!/bin/bash
-. /h/jkelly/new_jet_nodes.env
-ln -s /checkpoint/$USER/\$SLURM_JOB_ID ${j_dir}/\$SLURM_JOB_ID
+. /h/jessebett/.envs/jaxjet/jaxjet.env
 touch ${j_dir}/\$SLURM_JOB_ID/DELAYPURGE
-python $file $args --seed=0 --dirname=${j_dir} --ckpt_path=${j_dir}/\$SLURM_JOB_ID/ck.pt
+python $file $args --seed=0 --dirname=${j_dir}
 " > $j_dir/scripts/${j_name}.sh
 cp $file $j_dir/scripts/
-sbatch $j_dir/scripts/${j_name}.slrm --qos $q --account deadline
+sbatch $j_dir/scripts/${j_name}.slrm --qos $q
+# sbatch $j_dir/scripts/${j_name}.slrm --qos $q --account deadline

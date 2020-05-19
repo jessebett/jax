@@ -43,7 +43,7 @@ import sys
 
 parser = argparse.ArgumentParser('Jet Regularized FFJORD')
 parser.add_argument('--nepochs', type=int, default=500)
-parser.add_argument('--lr', type=float, default=1e-2)
+parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--atol', type=float, default=1e-4)
 parser.add_argument('--rtol', type=float, default=1e-3)
@@ -51,6 +51,7 @@ parser.add_argument('--reg', type=str, choices=['none', 'r3'], default='none')
 parser.add_argument('--plot_freq', type=int, default=0)
 parser.add_argument('--log_freq', type=int, default=1)
 parser.add_argument('--dirname', type=str, default='tmp')
+parser.add_argument('--seed', type=int, default=0)
 
 parsed_args = parser.parse_args()
 
@@ -140,7 +141,7 @@ def reg_dynamics(reg_aug_state, t, eps, params):
     return np.hstack([dz_dt, r3])
 
 
-def reg_log_density(params,x,D,rng, lam = 0):
+def reg_log_density(params,x,D,rng, lam = parsed_args.lam):
     init_ffjord_state = np.hstack([x, 0.])
     init_reg_state = 0.
     init_aug_reg_state = np.hstack([init_ffjord_state,init_reg_state])
@@ -271,7 +272,7 @@ def main(args):
 
     # Set up optimizer.
     init_params = init_random_params(0.1, [D + 1, 50, 100, D], rng)
-    opt_init, opt_update, get_params = optimizers.adam(step_size=0.01)
+    opt_init, opt_update, get_params = optimizers.adam(step_size=parsed_args.lr)
     opt_state = opt_init(init_params)
 
     @jit
@@ -291,7 +292,6 @@ def main(args):
         # Plotting
         if parsed_args.plot_freq>0:
             if t % parsed_args.plot_freq == 0: callback(params, t)
-    plt.show(block=True)
     #TODO: end plot
 
 
