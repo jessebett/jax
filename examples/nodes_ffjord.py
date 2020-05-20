@@ -6,12 +6,13 @@ import collections
 import os
 import pickle
 import sys
+import time
 
 import haiku as hk
 import tensorflow_datasets as tfds
 
 import jax
-from jax import lax
+from jax.tree_util import tree_flatten
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
@@ -26,26 +27,26 @@ config.update("jax_enable_x64", True)
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=200)
 parser.add_argument('--test_batch_size', type=int, default=200)
-parser.add_argument('--nepochs', type=int, default=500)
+parser.add_argument('--nepochs', type=int, default=1)  # TODO: should be 100, just for testing!
 parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--warmup_itrs', type=float, default=1e3)
-parser.add_argument("--max_grad_norm", type=float, default=1e10)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=0)
-parser.add_argument('--atol', type=float, default=1e-1)
-parser.add_argument('--rtol', type=float, default=1e-1)
+parser.add_argument('--atol', type=float, default=1e-6)
+parser.add_argument('--rtol', type=float, default=1e-6)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4'], default='none')
-parser.add_argument('--test_freq', type=int, default=15000)
-parser.add_argument('--save_freq', type=int, default=15000)
+parser.add_argument('--test_freq', type=int, default=300)
+parser.add_argument('--save_freq', type=int, default=300)
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--no_count_nfe', action="store_true")
-parser.add_argument('--ckpt_freq', type=int, default=600)  # 1 itr/sec, 6 epochs/10mins
+parser.add_argument('--ckpt_freq', type=int, default=300)  # divide test and save, divisible by num_batches
 parser.add_argument('--ckpt_path', type=str, default="./ck.pt")
 parse_args = parser.parse_args()
+
+# TODO: set env vars for memory stuff
 
 
 assert os.path.exists(parse_args.dirname)
@@ -483,17 +484,7 @@ def run():
     num_batches = meta["num_batches"]
     num_test_batches = meta["num_test_batches"]
 
-    def lr_schedule(itr):
-        """
-        Learning rate schedule.
-        Slowly warm-up with a small learning rate.
-        """
-        iter_frac = lax.min((itr.astype(jnp.float64) + 1.) / lax.max(parse_args.warmup_itrs, 1.), 1.)
-        _epoch = itr // num_batches
-        id = lambda x: x
-        return lax.cond(_epoch < 250, parse_args.lr * iter_frac, id, 1e-4, id)
-
-    opt_init, opt_update, get_params = optimizers.adam(step_size=lr_schedule)
+    opt_init, opt_update, get_params = optimizers.adam(step_size=1e-3)
     unravel_opt = ravel_pytree(opt_init(model["params"]))[1]
     if os.path.exists(parse_args.ckpt_path):
         outfile = open(parse_args.ckpt_path, 'rb')
@@ -514,9 +505,7 @@ def run():
         """
         Update the params based on grad for current batch.
         """
-        grad_ = jax.experimental.optimizers.clip_grads(grad_fn(get_params(_opt_state), _batch, _key),
-                                                       parse_args.max_grad_norm)
-        return opt_update(_itr, grad_, _opt_state)
+        return opt_update(_itr, grad_fn(get_params(_opt_state), _batch, _key), _opt_state)
 
     @jax.jit
     def sep_losses(_opt_state, _batch, _key):
@@ -580,7 +569,14 @@ def run():
             if itr <= load_itr:
                 continue
 
+            update_start = time.time()
             opt_state = update(itr, opt_state, key, batch)
+            tree_flatten(opt_state)[0][0].block_until_ready()
+            update_end = time.time()
+            time_str = "%d %.18f %d\n" % (itr, update_end - update_start, load_itr)
+            outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_time.txt" % (dirname, reg, lam, num_blocks), "a")
+            outfile.write(time_str)
+            outfile.close()
 
             if itr % parse_args.test_freq == 0:
                 loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, key, ds_test_eval)
