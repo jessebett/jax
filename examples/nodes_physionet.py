@@ -17,7 +17,7 @@ from jax import lax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint
+from jax.experimental.ode import odeint, ravel_first_arg
 from jax.experimental.jet import jet
 
 
@@ -61,7 +61,7 @@ rng = jax.random.PRNGKey(seed)
 dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
-vmap = False if parse_args.no_vmap is True else True
+vmap = False if parse_args.no_vmap is True else True  # note: this does nothing, we always vmap!!
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
@@ -347,12 +347,13 @@ def init_model(rec_ode_kwargs,
         "gen_to_data": gen_to_data_params
     }
 
-    def forward(count_nfe_, params, data, data_timesteps, timesteps, mask, num_samples=3):
+    def forward(count_nfe_, _method, params, data, data_timesteps, timesteps, mask, num_samples=3):
         """
         Forward pass of the model.
         y are the latent variables of the recognition model
         z are the latent variables of the generative model
         """
+
         data_mask = jnp.concatenate((data, mask), axis=-1)
 
         # ode-rnn encoder
@@ -384,9 +385,18 @@ def init_model(rec_ode_kwargs,
             else:
                 dynamics = augment_dynamics(gen_dynamics_wrap)
                 init_fn = aug_init
-            return jax.vmap(lambda z_, t_: odeint(dynamics, init_fn(z_), t_,
-                                                  params["gen_dynamics"], **gen_ode_kwargs),
-                            in_axes=(0, None))(z0_, timesteps)
+            rtol = gen_ode_kwargs["rtol"]
+            atol = gen_ode_kwargs["atol"]
+            mxstep = jnp.inf
+            def _ode(z_, t_):
+                z_ = init_fn(z_)
+                z_, unravel = ravel_pytree(z_)
+                func = ravel_first_arg(dynamics, unravel)
+                return _method(func, rtol, atol, mxstep, z_, t_, params["gen_dynamics"])
+            return jax.vmap(_ode, in_axes=(0, None))(z0_, timesteps)
+            # return jax.vmap(lambda z_, t_: odeint(dynamics, init_fn(z_), t_,
+            #                                       params["gen_dynamics"], **gen_ode_kwargs),
+            #                 in_axes=(0, None))(z0_, timesteps)
         z_r, gen_nfes = jax.vmap(integrate_sample)(z0)
         if count_nfe_:
             z, gen_r = z_r, 0.
@@ -468,8 +478,9 @@ def init_model(rec_ode_kwargs,
     model = {
         "forward": partial(forward, False),
         "params": init_params,
-        "nfe": lambda params, data, data_timesteps, timesteps, mask:
-        partial(forward, count_nfe)(params, data, data_timesteps, timesteps, mask)[-1]
+        "nfe": lambda *args: partial(forward, count_nfe)(*args)[-1]
+        # "nfe": lambda params, data, data_timesteps, timesteps, mask:
+        # partial(forward, count_nfe)(params, data, data_timesteps, timesteps, mask)[-1]
     }
 
     return model
