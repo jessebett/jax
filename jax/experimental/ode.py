@@ -39,8 +39,6 @@ from jax import linear_util as lu
 map = safe_map
 zip = safe_zip
 
-_ADAMS_MAX_ORDER = 12
-
 
 def ravel_first_arg(f, unravel):
   return ravel_first_arg_(lu.wrap_init(f), unravel).call_wrapped
@@ -168,11 +166,11 @@ def odeint(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=jnp.inf):
 def _odeint_wrapper(func, rtol, atol, mxstep, y0, ts, *args):
   y0, unravel = ravel_pytree(y0)
   func = ravel_first_arg(func, unravel)
-  out, nfe = _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args)
-  return jax.vmap(unravel)(out), nfe
+  out = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
+  return jax.vmap(unravel)(out)
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
-def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
+def _odeint(func, rtol, atol, mxstep, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
 
   def scan_fun(carry, target_t):
@@ -193,10 +191,8 @@ def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
       old = [i + 1,      y,      f,      t, dt, last_t,     interp_coeff]
       return map(partial(jnp.where, jnp.all(error_ratios <= 1.)), new, old)
 
-    nfe = carry[-1]
-    n_steps, *carry_ = lax.while_loop(cond_fun, body_fun, [0] + carry[:-1])
-    carry = carry_ + [nfe + 6 * n_steps]
-    _, _, t, _, last_t, interp_coeff = carry[:-1]
+    _, *carry = lax.while_loop(cond_fun, body_fun, [0] + carry)
+    _, _, t, _, last_t, interp_coeff = carry
     relative_output_time = (target_t - last_t) / (t - last_t)
     y_target = jnp.polyval(interp_coeff, relative_output_time)
     return carry, y_target
@@ -208,3 +204,44 @@ def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   _, ys = lax.scan(scan_fun, init_carry, ts[1:])
   return jnp.concatenate((y0[None], ys))
 
+def _odeint_fwd(func, rtol, atol, mxstep, y0, ts, *args):
+  ys = _odeint(func, rtol, atol, mxstep, y0, ts, *args)
+  return ys, (ys, ts, args)
+
+def _odeint_rev(func, rtol, atol, mxstep, res, g):
+  ys, ts, args = res
+
+  def aug_dynamics(augmented_state, t, *args):
+    """Original system augmented with vjp_y, vjp_t and vjp_args."""
+    y, y_bar, *_ = augmented_state
+    # `t` here is negatice time, so we need to negate again to get back to
+    # normal time. See the `odeint` invocation in `scan_fun` below.
+    y_dot, vjpfun = jax.vjp(func, y, -t, *args)
+    return (-y_dot, *vjpfun(y_bar))
+
+  y_bar = g[-1]
+  ts_bar = []
+  t0_bar = 0.
+
+  def scan_fun(carry, i):
+    y_bar, t0_bar, args_bar = carry
+    # Compute effect of moving measurement time
+    t_bar = jnp.dot(func(ys[i], ts[i], *args), g[i])
+    t0_bar = t0_bar - t_bar
+    # Run augmented system backwards to previous observation
+    _, y_bar, t0_bar, args_bar = odeint(
+        aug_dynamics, (ys[i], y_bar, t0_bar, args_bar),
+        jnp.array([-ts[i], -ts[i - 1]]),
+        *args, rtol=rtol, atol=atol, mxstep=mxstep)
+    y_bar, t0_bar, args_bar = tree_map(op.itemgetter(1), (y_bar, t0_bar, args_bar))
+    # Add gradient from current output
+    y_bar = y_bar + g[i - 1]
+    return (y_bar, t0_bar, args_bar), t_bar
+
+  init_carry = (g[-1], 0., tree_map(jnp.zeros_like, args))
+  (y_bar, t0_bar, args_bar), rev_ts_bar = lax.scan(
+      scan_fun, init_carry, jnp.arange(len(ts) - 1, 0, -1))
+  ts_bar = jnp.concatenate([jnp.array([t0_bar]), rev_ts_bar[::-1]])
+  return (y_bar, ts_bar, *args_bar)
+
+_odeint.defvjp(_odeint_fwd, _odeint_rev)
