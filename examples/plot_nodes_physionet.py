@@ -17,7 +17,7 @@ import numpy as onp
 from nodes_physionet import init_model, _reg_loss_fn
 from timeseries import init_physionet_data
 
-parser = argparse.ArgumentParser('Neural ODE')
+parser = argparse.ArgumentParser('Plot')
 parser.add_argument('--batch_size', type=int, default=50)
 parser.add_argument('--test_batch_size', type=int, default=100)
 parser.add_argument('--nepochs', type=int, default=100)
@@ -29,11 +29,13 @@ parser.add_argument('--method', type=str,
                     choices=["heun", "fehlberg", "bosh", "owrenzen", "dopri"],
                     default="dopri")  # TODO: flag that needs to be set!!
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default='none')
+parser.add_argument('--reg_result', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default='none')
 parser.add_argument('--dirname', type=str, default='tmp')
 parse_args = parser.parse_args()
 
 dirname = parse_args.dirname
 reg = parse_args.reg
+reg_result = parse_args.reg_result
 rng = jax.random.PRNGKey(0)
 num_blocks = 0
 ode_kwargs = {
@@ -48,10 +50,15 @@ methods = {"heun": _heun_odeint,
            "owrenzen": _owrenzen_odeint,
            "dopri": _dopri5_odeint
            }
+num_stages = {"heun": 1,
+              "fehlberg": 2,
+              "bosh": 3,
+              "owrenzen": 5,
+              "dopri": 6}
 
 model = init_model(ode_kwargs, ode_kwargs)
-forward = lambda *args: model["forward"](*args)[1:]
-forward = jax.jit(forward)
+get_reg = lambda *args: partial(model["forward"], reg_result, methods[method])(*args)[3]  # TODO: always uses dopri
+get_reg = jax.jit(get_reg)
 method = parse_args.method
 model["nfe"] = jax.jit(partial(model["nfe"], methods[method]))
 _, ds_train_eval, meta = init_physionet_data(rng, parse_args)
@@ -68,7 +75,7 @@ def parse_lam(filename):
 lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (dirname, reg))))
 
 
-def get_info(reg, dirname, lam):
+def get_info(reg, dirname, method, lam):
     """
     Get (final NFE, final loss) pair for a given lambda.
     """
@@ -76,42 +83,82 @@ def get_info(reg, dirname, lam):
     meta = pickle.load(meta_file)
 
     itr = 12800
-    nfe_filename = "%s/reg_%s_lam_%.12e_%d_%s_nfe.pickle" % (dirname, reg, lam, itr, method)
-    try:
-        nfe_file = open(nfe_filename, "rb")
-        nfe = pickle.load(nfe_file)
-        nfe_file.close()
-    except IOError:
-        print("Calculating NFE for %.4e" % lam)
-        param_file = open("%s/reg_%s_lam_%.12e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
-        params = pickle.load(param_file)
-        nfes = []
-        # nfe = 0
-        for test_batch_num in range(num_test_batches):
-            print(test_batch_num, num_test_batches)
-            test_batch = next(ds_train_eval)
-            # nfe += (model["nfe"](params, *test_batch) - nfe) / (test_batch_num + 1)
-            nfes.append(model["nfe"](params,
-                                     test_batch["observed_data"],
-                                     test_batch["observed_tp"],
-                                     test_batch["tp_to_predict"],
-                                     test_batch["observed_mask"])["gen"])
-        nfe = onp.mean(nfes)
-        nfe_file = open(nfe_filename, "wb")
-        pickle.dump(nfe, nfe_file)
-        nfe_file.close()
+    if method == "dopri":
+        nfe = meta["info"][itr]["gen_nfe"]
+    else:
+        nfe_filename = "%s/reg_%s_lam_%.12e_%d_%s_nfe.pickle" % (dirname, reg, lam, itr, method)
+        try:
+            nfe_file = open(nfe_filename, "rb")
+            nfe = pickle.load(nfe_file)
+            nfe_file.close()
+        except IOError:
+            print("Calculating NFE for %.4e" % lam)
+            param_file = open("%s/reg_%s_lam_%.12e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+            params = pickle.load(param_file)
+            nfes = []
+            # nfe = 0
+            for test_batch_num in range(num_test_batches):
+                print(test_batch_num, num_test_batches)
+                test_batch = next(ds_train_eval)
+                # nfe += (model["nfe"](params, *test_batch) - nfe) / (test_batch_num + 1)
+                nfes.append(model["nfe"](params,
+                                         test_batch["observed_data"],
+                                         test_batch["observed_tp"],
+                                         test_batch["tp_to_predict"],
+                                         test_batch["observed_mask"])["gen"])
+            nfe = onp.mean(nfes)
+            nfe_file = open(nfe_filename, "wb")
+            pickle.dump(nfe, nfe_file)
+            nfe_file.close()
 
     # loss = 1 - meta["info"][itr]["acc"]
     # log-log and log-linear both look good
-    nfe_ = meta["info"][itr]["gen_nfe"]
     # reg_val = meta["info"][itr]["loss_reg"]
     reg_val = meta["info"][itr]["gen_r"]
     # loss = meta["info"][itr]["mse"]
     loss = meta["info"][itr]["loss"]
 
     meta_file.close()
-    print(nfe, nfe_)
-    return nfe, loss
+    # print(nfe, nfe_)
+    return nfe, reg_val
+
+
+def get_info_r(reg, dirname, reg_result, lam):
+    """
+    Get (<reg_result>, <nfe>) pair after training w/ regularization <reg>.
+    """
+    meta_file = open("%s/reg_%s_lam_%.12e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
+    meta = pickle.load(meta_file)
+    meta_file.close()
+
+    itr = 12800
+    if reg_result == reg:
+        reg_val = meta["info"][itr]["gen_r"]
+    else:
+        reg_filename = "%s/reg_%s_lam_%.12e_%d_%s_reg.pickle" % (dirname, reg, lam, itr, reg_result)
+        try:
+            reg_file = open(reg_filename, "rb")
+            reg_val = pickle.load(reg_file)
+            reg_file.close()
+        except IOError:
+            print("Calculating %s for %.4e regularizing %s" % (reg_result, lam, reg))
+            param_file = open("%s/reg_%s_lam_%.12e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+            params = pickle.load(param_file)
+            regs = []
+            for test_batch_num in range(num_test_batches):
+                print(test_batch_num, num_test_batches)
+                test_batch = next(ds_train_eval)
+                regs.append(get_reg(params,
+                                    test_batch["observed_data"],
+                                    test_batch["observed_tp"],
+                                    test_batch["tp_to_predict"],
+                                    test_batch["observed_mask"]))
+            reg_val = onp.mean(regs)
+            reg_file = open(reg_filename, "wb")
+            pickle.dump(reg_val, reg_file)
+            reg_file.close()
+
+    return reg_val, meta["info"][itr]["gen_nfe"]
 
 
 def pareto_plot_nfe():
@@ -154,9 +201,9 @@ def pareto_plot_nfe():
     ax.plot(pf_X, pf_Y, c='0.35')
 
     ax.set_xlabel("Average Number of Function Evaluations")
-    ax.set_ylabel("Mean Squared Error")
+    ax.set_ylabel("Mean Regularization")
 
-    ax.set_ylim(bottom=3e-3, top=3.6e-3)
+    # ax.set_ylim(bottom=3e-3, top=3.6e-3)
 
     norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
     cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
@@ -165,17 +212,76 @@ def pareto_plot_nfe():
     plt.gcf().subplots_adjust(right=0.88, left=0.14)
     # plt.gcf().subplots_adjust(right=0.88)
 
-    plt.savefig("%s/nfe_mse_%s_pareto.pdf" % (dirname, reg))
-    plt.savefig("%s/nfe_mse_%s_pareto.png" % (dirname, reg))
+    plt.savefig("%s/nfe_reg_%s_pareto.pdf" % (dirname, reg))
+    plt.savefig("%s/nfe_reg_%s_pareto.png" % (dirname, reg))
     plt.clf()
     plt.close(fig)
 
+
+def pareto_plot_nfe_method():
+    """
+    Create pareto plot.
+    """
+    cm = plt.get_cmap('viridis')
+
+    font = {'family' : 'normal',
+            'weight' : 'bold',
+            'size'   : 14}
+    plt.rc('font', **font)
+    plt.rc('text', usetex=True)
+    fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
+
+    sorted_lams = sorted(lams)
+    x, y = zip(*map(partial(get_info, reg, dirname), sorted_lams))
+    anno = sorted_lams
+
+    # convert NFE -> num steps
+    x = (onp.array(x) - 2) / num_stages[parse_args.method]
+
+    num_points = len(x)
+    c_spacing = onp.linspace(0, 1, num=num_points)
+    cmap = lambda ind: cm(c_spacing[ind])
+
+    for i in range(num_points):
+        ax.scatter(x[i], y[i], c=cmap(i))
+
+    # plot the pareto front
+    maxY = False
+    sorted_list = sorted([[x[i], y[i]] for i in range(len(x))], reverse=maxY)
+    pareto_front = [sorted_list[0]]
+    for pair in sorted_list[1:]:
+        if maxY:
+            if pair[1] >= pareto_front[-1][1]:
+                pareto_front.append(pair)
+        else:
+            if pair[1] <= pareto_front[-1][1]:
+                pareto_front.append(pair)
+    pf_X = [pair[0] for pair in pareto_front]
+    pf_Y = [pair[1] for pair in pareto_front]
+    ax.plot(pf_X, pf_Y, c='0.35')
+
+    ax.set_xlabel("Average Number of Steps")
+    ax.set_ylabel("Mean Regularization")
+
+    # ax.set_ylim(bottom=3e-3, top=3.6e-3)
+
+    norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
+    cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
+    cb1.set_label(r'Regularization Weight ($\lambda$)')
+
+    plt.gcf().subplots_adjust(right=0.88, left=0.14)
+    # plt.gcf().subplots_adjust(right=0.88)
+
+    plt.savefig("%s/nfe_reg_%s_%s_pareto.pdf" % (dirname, reg, parse_args.method))
+    plt.savefig("%s/nfe_reg_%s_%s_pareto.png" % (dirname, reg, parse_args.method))
+    plt.clf()
+    plt.close(fig)
 
 def pareto_plot_nfe_all_orders():
     """
     Create pareto plot.
     """
-    cm = plt.get_cmap('viridis')
+    cm = plt.get_cmap('copper')
 
     font = {'family' : 'normal',
             'weight' : 'bold',
@@ -194,16 +300,14 @@ def pareto_plot_nfe_all_orders():
     }
 
     regs = ["r2", "r3", "r4", "r5"]
-    regs_opacity = onp.linspace(0.1, 0.9, num=4)
+    num_points = len(regs)
+    c_spacing = onp.linspace(0, 1, num=num_points)
+    cmap = lambda ind: cm(c_spacing[ind])
 
     anno = sorted_lams
 
-    for reg, dir in reg_dirs.items():
+    for i, (reg, dir) in enumerate(reg_dirs.items()):
         x, y = zip(*map(partial(get_info, reg, dir), sorted_lams))
-
-        num_points = len(x)
-        c_spacing = onp.linspace(0, 1, num=num_points)
-        cmap = lambda ind: cm(c_spacing[ind])
 
         # plot the pareto front
         maxY = False
@@ -218,25 +322,62 @@ def pareto_plot_nfe_all_orders():
                     pareto_front.append(pair)
         pf_X = [pair[0] for pair in pareto_front]
         pf_Y = [pair[1] for pair in pareto_front]
-        ax.plot(pf_X, pf_Y, c=str(regs_opacity[regs.index(reg)]))
+        ax.plot(pf_X, pf_Y, c=cmap(i))
 
     ax.set_xlabel("Average Number of Function Evaluations")
     ax.set_ylabel("IWAE Loss")
 
     # ax.set_ylim(bottom=3e-3, top=3.6e-3)
 
-    norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
+    norm = mpl.colors.Normalize(vmin=2, vmax=5)  # other option is LogNorm
     cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
-    cb1.set_label(r'Regularization Weight ($\lambda$)')
+    cb1.set_label(r'Regularization Order ($k$)')
 
     plt.gcf().subplots_adjust(right=0.88, left=0.14)
     # plt.gcf().subplots_adjust(right=0.88)
 
-    plt.savefig("%s/all_nfe_loss_pareto.pdf" % (dirname))
-    plt.savefig("%s/all_nfe_loss_pareto.png" % (dirname))
+    plt.savefig("%s/all_nfe_loss_pareto.pdf" % dirname)
+    plt.savefig("%s/all_nfe_loss_pareto.png" % dirname)
     plt.clf()
     plt.close(fig)
 
+
+def sanity_check_nfe():
+    methods = [("heun", _heun_odeint, 2, 1),
+               ("fehlberg", _fehlberg_odeint, 2, 2),
+               ("bosh", _bosh_odeint, 3, 3),
+               ("owrenzen", _owrenzen_odeint, 4, 5),
+               # ("owrenzen5", _owrenzen5_odeint, 5, 7),
+               ("dopri", _dopri5_odeint, 5, 6)]
+    reg_dirs = {
+        "r2": "2020-05-08-21-53-39",
+        "r3": "2020-05-09-15-38-52",
+        "r4": "2020-05-10-10-14-19",
+        "r5": "2020-05-10-21-22-28"
+    }
+    lam = 1e3
+
+    fig, ax = plt.subplots()
+
+    for method_name, _, order, stages in methods:
+        x = [0, 1]
+        y = [0, 0]
+        for i, (reg, dir) in enumerate(reg_dirs.items()):
+            nfe, _ = get_info(reg, dir, method_name, lam)
+            nsteps = (onp.array(nfe) - 2) / stages
+
+            x.append(i + 2)
+            y.append(nsteps)
+
+        y = onp.array(y)
+        y = onp.concatenate((onp.array([0]), y[1:] - y[:-1]))
+        ax.plot(x, y / sum(y), label="%s%d" % (method_name, order))
+
+    plt.legend()
+    plt.savefig("%s/nfe_sanity.pdf" % dirname)
+    plt.savefig("%s/nfe_sanity.png" % dirname)
+    plt.clf()
+    plt.close(fig)
 
 def get_nfe_dist(lam):
     """
@@ -292,18 +433,6 @@ def histogram_nfe():
         plt.savefig(figname)
         plt.clf()
         plt.close(fig)
-
-
-def get_info_r(lam):
-    """
-    Get (NFE, reg) pairs for a lam.
-    """
-    meta_file = open("%s/reg_%s_lam_%.4e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
-    meta = pickle.load(meta_file)
-    meta_file.close()
-    info = meta["info"]
-
-    return [(onp.log10(info[itr]["loss_reg"]), onp.log10(info[itr]["nfe"])) for itr in info]
 
 
 def nfe_r():
@@ -517,10 +646,13 @@ def r_over_training():
 
 
 if __name__ == "__main__":
-    get_info(reg, dirname, parse_args.lam)
+    get_info_r(reg, dirname, reg_result, parse_args.lam)
+
+    # sanity_check_nfe()
 
     # nfe_r()
     # pareto_plot_nfe()
+    # pareto_plot_nfe_method()
     # pareto_plot_nfe_all_orders()
     # histogram_nfe()
     # pareto_nfe_r()

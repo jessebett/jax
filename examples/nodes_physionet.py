@@ -24,6 +24,8 @@ from jax.experimental.jet import jet
 from jax.config import config
 config.update("jax_enable_x64", True)
 
+REGS = ["r2", "r3", "r4", "r5"]
+
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=50)
 parser.add_argument('--test_batch_size', type=int, default=100)
@@ -37,7 +39,8 @@ parser.add_argument('--rtol', type=float, default=1.4e-8)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
-parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default='none')
+parser.add_argument('--reg', type=str, choices=['none'] + REGS, default='none')
+parser.add_argument('--reg_result', type=str, choices=['none'] + REGS, default='none')  # TODO: for importing into plotting
 parser.add_argument('--test_freq', type=int, default=640)
 parser.add_argument('--save_freq', type=int, default=640)
 parser.add_argument('--dirname', type=str, default='tmp')
@@ -248,7 +251,7 @@ def initialization_data(rec_dim, gen_dim, data_dim):
     return data
 
 
-def augment_dynamics(dynamics, sign=1):
+def augment_dynamics(dynamics, reg, sign=1):
     """
     Closure to augment dynamics.
     """
@@ -259,9 +262,8 @@ def augment_dynamics(dynamics, sign=1):
         if reg == "none":
             return 0.
         else:
-            # do r3 regularization
             y0, y_n = sol_recursive(lambda _y, _t: dynamics(_y, _t, params), y, t)
-            r = y_n[-1]
+            r = y_n[REGS.index(reg)]
             # return jnp.mean(r ** 2, axis=[axis_ for axis_ in range(1, r.ndim)])
             return jnp.mean(r ** 2)  # TODO: this only works for vmapping!!
 
@@ -347,7 +349,7 @@ def init_model(rec_ode_kwargs,
         "gen_to_data": gen_to_data_params
     }
 
-    def forward(count_nfe_, _method, params, data, data_timesteps, timesteps, mask, num_samples=3):
+    def forward(count_nfe_, reg, _method, params, data, data_timesteps, timesteps, mask, num_samples=3):
         """
         Forward pass of the model.
         y are the latent variables of the recognition model
@@ -383,20 +385,20 @@ def init_model(rec_ode_kwargs,
                 dynamics = gen_dynamics_wrap
                 init_fn = lambda x: x
             else:
-                dynamics = augment_dynamics(gen_dynamics_wrap)
+                dynamics = augment_dynamics(gen_dynamics_wrap, reg)
                 init_fn = aug_init
             rtol = gen_ode_kwargs["rtol"]
             atol = gen_ode_kwargs["atol"]
             mxstep = jnp.inf
-            def _ode(z_, t_):
-                z_ = init_fn(z_)
-                z_, unravel = ravel_pytree(z_)
-                func = ravel_first_arg(dynamics, unravel)
-                return _method(func, rtol, atol, mxstep, z_, t_, params["gen_dynamics"])
-            return jax.vmap(_ode, in_axes=(0, None))(z0_, timesteps)
-            # return jax.vmap(lambda z_, t_: odeint(dynamics, init_fn(z_), t_,
-            #                                       params["gen_dynamics"], **gen_ode_kwargs),
-            #                 in_axes=(0, None))(z0_, timesteps)
+            # def _ode(z_, t_):
+            #     z_ = init_fn(z_)
+            #     z_, unravel = ravel_pytree(z_)
+            #     func = ravel_first_arg(dynamics, unravel)
+            #     return _method(func, rtol, atol, mxstep, z_, t_, params["gen_dynamics"])
+            # return jax.vmap(_ode, in_axes=(0, None))(z0_, timesteps)
+            return jax.vmap(lambda z_, t_: odeint(dynamics, init_fn(z_), t_,
+                                                  params["gen_dynamics"], **gen_ode_kwargs),
+                            in_axes=(0, None))(z0_, timesteps)
         z_r, gen_nfes = jax.vmap(integrate_sample)(z0)
         if count_nfe_:
             z, gen_r = z_r, 0.
@@ -478,7 +480,7 @@ def init_model(rec_ode_kwargs,
     model = {
         "forward": partial(forward, False),
         "params": init_params,
-        "nfe": lambda *args: partial(forward, count_nfe)(*args)[-1]
+        "nfe": lambda *args: partial(forward, count_nfe, reg)(*args)[-1]
         # "nfe": lambda params, data, data_timesteps, timesteps, mask:
         # partial(forward, count_nfe)(params, data, data_timesteps, timesteps, mask)[-1]
     }
