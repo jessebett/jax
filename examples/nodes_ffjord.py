@@ -7,7 +7,6 @@ import os
 import pickle
 import sys
 import time
-from functools import partial
 
 import haiku as hk
 import tensorflow_datasets as tfds
@@ -17,7 +16,7 @@ from jax.tree_util import tree_flatten
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint, odeint_sepaux, _odeint_sepaux2_fwd, _odeint_sepaux2_rev, ravel_first_arg
+from jax.experimental.ode import odeint
 from jax.experimental.jet import jet
 from jax.scipy.special import expit as sigmoid
 from jax.scipy.special import logit
@@ -293,10 +292,8 @@ def init_model():
         dy, dp = ffjord_dynamics((y, p), t, eps, params)
         dr = reg_dynamics(y, t, params)
         return dy, dp, dr
-    nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
-                                                            aug_dynamics, y0, ts, eps, params, **ode_kwargs)
-    # nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)
+    nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)
 
     def ode_aux(params, y, delta_logp, eps):
         """
@@ -311,106 +308,6 @@ def init_model():
         """
         ys, delta_logps, rs = nodeint(reg_init(y, delta_logp), ts, eps, params)
         return ys[-1], delta_logps[-1], rs[-1]
-
-    if count_nfe:
-        # TODO: w/ finlay trick this is not true NFE
-        if vmap:
-            unreg_nodeint = jax.vmap(lambda z, delta_logp, t, eps, params:
-                                     odeint(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1],
-                                     (0, 0, None, 0, None))
-        else:
-            unreg_nodeint = lambda z, delta_logp, t, eps, params: \
-                odeint(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1]
-
-        @jax.jit
-        def nfe_fn(key, params, _images):
-            """
-            Function to return NFE.
-            """
-            eps = get_epsilon(key, _images.shape)
-
-            z, detla_logp = pre_ode_fn(params["pre_ode"], *aug_init(_images)[:-1])
-            f_nfe = unreg_nodeint(z, detla_logp, ts, eps, params["ode"])
-            return jnp.mean(f_nfe)
-
-        @jax.jit
-        def bnfe_fn(key, params, _images):
-            """
-            Sketchy function for reverse NFE.
-            """
-            eps = get_epsilon(key, _images.shape)
-            z, delta_logp = pre_ode_fn(params["pre_ode"], *aug_init(_images)[:-1])
-            (ys, delta_logps, rs), nfe = nodeint_aux(reg_init(z, delta_logp), ts, eps, params["ode"])
-            g = jax.grad(lambda z, delta_logp, regs: _loss_fn(z[-1], delta_logp[-1]) + lam * _reg_loss_fn(regs[-1]),
-                         argnums=(0, 1, 2))(ys, delta_logps, rs)
-            fwd_func = lambda y, t, eps, params: dynamics_wrap(y, t, params)
-            rev_func = aug_dynamics
-            y0 = reg_init(z, delta_logp)
-            fwd_func = ravel_first_arg(fwd_func, ravel_pytree(y0[0])[1])
-            rev_func = ravel_first_arg(rev_func, ravel_pytree(y0)[1])
-            res = _odeint_sepaux2_fwd(fwd_func,
-                                      rev_func,
-                                      ode_kwargs["rtol"],
-                                      ode_kwargs["atol"],
-                                      jnp.inf,
-                                      0.,
-                                      y0,
-                                      ts,
-                                      get_epsilon(key, _images.shape),
-                                      params["ode"])[1]
-            return _odeint_sepaux2_rev(fwd_func,
-                                       rev_func,
-                                       rtol=ode_kwargs["rtol"],
-                                       atol=ode_kwargs["atol"],
-                                       mxstep=jnp.inf,
-                                       res=res,
-                                       g=(g, 0.))[0]
-
-    else:
-        nfe_fn = None
-        bnfe_fn = None
-
-    def pre_fwd_solve(key, params, _images):
-        eps = get_epsilon(key, _images.shape)
-        z, delta_logp = pre_ode_fn(params["pre_ode"], *aug_init(_images)[:-1])
-        (ys, delta_logps, rs), nfe = nodeint_aux(reg_init(z, delta_logp), ts, eps, params["ode"])
-        g = jax.grad(lambda z, delta_logp, regs: _loss_fn(z[-1], delta_logp[-1]) + lam * _reg_loss_fn(regs[-1]),
-                     argnums=(0, 1, 2))(ys, delta_logps, rs)
-        fwd_func = lambda y, t, eps, params: dynamics_wrap(y, t, params)
-        rev_func = aug_dynamics
-        y0 = reg_init(z, delta_logp)
-        fwd_func = ravel_first_arg(fwd_func, ravel_pytree(y0[0])[1])
-        rev_func = ravel_first_arg(rev_func, ravel_pytree(y0)[1])
-        return fwd_func, rev_func, y0, ts, eps, params
-
-    def _fwd_solve(fwd_func, rev_func, y0, ts, eps, params):
-        """
-        For timing the forward solve.
-        """
-        return _odeint_sepaux2_fwd(fwd_func,
-                                   rev_func,
-                                   ode_kwargs["rtol"],
-                                   ode_kwargs["atol"],
-                                   jnp.inf,
-                                   0.,
-                                   y0,
-                                   ts,
-                                   eps,
-                                   params["ode"])
-
-    def _rev_solve(fwd_func, rev_func, res, g):
-        return _odeint_sepaux2_rev(fwd_func,
-                                   rev_func,
-                                   rtol=ode_kwargs["rtol"],
-                                   atol=ode_kwargs["atol"],
-                                   mxstep=jnp.inf,
-                                   res=res,
-                                   g=(g, 0.))
-
-    fwd_func, rev_func = pre_fwd_solve(rng, {"pre_ode": pre_ode_params,
-                                             "ode": dynamics_params}, initialization_data_["ode"][0])[:-1]
-    fwd_solve = partial(_fwd_solve, fwd_func, rev_func)
-    rev_solve = partial(_rev_solve, fwd_func, rev_func)
 
     def forward_aux(key, params, _images):
         """
@@ -441,9 +338,7 @@ def init_model():
         "pre_ode": pre_ode_params,
         "ode": dynamics_params
     },
-        "nfe": nfe_fn,
-        "forward": forward,
-        "bnfe": bnfe_fn
+        "forward": forward
     }
 
     return forward_aux, model
@@ -557,7 +452,7 @@ def run():
 
     # init the model first so that jax gets enough GPU memory before TFDS
     forward, model = init_model()
-    grad_fn = jax.value_and_grad(lambda *args: loss_fn(forward, *args), has_aux=True)
+    grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
 
     ds_train, ds_test_eval, meta = init_data()
     num_batches = meta["num_batches"]
@@ -584,8 +479,7 @@ def run():
         """
         Update the params based on grad for current batch.
         """
-        value_nfe, grad_ = grad_fn(get_params(_opt_state), _batch, _key)
-        return opt_update(_itr, grad_, _opt_state), value_nfe
+        return opt_update(_itr, grad_fn(get_params(_opt_state), _batch, _key), _opt_state)
 
     @jax.jit
     def sep_losses(_opt_state, _batch, _key):
@@ -614,10 +508,7 @@ def run():
 
             test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, test_batch, _key)
 
-            if count_nfe:
-                nfe.append(model["nfe"](_key, get_params(opt_state), test_batch))
-            else:
-                nfe.append(0)
+            nfe.append(0)
 
             sep_loss_aug_.append(test_batch_loss_aug_)
             sep_loss_.append(test_batch_loss_)
@@ -650,11 +541,10 @@ def run():
                 continue
 
             update_start = time.time()
-            opt_state_val_nfe = update(itr, opt_state, key, batch)
-            tree_flatten(opt_state_val_nfe)[0][0].block_until_ready()
+            opt_state = update(itr, opt_state, key, batch)
+            tree_flatten(opt_state)[0][0].block_until_ready()
             update_end = time.time()
-            bnfe = model["bnfe"](key, get_params(opt_state), batch)
-            time_str = "%d %.18f %.4f %.4f %d\n" % (itr, update_end - update_start, opt_state_val_nfe[1][1], bnfe, load_itr)
+            time_str = "%d %.18f %.4f %.4f %d\n" % (itr, update_end - update_start, load_itr)
             outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_time.txt" % (dirname, reg, lam, num_blocks), "a")
             outfile.write(time_str)
             outfile.close()
