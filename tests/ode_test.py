@@ -53,7 +53,7 @@ class ODETest(jtu.JaxTestCase):
       theta, omega = y
       return [omega, -m * omega - g * jnp.sin(theta)]
 
-    integrate = lambda *args: partial(odeint, partial(pend, np))(*args)
+    integrate = partial(odeint, partial(pend, np))
 
     y0 = [jnp.pi - 0.1, 0.0]
     ts = jnp.linspace(0., 1., 11)
@@ -72,7 +72,7 @@ class ODETest(jtu.JaxTestCase):
     def dynamics(_np, y, t):
       return jnp.array([y[1] * -t, -1 * y[1] - 9.8 * jnp.sin(y[0])])
 
-    integrate = lambda *args: partial(odeint, partial(dynamics, np))(*args)
+    integrate = partial(odeint, partial(dynamics, np))
 
     y0 = [jnp.pi - 0.1, 0.0]
     ts = jnp.linspace(0., 1., 11)
@@ -89,7 +89,7 @@ class ODETest(jtu.JaxTestCase):
     def decay(_np, y, t, arg1, arg2):
         return -jnp.sqrt(t) - y + arg1 - jnp.mean((y + arg2)**2)
 
-    integrate = lambda *args: partial(odeint, partial(decay, np))(*args)
+    integrate = partial(odeint, partial(decay, np))
 
     rng = np.random.RandomState(0)
     args = (rng.randn(3), rng.randn(3))
@@ -109,7 +109,7 @@ class ODETest(jtu.JaxTestCase):
     def swoop(_np, y, t, arg1, arg2):
       return jnp.array(y - jnp.sin(t) - jnp.cos(t) * arg1 + arg2)
 
-    integrate = lambda *args: partial(odeint, partial(swoop, np))(*args)
+    integrate = partial(odeint, partial(swoop, np))
 
     ts = jnp.array([0.1, 0.2])
     tol = 1e-1 if num_float_bits(np.float64) == 32 else 1e-3

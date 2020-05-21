@@ -322,7 +322,6 @@ def _tanh_taylor(primals_in, series_in):
   return 2 * primal_out - 1, series_out
 jet_rules[lax.tanh_p] = _tanh_taylor
 
-
 def _log_taylor(primals_in, series_in):
   x, = primals_in
   series, = series_in
