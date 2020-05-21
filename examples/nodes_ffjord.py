@@ -128,7 +128,7 @@ def get_epsilon(key, shape):
     # # normal
     # return jax.random.normal(key, shape)
     # rademacher
-    return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float64) * 2 - 1
+    return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float32) * 2 - 1
 
 
 class ForwardPreODE(hk.Module):
@@ -521,7 +521,7 @@ def run():
         for test_batch_num in range(num_test_batches):
             _key, _key2 = jax.random.split(_key, num=2)
             test_batch = next(ds_eval)[0]
-            test_batch = (test_batch.astype(jnp.float64) + jax.random.uniform(_key2,
+            test_batch = (test_batch.astype(jnp.float32) + jax.random.uniform(_key2,
                                                                               minval=1e-15,
                                                                               maxval=1 - 1e-15,
                                                                               shape=test_batch.shape)) / 256.
@@ -553,7 +553,7 @@ def run():
         for i in range(num_batches):
             key, key2 = jax.random.split(key, num=2)
             batch = next(ds_train)[0]
-            batch = (batch.astype(jnp.float64) + jax.random.uniform(key2,
+            batch = (batch.astype(jnp.float32) + jax.random.uniform(key2,
                                                                     minval=1e-15,
                                                                     maxval=1 - 1e-15,
                                                                     shape=batch.shape)) / 256.
