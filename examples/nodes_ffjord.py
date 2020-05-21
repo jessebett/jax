@@ -651,7 +651,7 @@ def run():
 
             update_start = time.time()
             opt_state_val_nfe = update(itr, opt_state, key, batch)
-            tree_flatten(opt_state_val_nfe)[0][0].block_until_ready()
+            tree_flatten(opt_state_val_nfe)[0][0].block_until_ready()  # TODO: doesn't update!
             update_end = time.time()
             bnfe = model["bnfe"](key, get_params(opt_state), batch)
             time_str = "%d %.18f %.4f %.4f %d\n" % (itr, update_end - update_start, opt_state_val_nfe[1][1], bnfe, load_itr)
