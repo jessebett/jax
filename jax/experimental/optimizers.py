@@ -383,42 +383,6 @@ def adam(step_size, b1=0.9, b2=0.999, eps=1e-8):
   return init, update, get_params
 
 
-@optimizer
-def adam_aux(step_size, b1=0.9, b2=0.999, eps=1e-8):
-  """Construct optimizer triple for Adam.
-  aux means the step size is determined with auxiliary information.
-
-  Args:
-    step_size: positive scalar, or a callable representing a step size schedule
-      that maps the iteration index to positive scalar.
-    b1: optional, a positive scalar value for beta_1, the exponential decay rate
-      for the first moment estimates (default 0.9).
-    b2: optional, a positive scalar value for beta_2, the exponential decay rate
-      for the second moment estimates (default 0.999).
-    eps: optional, a positive scalar value for epsilon, a small constant for
-      numerical stability (default 1e-8).
-
-  Returns:
-    An (init_fun, update_fun, get_params) triple.
-  """
-  def init(x0):
-    m0 = np.zeros_like(x0)
-    v0 = np.zeros_like(x0)
-    return x0, m0, v0
-  def update(i, g, state, aux_state):
-    x, m, v = state
-    m = (1 - b1) * g + b1 * m  # First  moment estimate.
-    v = (1 - b2) * (g ** 2) + b2 * v  # Second moment estimate.
-    mhat = m / (1 - b1 ** (i + 1))  # Bias correction.
-    vhat = v / (1 - b2 ** (i + 1))
-    lr, aux_state = step_size(i, aux_state)
-    x = x - lr * mhat / (np.sqrt(vhat) + eps)
-    return (x, m, v), aux_state
-  def get_params(state):
-    x, m, v = state
-    return x
-  return init, update, get_params
-
 
 @optimizer
 def adamax(step_size, b1=0.9, b2=0.999, eps=1e-8):
@@ -508,9 +472,9 @@ def constant(step_size):
     return step_size
   return schedule
 
-def exponential_decay(step_size, decay_steps, decay_rate, lowest=-np.inf):
+def exponential_decay(step_size, decay_steps, decay_rate):
   def schedule(i):
-    return np.maximum(step_size * decay_rate ** (i / decay_steps), lowest)
+    return step_size * decay_rate ** (i / decay_steps)
   return schedule
 
 def inverse_time_decay(step_size, decay_steps, decay_rate, staircase=False):
