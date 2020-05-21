@@ -7,6 +7,7 @@ import os
 import pickle
 import sys
 import time
+from functools import partial
 
 import haiku as hk
 import tensorflow_datasets as tfds
@@ -368,6 +369,48 @@ def init_model():
     else:
         nfe_fn = None
         bnfe_fn = None
+
+    def pre_fwd_solve(key, params, _images):
+        eps = get_epsilon(key, _images.shape)
+        z, delta_logp = pre_ode_fn(params["pre_ode"], *aug_init(_images)[:-1])
+        (ys, delta_logps, rs), nfe = nodeint_aux(reg_init(z, delta_logp), ts, eps, params["ode"])
+        g = jax.grad(lambda z, delta_logp, regs: _loss_fn(z[-1], delta_logp[-1]) + lam * _reg_loss_fn(regs[-1]),
+                     argnums=(0, 1, 2))(ys, delta_logps, rs)
+        fwd_func = lambda y, t, eps, params: dynamics_wrap(y, t, params)
+        rev_func = aug_dynamics
+        y0 = reg_init(z, delta_logp)
+        fwd_func = ravel_first_arg(fwd_func, ravel_pytree(y0[0])[1])
+        rev_func = ravel_first_arg(rev_func, ravel_pytree(y0)[1])
+        return fwd_func, rev_func, y0, ts, eps, params
+
+    def _fwd_solve(fwd_func, rev_func, y0, ts, eps, params):
+        """
+        For timing the forward solve.
+        """
+        return _odeint_sepaux2_fwd(fwd_func,
+                                   rev_func,
+                                   ode_kwargs["rtol"],
+                                   ode_kwargs["atol"],
+                                   jnp.inf,
+                                   0.,
+                                   y0,
+                                   ts,
+                                   eps,
+                                   params["ode"])
+
+    def _rev_solve(fwd_func, rev_func, res, g):
+        return _odeint_sepaux2_rev(fwd_func,
+                                   rev_func,
+                                   rtol=ode_kwargs["rtol"],
+                                   atol=ode_kwargs["atol"],
+                                   mxstep=jnp.inf,
+                                   res=res,
+                                   g=(g, 0.))
+
+    fwd_func, rev_func = pre_fwd_solve(rng, {"pre_ode": pre_ode_params,
+                                             "ode": dynamics_params}, initialization_data_["ode"][0])[:-1]
+    fwd_solve = partial(_fwd_solve, fwd_func, rev_func)
+    rev_solve = partial(_rev_solve, fwd_func, rev_func)
 
     def forward_aux(key, params, _images):
         """
