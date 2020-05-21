@@ -337,9 +337,11 @@ def init_model():
             """
             Sketchy function for reverse NFE.
             """
-            (z, delta_logp, regs), nfe = forward_aux(key, params, _images)
-            g = jax.grad(lambda z, delta_logp, regs: _loss_fn(z, delta_logp) + lam * _reg_loss_fn(regs),
-                         argnums=(0, 1, 2))(z, delta_logp, regs)
+            eps = get_epsilon(key, _images.shape)
+            z, delta_logp = pre_ode_fn(params["pre_ode"], *aug_init(_images)[:-1])
+            (ys, delta_logps, rs), nfe = nodeint_aux(reg_init(z, delta_logp), ts, eps, params["ode"])
+            g = jax.grad(lambda z, delta_logp, regs: _loss_fn(z[-1], delta_logp[-1]) + lam * _reg_loss_fn(regs[-1]),
+                         argnums=(0, 1, 2))(ys, delta_logps, rs)
             fwd_func = lambda y, t, eps, params: dynamics_wrap(y, t, params)
             rev_func = aug_dynamics
             y0 = reg_init(z, delta_logp)
