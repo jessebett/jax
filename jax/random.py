@@ -23,6 +23,7 @@ https://github.com/google/jax/blob/master/design_notes/prng.md
 
 from functools import partial
 from typing import Optional, Sequence, Union
+import warnings
 
 import numpy as onp
 
@@ -42,6 +43,9 @@ from jax.interpreters import ad
 from jax.interpreters import batching
 from jax.interpreters import xla
 from jax.util import prod
+
+
+_UINT_DTYPES = {8: np.uint8, 16: np.uint16, 32: np.uint32, 64: np.uint64}
 
 
 def PRNGKey(seed: int) -> np.ndarray:
@@ -107,6 +111,25 @@ def _threefry2x32_abstract_eval(*args):
     aval = abstract_arrays.UnshapedArray(np.dtype(np.uint32))
   return (aval,) * 2
 
+rotate_left = _make_rotate_left(onp.uint32)
+
+def apply_round(v, rot):
+  v = v[:]
+  v[0] = v[0] + v[1]
+  v[1] = rotate_left(v[1], rot)
+  v[1] = v[0] ^ v[1]
+  return v
+
+def rotate_list(xs):
+  return xs[1:] + xs[:1]
+
+def rolled_loop_step(i, state):
+  x, ks, rotations = state
+  for r in rotations[0]:
+    x = apply_round(x, r)
+  new_x = [x[0] + ks[0], x[1] + ks[1] + asarray(i + 1, dtype=onp.uint32)]
+  return new_x, rotate_list(ks), rotate_list(rotations)
+
 def _threefry2x32_lowering(key1, key2, x1, x2, use_rolled_loops=True):
   """Apply the Threefry 2x32 hash.
 
@@ -118,15 +141,6 @@ def _threefry2x32_lowering(key1, key2, x1, x2, use_rolled_loops=True):
     An array of dtype uint32 with the same shape as `count`.
   """
   x = [x1, x2]
-  rotate_left = _make_rotate_left(onp.uint32)
-
-  def apply_round(v, rot):
-    v = v[:]
-    v[0] = v[0] + v[1]
-    v[1] = rotate_left(v[1], rot)
-    v[1] = v[0] ^ v[1]
-    return v
-
 
   rotations = [onp.array([13, 15, 26, 6], dtype=onp.uint32),
                onp.array([17, 29, 16, 24], dtype=onp.uint32)]
@@ -136,14 +150,7 @@ def _threefry2x32_lowering(key1, key2, x1, x2, use_rolled_loops=True):
   x[1] = x[1] + ks[1]
 
   if use_rolled_loops:
-    def rotate_list(xs): return xs[1:] + xs[:1]
-    def step(i, state):
-      x, ks, rotations = state
-      for r in rotations[0]:
-        x = apply_round(x, r)
-      new_x = [x[0] + ks[0], x[1] + ks[1] + asarray(i + 1, dtype=onp.uint32)]
-      return new_x, rotate_list(ks), rotate_list(rotations)
-    x, _, _ = lax.fori_loop(0, 5, step, (x, rotate_list(ks), rotations))
+    x, _, _ = lax.fori_loop(0, 5, rolled_loop_step, (x, rotate_list(ks), rotations))
 
   else:
     for r in rotations[0]:
@@ -176,16 +183,15 @@ def _threefry2x32_lowering(key1, key2, x1, x2, use_rolled_loops=True):
 
 def _threefry2x32_gpu_translation_rule(c, k1, k2, x1, x2):
   shape = lax.broadcast_shapes(
-      c.GetShape(k1).dimensions(), c.GetShape(k2).dimensions(),
-      c.GetShape(x1).dimensions(), c.GetShape(x2).dimensions())
+      c.get_shape(k1).dimensions(), c.get_shape(k2).dimensions(),
+      c.get_shape(x1).dimensions(), c.get_shape(x2).dimensions())
   rank = len(shape)
   def _broadcast(x):
-    ndims = c.GetShape(x).rank()
+    ndims = c.get_shape(x).rank()
     return xla_client.ops.BroadcastInDim(x, shape,
                                          tuple(range(rank - ndims, rank)))
   return cuda_prng.threefry2x32(
-      xla_bridge.computation_builder_shim(c),
-      (_broadcast(k1), _broadcast(k2)), (_broadcast(x1), _broadcast(x2)))
+      c, (_broadcast(k1), _broadcast(k2)), (_broadcast(x1), _broadcast(x2)))
 
 threefry2x32_p = core.Primitive("threefry2x32")
 threefry2x32_p.multiple_results = True
@@ -270,18 +276,34 @@ def _random_bits(key, bit_width, shape):
   """Sample uniform random bits of given width and shape using PRNG key."""
   if not _is_prng_key(key):
     raise TypeError("_random_bits got invalid prng key.")
-  if bit_width not in (32, 64):
-    raise TypeError("requires 32- or 64-bit field width.")
-  max_count = (bit_width // 32) * onp.prod(shape)
+  if bit_width not in (8, 16, 32, 64):
+    raise TypeError("requires 8-, 16-, 32- or 64-bit field width.")
+  size = onp.prod(shape)
+  max_count = int(onp.ceil(bit_width * size / 32))
   if max_count >= np.iinfo(onp.uint32).max:
     # TODO(mattjj): just split the key here
     raise TypeError("requesting more random bits than a single call provides.")
 
   counts = lax.tie_in(key, lax.iota(onp.uint32, max_count))
   bits = threefry_2x32(key, counts)
+  dtype = _UINT_DTYPES[bit_width]
   if bit_width == 64:
-    bits = [lax.convert_element_type(x, onp.uint64) for x in np.split(bits, 2)]
-    bits = lax.shift_left(bits[0], onp.uint64(32)) | bits[1]
+    bits = [lax.convert_element_type(x, dtype) for x in np.split(bits, 2)]
+    bits = lax.shift_left(bits[0], dtype(32)) | bits[1]
+  elif bit_width in [8, 16]:
+    # this is essentially bits.view(dtype)[:size]
+    bits = lax.bitwise_and(
+      onp.uint32(onp.iinfo(dtype).max),
+      lax.shift_right_logical(
+        lax.broadcast(bits, (1,)),
+        lax.mul(
+          onp.uint32(bit_width),
+          lax.broadcasted_iota(onp.uint32, (32 // bit_width, 1), 0)
+        )
+      )
+    )
+    bits = lax.reshape(bits, (onp.uint32(max_count * 32 // bit_width),), (1, 0))
+    bits = lax.convert_element_type(bits, dtype)[:size]
   return lax.reshape(bits, shape)
 
 
@@ -289,11 +311,8 @@ def _random_bits(key, bit_width, shape):
 
 
 def _check_shape(name, shape, *param_shapes):
-  try:
-    shape = tuple(map(int, shape))
-  except TypeError as err:
-    msg = "{} requires a concrete tuple of integers as shape argument, got {}."
-    raise ValueError(msg.format(name, shape)) from err
+  shape = abstract_arrays.canonicalize_shape(shape)
+
   if param_shapes:
     shape_ = lax.broadcast_shapes(shape, *param_shapes)
     if shape != shape_:
@@ -337,7 +356,7 @@ def _uniform(key, shape, dtype, minval, maxval):
   finfo = np.finfo(dtype)
   nbits, nmant = finfo.bits, finfo.nmant
 
-  if nbits not in (32, 64):
+  if nbits not in (16, 32, 64):
     raise TypeError("uniform only accepts 32- or 64-bit dtypes.")
 
   bits = _random_bits(key, nbits, shape)
@@ -348,7 +367,7 @@ def _uniform(key, shape, dtype, minval, maxval):
   # equivalent float representations, which might not be true on all platforms.
   float_bits = lax.bitwise_or(
       lax.shift_right_logical(bits, onp.array(nbits - nmant, lax.dtype(bits))),
-      onp.array(1., dtype).view(onp.uint32 if nbits == 32 else onp.uint64))
+      onp.array(1., dtype).view(_UINT_DTYPES[nbits]))
   floats = lax.bitcast_convert_type(float_bits, dtype) - onp.array(1., dtype)
   return lax.max(
       minval,
@@ -389,8 +408,8 @@ def _randint(key, shape, minval, maxval, dtype):
   maxval = lax.convert_element_type(maxval, dtype)
   nbits = np.iinfo(dtype).bits
 
-  if nbits not in (32, 64):
-    raise TypeError("randint only accepts 32- or 64-bit dtypes.")
+  if nbits not in (8, 16, 32, 64):
+    raise TypeError("randint only accepts 8-, 16-, 32-, or 64-bit dtypes.")
 
   # if we don't have minval < maxval, just always return minval
   # https://github.com/google/jax/issues/222
@@ -403,16 +422,15 @@ def _randint(key, shape, minval, maxval, dtype):
   rbits = lambda key: _random_bits(key, nbits, shape)
   higher_bits, lower_bits = rbits(k1), rbits(k2)
 
-  unsigned_dtype = onp.uint32 if nbits == 32 else onp.uint64
+  unsigned_dtype = _UINT_DTYPES[nbits]
   span = lax.convert_element_type(maxval - minval, unsigned_dtype)
 
   # To compute a remainder operation on an integer that might have twice as many
   # bits as we can represent in the native unsigned dtype, we compute a
-  # multiplier equal to 2**nbits % span (using that nbits is 32 or 64).
-  multiplier = lax.rem(onp.array(2**16, unsigned_dtype), span)
+  # multiplier equal to 2**nbits % span. To avoid overflow, we use the identity:
+  #  (a * b) % N = [(a % N) * (b % N)] % N
+  multiplier = lax.rem(lax._const(span, 2 ** (nbits // 2)), span)
   multiplier = lax.rem(lax.mul(multiplier, multiplier), span)
-  if nbits == 64:
-    multiplier = lax.rem(lax.mul(multiplier, multiplier), span)
 
   random_offset = lax.add(lax.mul(lax.rem(higher_bits, span), multiplier),
                           lax.rem(lower_bits, span))
@@ -431,12 +449,18 @@ def shuffle(key: np.ndarray, x: np.ndarray, axis: int = 0) -> np.ndarray:
   Returns:
     A shuffled version of x.
   """
+  msg = ("jax.random.shuffle is deprecated and will be removed in a future release. "
+         "Use jax.random.permutation")
+  warnings.warn(msg, FutureWarning)
   return _shuffle(key, x, axis)
 
 
 def permutation(key, x):
   """
   Permute elements of an array along its first axis or return a permuted range.
+
+  If `x` is a multi-dimensional array, it is only shuffled along its
+  first index.
 
   Args:n
     key: a PRNGKey used as the random key.
@@ -454,9 +478,8 @@ def permutation(key, x):
   elif onp.ndim(x) == 1:
     return _shuffle(key, x, 0)
   else:
-    msg = ("permutation for >1d inputs x not yet implemented, see "
-           "https://github.com/google/jax/issues/2066 for updates.")
-    raise NotImplementedError(msg)
+    ind = _shuffle(key, np.arange(x.shape[0]), 0)
+    return x[ind]
 
 
 @partial(jit, static_argnums=(2,))
@@ -1016,6 +1039,114 @@ def _gamma(key, a, shape, dtype):
   return random_gamma_p.bind(key, a)[0]
 
 
+@partial(jit, static_argnums=(2, 3, 4))
+def _poisson_knuth(key, lam, shape, dtype, max_iters):
+  # Knuth's algorithm for generating Poisson random variates.
+  # Reference:
+  # https://en.wikipedia.org/wiki/Poisson_distribution#Generating_Poisson-distributed_random_variables
+
+  def body_fn(carry):
+    i, k, rng, log_prod = carry
+    rng, subkey = split(rng)
+    k = lax.select(log_prod > -lam, k + 1, k)
+    u = uniform(subkey, shape, onp.float32)
+    return i + 1, k, rng, log_prod + np.log(u)
+
+  def cond_fn(carry):
+    i, log_prod = carry[0], carry[3]
+    return (log_prod > -lam).any() & (i < max_iters)
+
+  k_init = lax.full_like(lam, 0, dtype, shape)
+  log_rate_init = lax.full_like(lam, 0, onp.float32, shape)
+  k = lax.while_loop(cond_fn, body_fn, (0, k_init, key, log_rate_init))[1]
+  return (k - 1).astype(dtype)
+
+
+@partial(jit, static_argnums=(2, 3, 4))
+def _poisson_rejection(key, lam, shape, dtype, max_iters):
+  # Transformed rejection due to Hormann.
+  # Reference:
+  # http://citeseer.ist.psu.edu/viewdoc/citations;jsessionid=1BEB35946CC807879F55D42512E5490C?doi=10.1.1.48.3054.
+  log_lam = lax.log(lam)
+  b = 0.931 + 2.53 * lax.sqrt(lam)
+  a = -0.059 + 0.02483 * b
+  inv_alpha = 1.1239 + 1.1328 / (b - 3.4)
+  v_r = 0.9277 - 3.6224 / (b - 2)
+
+  def body_fn(carry):
+    i, k_out, accepted, key = carry
+    key, subkey_0, subkey_1 = split(key, 3)
+
+    u = uniform(subkey_0, shape, lam.dtype) - 0.5
+    v = uniform(subkey_1, shape, lam.dtype)
+    u_shifted = 0.5 - abs(u)
+
+    k = lax.floor((2 * a / u_shifted + b) * u + lam + 0.43)
+    s = lax.log(v * inv_alpha / (a / (u_shifted * u_shifted) + b))
+    t = -lam + k * log_lam - lax.lgamma(k + 1)
+
+    accept1 = (u_shifted >= 0.07) & (v <= v_r)
+    reject = (k < 0) | ((u_shifted < 0.013) & (v > u_shifted))
+    accept2 = s <= t
+    accept = accept1 | (~reject & accept2)
+
+    k_out = lax.select(accept, k, k_out)
+    accepted |= accept
+
+    return i + 1, k_out, accepted, key
+
+  def cond_fn(carry):
+    i, k_out, accepted, key = carry
+    return (~accepted).any() & (i < max_iters)
+
+  k_init = lax.full_like(lam, -1, lam.dtype, shape)
+  accepted = lax.full_like(lam, False, np.bool_, shape)
+  k = lax.while_loop(cond_fn, body_fn, (0, k_init, accepted, key))[1]
+  return k.astype(dtype)
+
+
+@partial(jit, static_argnums=(2, 3))
+def _poisson(key, lam, shape, dtype):
+  # The implementation matches TensorFlow and NumPy:
+  # https://github.com/tensorflow/tensorflow/blob/v2.2.0-rc3/tensorflow/core/kernels/random_poisson_op.cc
+  # https://github.com/numpy/numpy/blob/v1.18.3/numpy/random/src/distributions/distributions.c#L574
+  # For lambda < 10, we use the Knuth algorithm; otherwise, we use transformed
+  # rejection sampling.
+  use_knuth = lam < 10
+  lam_knuth = lax.select(use_knuth, lam, lax.full_like(lam, 0.0))
+  # The acceptance probability for rejection sampling maxes out at 89% as
+  # λ -> ∞, so pick some arbitrary large value.
+  lam_rejection = lax.select(use_knuth, lax.full_like(lam, 1e5), lam)
+  max_iters = np.iinfo(dtype).max  # insanely conservative
+  return lax.select(
+      use_knuth,
+      _poisson_knuth(key, lam_knuth, shape, dtype, max_iters),
+      _poisson_rejection(key, lam_rejection, shape, dtype, max_iters),
+  )
+
+
+def poisson(key, lam, shape=(), dtype=onp.int64):
+  """Sample Poisson random values with given shape and integer dtype.
+
+  Args:
+    key: a PRNGKey used as the random key.
+    lam: rate parameter (mean of the distribution), must be >= 0.
+    shape: optional, a tuple of nonnegative integers representing the result
+      shape. Default ().
+    dtype: optional, a integer dtype for the returned values (default int64 if
+      jax_enable_x64 is true, otherwise int32).
+
+  Returns:
+    A random array with the specified shape and dtype.
+  """
+  dtype = dtypes.canonicalize_dtype(dtype)
+  shape = abstract_arrays.canonicalize_shape(shape)
+  if onp.shape(lam) != shape:
+    lam = np.broadcast_to(lam, shape)
+  lam = lam.astype(onp.float32)
+  return _poisson(key, lam, shape, dtype)
+
+
 def gumbel(key, shape=(), dtype=onp.float64):
   """Sample Gumbel random values with given shape and float dtype.
 
@@ -1038,6 +1169,7 @@ def _gumbel(key, shape, dtype):
   _check_shape("gumbel", shape)
   return -np.log(-np.log(
       uniform(key, shape, dtype, minval=np.finfo(dtype).eps, maxval=1.)))
+
 
 def categorical(key, logits, axis=-1, shape=None):
   """Sample random values from categorical distributions.
@@ -1067,6 +1199,7 @@ def categorical(key, logits, axis=-1, shape=None):
 
   sample_shape = shape[:len(shape)-len(batch_shape)]
   return np.argmax(gumbel(key, sample_shape + logits.shape, logits.dtype) + logits, axis=axis)
+
 
 def laplace(key, shape=(), dtype=onp.float64):
   """Sample Laplace random values with given shape and float dtype.
@@ -1112,8 +1245,21 @@ def logistic(key, shape=(), dtype=onp.float64):
 
 @partial(jit, static_argnums=(1, 2))
 def _logistic(key, shape, dtype):
+  # Mathematically, we can compute the distribution by generating uniformly-distributed
+  # numbers x in the open interval (a, b) and computing:
+  #   z = log[ (x - a) / (b - x))
+  # It's important to avoid x=a or x=b, which lead to infinite values for z.
+  # The uniform() function generates pseudorandom floating point numbers x in the
+  # semi-closed interval [0, 1), so if used directly  with (a,b)=(0,1), it will
+  # lead to infinite output in a small number of cases (as many as 1 in 2^23 for float32).
+  #
+  # Instead, we let (a, b) = (-ε, 1) where ε is the smallest step between floating point
+  # values: then numbers in the interval (-ε, 1) are approximated by standard uniformly
+  # drawn numbers in [0, 1).
   _check_shape("logistic", shape)
-  return logit(uniform(key, shape, dtype))
+  x = uniform(key, shape, dtype)
+  eps = np.finfo(dtype).eps
+  return lax.log(lax.div(lax.add(lax._const(x, eps), x), lax.sub(lax._const(x, 1), x)))
 
 
 def pareto(key, b, shape=None, dtype=onp.float64):

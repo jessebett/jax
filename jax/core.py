@@ -28,6 +28,7 @@ from typing import Any, Callable, ClassVar, Dict, List, Optional, Set
 import numpy as onp
 
 from . import dtypes
+from .config import FLAGS
 from . import linear_util as lu
 
 from .util import safe_zip, safe_map, partial, curry, prod, partialmethod
@@ -35,8 +36,19 @@ from .pprint_util import pp, vcat, hcat, pp_kv_pairs, PrettyPrint
 
 # TODO(dougalm): the trace cache breaks the leak detector. Consisder solving.
 check_leaks = False
-# TODO(dougalm): put this behind a flag that's enabled during testing
-skip_checks = True  # not __debug__  # google doesn't use -O
+
+"""Disables internal invariant checks."""
+skip_checks = not FLAGS.jax_enable_checks  # not __debug__  # google doesn't use -O
+
+@contextmanager
+def skipping_checks():
+  """Context manager for temporarily disabling checks."""
+  global skip_checks
+  old_value, skip_checks = skip_checks, True
+  try:
+    yield
+  finally:
+    skip_checks = old_value
 
 zip = safe_zip
 map = safe_map
@@ -359,11 +371,18 @@ class Tracer(object):
   __slots__ = ['_trace', '__weakref__']
 
   def __array__(self, *args, **kw):
-    raise Exception("Tracer can't be used with raw numpy functions. "
-                    "You might have\n"
-                    "  import numpy as np\n"
-                    "instead of\n"
-                    "  import jax.numpy as np")
+    msg = ("The numpy.ndarray conversion method __array__() was called on "
+           f"the JAX Tracer object {self}.\n\n"
+           "This error can occur when a JAX Tracer object is passed to a raw "
+           "numpy function, or a method on a numpy.ndarray object. You might "
+           "want to check that you are using `jnp` together with "
+           "`import jax.numpy as jnp` rather than using `np` via "
+           "`import numpy as np`. If this error arises on a line that involves "
+           "array indexing, like `x[idx]`, it may be that the array being "
+           "indexed `x` is a raw numpy.ndarray while the indices `idx` are a "
+           "JAX Tracer instance; in that case, you can instead write "
+           "`jax.device_put(x)[idx]`.")
+    raise Exception(msg)
 
   def __init__(self, trace):
     self._trace = trace
@@ -653,7 +672,10 @@ class Bot(AbstractValue): pass
 bot = Bot()
 
 class AbstractUnit(AbstractValue):
-  def join(self, other): return self
+  def join(self, other):
+    if not skip_checks:
+      assert other is abstract_unit, other
+    return self
   def _eq(self, self_traced, other): return get_aval(other) is self
 
 abstract_unit = AbstractUnit()
@@ -683,10 +705,10 @@ def valid_jaxtype(x):
 
 
 def concrete_aval(x):
-  try:
-    return pytype_aval_mappings[type(x)](x)
-  except KeyError as err:
-    raise TypeError("{} is not a valid Jax type".format(type(x))) from err
+  for typ in type(x).mro():
+    handler = pytype_aval_mappings.get(typ)
+    if handler: return handler(x)
+  raise TypeError(f"{type(x)} is not a valid Jax type")
 
 
 def get_aval(x):
@@ -917,7 +939,12 @@ class ConcreteArray(ShapedArray):
   _oct     = partialmethod(_forward_to_value, oct)
 
 
-class AbstractToken(AbstractValue): pass
+class AbstractToken(AbstractValue):
+  def join(self, other):
+    if isinstance(other, AbstractToken):
+      return self
+    else:
+      assert False, f"Cannot join {self} with {other}"
 
 abstract_token = AbstractToken()
 
@@ -1048,7 +1075,7 @@ def check_jaxpr(jaxpr: Jaxpr):
   map(write, jaxpr.constvars)
   map(write, jaxpr.invars)
   for eqn in jaxpr.eqns:
-    if eqn.primitive.call_primitive or eqn.map_primitive:
+    if eqn.primitive.call_primitive or eqn.primitive.map_primitive:
       if "call_jaxpr" not in eqn.params:
         raise Exception("Call primitive {} should have a 'call_jaxpr' parameter"
                         .format(eqn.primitive))
