@@ -565,16 +565,10 @@ def clip_grads(grad_tree, max_norm):
   normalize = lambda g: np.where(norm < max_norm, g, g * (max_norm / norm))
   return tree_map(normalize, grad_tree)
 
-def _check_nan(tree):
+def check_finite(tree):
   """Compute the l2 norm of a pytree of arrays. Useful for weight decay."""
   flat_tree, _ = ravel_pytree(tree)
   return np.all(np.isfinite(flat_tree))
-
-def nan_zero_grads(grad_tree):
-  """If any gradients are nan, don't update"""
-  is_not_nan = _check_nan(grad_tree)
-  convert_nan = lambda g: np.where(is_not_nan, g, np.zeros_like(g))
-  return tree_map(convert_nan, grad_tree)
 
 ### serialization utilities
 
