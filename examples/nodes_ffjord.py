@@ -12,6 +12,7 @@ import haiku as hk
 import tensorflow_datasets as tfds
 
 import jax
+from jax import lax
 from jax.tree_util import tree_flatten
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
@@ -478,6 +479,17 @@ def run():
     num_batches = meta["num_batches"]
     num_test_batches = meta["num_test_batches"]
 
+    def lr_schedule(itr):
+        """
+        Learning rate schedule.
+        Slowly warm-up with a small learning rate.
+        """
+        iter_frac = lax.min((itr.astype(jnp.float32) + 1.) / lax.max(parse_args.warmup_itrs, 1.), 1.)
+        _epoch = itr // num_batches
+        id = lambda x: x
+        return lax.cond(_epoch < 250, parse_args.lr * iter_frac, id, 1e-4, id)
+
+    opt_init, opt_update, get_params = optimizers.adam(step_size=lr_schedule)
     opt_init, opt_update, get_params = optimizers.adam(step_size=1e-3)
     unravel_opt = ravel_pytree(opt_init(model["params"]))[1]
     if os.path.exists(parse_args.ckpt_path):
@@ -499,7 +511,9 @@ def run():
         """
         Update the params based on grad for current batch.
         """
-        return opt_update(_itr, grad_fn(get_params(_opt_state), _batch, _key), _opt_state)
+        grad_ = jax.experimental.optimizers.clip_grads(grad_fn(get_params(_opt_state), _batch, _key),
+                                                       parse_args.max_grad_norm)
+        return opt_update(_itr, grad_, _opt_state)
 
     @jax.jit
     def sep_losses(_opt_state, _batch, _key):
