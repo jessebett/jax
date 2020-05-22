@@ -56,5 +56,5 @@ python $file $args --seed=0 --dirname=${j_dir} --ckpt_path=/checkpoint/$USER/\$S
 cp $file $j_dir/scripts/
 
 # TODO: deadline or nah
-sbatch $j_dir/scripts/${j_name}.slrm --qos $q --account deadline
-# sbatch $j_dir/scripts/${j_name}.slrm --qos $q
+# sbatch $j_dir/scripts/${j_name}.slrm --qos $q --account deadline
+sbatch $j_dir/scripts/${j_name}.slrm --qos $q
