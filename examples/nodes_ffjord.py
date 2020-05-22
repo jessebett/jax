@@ -516,7 +516,10 @@ def run():
                                                        parse_args.max_grad_norm)
         is_finite = jax.experimental.optimizers.check_finite(grad_)
         # don't update params or the opt_state if we have nans
-        return jnp.where(is_finite, opt_update(_itr, grad_, _opt_state), _opt_state)
+        flat_new_opt_state = jnp.where(is_finite,
+                                       ravel_pytree(opt_update(_itr, grad_, _opt_state))[0],
+                                       ravel_pytree(_opt_state)[0])
+        return unravel_opt(flat_new_opt_state)
 
     @jax.jit
     def sep_losses(_opt_state, _batch, _key):
