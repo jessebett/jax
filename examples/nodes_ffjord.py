@@ -128,10 +128,10 @@ def get_epsilon(key, shape):
     """
     Sample epsilon from the desired distribution.
     """
-    # # normal
-    # return jax.random.normal(key, shape)
+    # normal
+    return jax.random.normal(key, shape)
     # rademacher
-    return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float32) * 2 - 1
+    # return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float32) * 2 - 1
 
 
 class ForwardPreODE(hk.Module):
@@ -289,9 +289,9 @@ def init_model():
         dy, dp = ffjord_dynamics((y, p), t, eps, params)
         dr = reg_dynamics(y, t, params)
         return dy, dp, dr
-    nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
-                                                            aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    # nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    # nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+    #                                                         aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
     nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
 
     def ode_aux(params, y, delta_logp, eps):
@@ -492,7 +492,6 @@ def run():
         return lax.cond(_epoch < 250, parse_args.lr * iter_frac, id, 1e-4, id)
 
     opt_init, opt_update, get_params = optimizers.adam(step_size=lr_schedule)
-    opt_init, opt_update, get_params = optimizers.adam(step_size=1e-3)
     unravel_opt = ravel_pytree(opt_init(model["params"]))[1]
     if os.path.exists(parse_args.ckpt_path):
         outfile = open(parse_args.ckpt_path, 'rb')
@@ -515,6 +514,7 @@ def run():
         """
         grad_ = jax.experimental.optimizers.clip_grads(grad_fn(get_params(_opt_state), _batch, _key),
                                                        parse_args.max_grad_norm)
+        grad_ = jax.experimental.optimizers.nan_zero_grads(grad_)  # TODO: zeroing gradient will also affect running avgs of adam
         return opt_update(_itr, grad_, _opt_state)
 
     @jax.jit
