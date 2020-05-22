@@ -15,7 +15,7 @@ from jax import lax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint
+from jax.experimental.ode import odeint, ravel_first_arg
 from jax.experimental.jet import jet
 
 from jax.config import config
@@ -58,7 +58,7 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
-vmap = False
+vmap = True
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
@@ -392,13 +392,28 @@ def init_model():
             else:
                 unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
 
-            @jax.jit
-            def nfe_fn(params, _images, _labels):
+            # @jax.jit
+            # def nfe_fn(params, _images, _labels):
+            #     """
+            #     Function to return NFE.
+            #     """
+            #     in_ode = pre_ode_fn(params["pre_ode"], _images)
+            #     f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
+            #     return jnp.mean(f_nfe)
+
+            def plot_nfe_fn(_method, params, _images, _labels):
                 """
                 Function to return NFE.
                 """
+                rtol = ode_kwargs["rtol"]
+                atol = ode_kwargs["atol"]
+                mxstep = jnp.inf
                 in_ode = pre_ode_fn(params["pre_ode"], _images)
-                f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
+                def unreg_nodeint(y0, t, params):
+                    y0, unravel = ravel_pytree(y0)
+                    func = ravel_first_arg(dynamics_wrap, unravel)
+                    return _method(func, rtol, atol, mxstep, y0, t, params)[1]
+                f_nfe = jax.vmap(unreg_nodeint, (0, None, None))(in_ode, ts, params["ode"])
                 return jnp.mean(f_nfe)
 
         else:
@@ -429,7 +444,8 @@ def init_model():
     if odenet:
         model["model"]["ode"] = ode
         model["params"]["ode"] = dynamics_params
-        model["nfe"] = nfe_fn
+        # model["nfe"] = nfe_fn
+        model["plot_nfe"] = plot_nfe_fn  # TODO: plot or nah?
     else:
         model["model"]["res"] = resnet_fn
         model["params"]["res"] = resnet_params
