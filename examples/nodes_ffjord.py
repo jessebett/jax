@@ -145,7 +145,7 @@ class ForwardPreODE(hk.Module):
 
     def __call__(self, x, logpx):
         s = self.alpha + (1 - 2 * self.alpha) * x
-        y = logit(s)
+        y = jnp.log(s) - jnp.log(1 - s)
         logpy = logpx - logdetgrad(x, self.alpha)
         return y, logpy
 
