@@ -28,11 +28,11 @@ parser.add_argument('--test_batch_size', type=int, default=200)
 parser.add_argument('--nepochs', type=int, default=100)
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--warmup_itrs', type=float, default=1e3)
-parser.add_argument("--max_grad_norm", type=float, default=1e10)
+parser.add_argument("--max_grad_norm", type=float, default=1e6)
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--lam_w', type=float, default=0)
-parser.add_argument('--atol', type=float, default=1e-5)
-parser.add_argument('--rtol', type=float, default=1e-5)
+parser.add_argument('--atol', type=float, default=1e-7)
+parser.add_argument('--rtol', type=float, default=1e-7)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
@@ -139,7 +139,7 @@ class ForwardPreODE(hk.Module):
     Module applied before the ODE layer.
     """
 
-    def __init__(self, alpha=1e-6):
+    def __init__(self, alpha=1e-5):
         super(ForwardPreODE, self).__init__()
         self.alpha = alpha
 
@@ -289,9 +289,9 @@ def init_model():
         dy, dp = ffjord_dynamics((y, p), t, eps, params)
         dr = reg_dynamics(y, t, params)
         return dy, dp, dr
-    nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
-                                                            aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    # nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    # nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+    #                                                         aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
     nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
 
     def ode_aux(params, y, delta_logp, eps):
@@ -489,7 +489,7 @@ def run():
         iter_frac = lax.min((itr.astype(jnp.float32) + 1.) / lax.max(parse_args.warmup_itrs, 1.), 1.)
         _epoch = itr // num_batches
         id = lambda x: x
-        return lax.cond(_epoch < 80, parse_args.lr * iter_frac, id, 1e-4, id)  # TODO: just a guess for schedule
+        return lax.cond(_epoch < 80, parse_args.lr * iter_frac, id, parse_args.lr / 10, id)  # TODO: just a guess for schedule
 
     opt_init, opt_update, get_params = optimizers.adam(step_size=lr_schedule)
     unravel_opt = ravel_pytree(opt_init(model["params"]))[1]
