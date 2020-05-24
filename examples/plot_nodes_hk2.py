@@ -419,27 +419,27 @@ def get_info_r(reg, dirname, reg_result, lam):
 
     itr = 96000
 
-    if reg_result == reg:
-        reg_val = meta["info"][itr]["loss_reg"]
-    else:
-        reg_filename = "%s/reg_%s_lam_%.18e_%d_%s_reg.pickle" % (dirname, reg, lam, itr, reg_result)
-        try:
-            reg_file = open(reg_filename, "rb")
-            reg_val = pickle.load(reg_file)
-            reg_file.close()
-        except IOError:
-            print("Calculating %s for %.4e regularizing %s" % (reg_result, lam, reg))
-            param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
-            params = pickle.load(param_file)
-            regs = []
-            for test_batch_num in range(num_test_batches):
-                print(test_batch_num, num_test_batches)
-                test_batch = next(ds_train_eval)
-                regs.append(get_reg(params, test_batch[0]))
-            reg_val = onp.mean(regs)
-            reg_file = open(reg_filename, "wb")
-            pickle.dump(reg_val, reg_file)
-            reg_file.close()
+    # if reg_result == reg:
+    #     reg_val = meta["info"][itr]["loss_reg"]
+    # else:
+    reg_filename = "%s/reg_%s_lam_%.18e_%d_%s_reg.pickle" % (dirname, reg, lam, itr, reg_result)
+    try:
+        reg_file = open(reg_filename, "rb")
+        reg_val = pickle.load(reg_file)
+        reg_file.close()
+    except IOError:
+        print("Calculating %s for %.4e regularizing %s" % (reg_result, lam, reg))
+        param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+        params = pickle.load(param_file)
+        regs = []
+        for test_batch_num in range(num_test_batches):
+            print(test_batch_num, num_test_batches)
+            test_batch = next(ds_train_eval)
+            regs.append(get_reg(params, test_batch[0]))
+        reg_val = onp.mean(regs)
+        reg_file = open(reg_filename, "wb")
+        pickle.dump(reg_val, reg_file)
+        reg_file.close()
 
     nfe = meta["info"][itr]["nfe"]
     return reg_val, nfe
