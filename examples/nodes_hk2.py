@@ -21,6 +21,8 @@ from jax.experimental.jet import jet
 from jax.config import config
 config.update("jax_enable_x64", True)
 
+REGS = ["r2", "r3", "r4", "r5", "r6"]
+
 parser = argparse.ArgumentParser('Neural ODE')
 parser.add_argument('--batch_size', type=int, default=100)
 parser.add_argument('--test_batch_size', type=int, default=1000)
@@ -33,7 +35,8 @@ parser.add_argument('--rtol', type=float, default=1.4e-8)
 parser.add_argument('--method', type=str, default="dopri5")
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--init_step', type=float, default=1.)
-parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5', 'r6'], default='none')
+parser.add_argument('--reg', type=str, choices=['none'] + REGS, default='none')
+parser.add_argument('--reg_result', type=str, choices=['none'] + REGS, default=None)  # TODO: for plotting
 parser.add_argument('--test_freq', type=int, default=3000)
 parser.add_argument('--save_freq', type=int, default=3000)
 parser.add_argument('--dirname', type=str, default='tmp')
@@ -58,7 +61,7 @@ dirname = parse_args.dirname
 odenet = False if parse_args.resnet is True else True
 count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
-vmap = True
+vmap = False
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
     "atol": parse_args.atol,
@@ -317,7 +320,7 @@ def initialization_data(input_shape, ode_shape):
     return data
 
 
-def init_model():
+def init_model(model_reg=None):
     """
     Instantiates transformed submodules of model and their parameters.
     """
@@ -353,7 +356,10 @@ def init_model():
                 else:
                     # do r3 regularization
                     y0, y_n = sol_recursive(lambda _y, _t: dynamics_wrap(_y, _t, params), y, t)
-                    r = y_n[-1]
+                    if model_reg is None:
+                        r = y_n[-1]
+                    else:
+                        r = y_n[REGS.index(model_reg)]
                     return jnp.mean(jnp.square(r), axis=[axis_ for axis_ in range(1, r.ndim)])
 
             def aug_dynamics(yr, t, params):

@@ -30,7 +30,7 @@ parser.add_argument('--method', type=str,
                     choices=["heun", "fehlberg", "bosh", "owrenzen", "dopri"],
                     default="dopri")  # TODO: flag that needs to be set!!
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default='none')
-parser.add_argument('--reg_result', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default='none')
+parser.add_argument('--reg_result', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default=None)
 parser.add_argument('--dirname', type=str, default='tmp')
 parse_args = parser.parse_args()
 
@@ -63,9 +63,9 @@ num_stages = {"heun": 1,
               "dopri": 6
               }
 
-forward, model = init_model()
-forward = jax.jit(forward)
+forward, model = init_model(reg_result)
 _loss_fn = jax.jit(_loss_fn)
+get_reg = jax.jit(lambda *args: jnp.mean(forward(*args)[1]))
 method = parse_args.method
 count_nfe = jax.jit(partial(model["plot_nfe"], methods[method]))
 _, ds_train_eval, meta = init_data()
@@ -409,16 +409,40 @@ def histogram_nfe():
         plt.close(fig)
 
 
-def get_info_r(lam):
+def get_info_r(reg, dirname, reg_result, lam):
     """
-    Get (NFE, reg) pairs for a lam.
+    Get (<reg_result>, <nfe>) pair after training w/ regularization <reg>.
     """
-    meta_file = open("%s/reg_%s_lam_%.4e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
+    meta_file = open("%s/reg_%s_lam_%.18e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
     meta = pickle.load(meta_file)
     meta_file.close()
-    info = meta["info"]
 
-    return [(onp.log10(info[itr]["loss_reg"]), onp.log10(info[itr]["nfe"])) for itr in info]
+    itr = 96000
+
+    if reg_result == reg:
+        reg_val = meta["info"][itr]["loss_reg"]
+    else:
+        reg_filename = "%s/reg_%s_lam_%.18e_%d_%s_reg.pickle" % (dirname, reg, lam, itr, reg_result)
+        try:
+            reg_file = open(reg_filename, "rb")
+            reg_val = pickle.load(reg_file)
+            reg_file.close()
+        except IOError:
+            print("Calculating %s for %.4e regularizing %s" % (reg_result, lam, reg))
+            param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+            params = pickle.load(param_file)
+            regs = []
+            for test_batch_num in range(num_test_batches):
+                print(test_batch_num, num_test_batches)
+                test_batch = next(ds_train_eval)
+                regs.append(get_reg(params, test_batch[0]))
+            reg_val = onp.mean(regs)
+            reg_file = open(reg_filename, "wb")
+            pickle.dump(reg_val, reg_file)
+            reg_file.close()
+
+    nfe = meta["info"][itr]["nfe"]
+    return reg_val, nfe
 
 
 def nfe_r():
@@ -697,7 +721,7 @@ def plot_nfe_over_training():
 
 
 if __name__ == "__main__":
-    # get_info(reg, dirname, method, parse_args.lam)
+    get_info_r(reg, dirname, reg_result, parse_args.lam)
 
     # for ind, lam in enumerate(lams):
     #     print(ind, len(lams))
@@ -709,7 +733,7 @@ if __name__ == "__main__":
 
     # nfe_r()
     # pareto_plot_nfe()
-    pareto_plot_nfe_all_orders()
+    # pareto_plot_nfe_all_orders()
     # histogram_nfe()
     # pareto_nfe_r()
     # r_corr()
