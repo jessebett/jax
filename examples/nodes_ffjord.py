@@ -515,10 +515,10 @@ def run():
         grad_ = jax.experimental.optimizers.clip_grads(grad_fn(get_params(_opt_state), _batch, _key),
                                                        parse_args.max_grad_norm)
         is_finite = jax.experimental.optimizers.check_finite(grad_)
-        # don't update params or the opt_state if we have nans
+        # restart optimization from current point if we have NaNs
         flat_new_opt_state = jnp.where(is_finite,
                                        ravel_pytree(opt_update(_itr, grad_, _opt_state))[0],
-                                       ravel_pytree(_opt_state)[0])
+                                       ravel_pytree(opt_init(get_params(_opt_state)))[0])
         return unravel_opt(flat_new_opt_state)
 
     @jax.jit
