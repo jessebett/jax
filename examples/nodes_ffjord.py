@@ -23,7 +23,7 @@ from jax.scipy.special import expit as sigmoid
 from jax.scipy.special import logit
 
 parser = argparse.ArgumentParser('Neural ODE')
-parser.add_argument('--batch_size', type=int, default=200)
+parser.add_argument('--batch_size', type=int, default=2)
 parser.add_argument('--test_batch_size', type=int, default=200)
 parser.add_argument('--nepochs', type=int, default=100)
 parser.add_argument('--lr', type=float, default=1e-5)
@@ -67,13 +67,8 @@ ode_kwargs = {
     # "init_step": parse_args.init_step
 }
 
-# jax.nn.softplus jet will fail because of convert element type
-# logaddexp will fail because no lax.max primitive implemented
-# TODO: maybe use jax.nn.softplus when not doing jet?
-# softplus = jax.nn.softplus
-softplus = lambda x: jnp.where(x >= 0,
-                               x + jnp.log1p(jnp.exp(-x)),
-                               jnp.log1p(jnp.exp(x)))
+# TODO: jet rules for convert_element_type and lax.max
+softplus = jax.nn.softplus
 
 
 def sol_recursive(f, z, t):
