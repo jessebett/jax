@@ -51,14 +51,17 @@ def jet(fun, primals, series):
     yield tree_flatten(ans)
 
   f, out_tree = flatten_fun_output(lu.wrap_init(fun))
-  out_primals, out_terms = jet_fun(jet_subtrace(f)).call_wrapped(primals, series)
+  out_primals, out_terms = jet_fun(jet_subtrace(f), order).call_wrapped(primals, series)
   return tree_unflatten(out_tree(), out_primals), tree_unflatten(out_tree(), out_terms)
 
 @lu.transformation
-def jet_fun(primals, series):
+def jet_fun(order, primals, series):
   with core.new_master(JetTrace) as master:
+    master.order = order
     out_primals, out_terms = yield (master, primals, series), {}
     del master
+  out_terms = [[onp.zeros_like(p)] * order if s is zero_series else s
+               for p, s in zip(out_primals, out_terms)]
   yield out_primals, out_terms
 
 @lu.transformation
@@ -110,8 +113,8 @@ class JetTrace(core.Trace):
 
   def process_primitive(self, primitive, tracers, params):
     assert not primitive.multiple_results  # TODO
+    order = self.master.order
     primals_in, series_in = unzip2((t.primal, t.terms) for t in tracers)
-    order, = {len(terms) for terms in series_in if terms is not zero_series}
     series_in = [[zero_term] * order if s is zero_series else s
                  for s in series_in]
     # TODO(mattjj): avoid always instantiating zeros
@@ -171,6 +174,7 @@ defzero(lax.gt_p)
 defzero(lax.ge_p)
 defzero(lax.eq_p)
 defzero(lax.ne_p)
+defzero(lax.not_p)
 defzero(lax.and_p)
 defzero(lax.or_p)
 defzero(lax.xor_p)
@@ -208,6 +212,7 @@ deflinear(lax.reduce_window_sum_p)
 deflinear(lax.tie_in_p)
 deflinear(lax_fft.fft_p)
 deflinear(xla.device_put_p)
+deflinear(lax.is_finite_p)
 
 
 
@@ -397,6 +402,47 @@ def _gen_reduce_choose_taylor_rule(chooser_fun):
   return chooser_taylor_rule
 jet_rules[lax.reduce_max_p] = _gen_reduce_choose_taylor_rule(lax.reduce_max_p.bind)
 jet_rules[lax.reduce_min_p] = _gen_reduce_choose_taylor_rule(lax.reduce_min_p.bind)
+
+def _lax_max_taylor_rule(primal_in, series_in, **params):
+    # TODO: (Jesse) doesn't use params
+    # TODO: (Jesse) Could probably be done with a single pass
+    # TODO: (Jesse) shape promotion
+    x,y = primal_in
+    # x, y = lnp._promote_shapes("laxmax", *lnp._promote_dtypes_inexact(x, jax.numpy.array([y])))
+    # y = jax.numpy.full(x.shape, y)
+
+    xgy = x>y  # greater than mask
+    xey = x==y # equal to mask
+    primal_out = lax.select(xgy,x,y)
+
+    def select_max_and_avg_eq(x_i,y_i):
+        """Select x where x>y or average when x==y"""
+        # y_i = jax.numpy.full(x.shape, y_i)
+        max_i = lax.select(xgy,x_i,y_i)
+        max_i = lax.select(xey, (x_i + y_i)/2, max_i)
+        return max_i
+
+    series_out = [select_max_and_avg_eq(*terms_in) for terms_in in zip(*series_in)]
+    return primal_out, series_out
+jet_rules[lax.max_p] = _lax_max_taylor_rule
+
+def _lax_min_taylor_rule(primal_in, series_in, **params):
+    # TODO: (Jesse) doesn't use params
+    # TODO: (Jesse) could be 1 function with max
+    x,y = primal_in
+    xgy = x<y  # less than mask
+    xey = x==y # equal to mask
+    primal_out = lax.select(xgy,x,y)
+
+    def select_min_and_avg_eq(x_i,y_i):
+        """Select x where x>y or average when x==y"""
+        min_i = lax.select(xgy,x_i,y_i)
+        min_i = lax.select(xey, (x_i + y_i)/2, min_i)
+        return min_i
+
+    series_out = [select_min_and_avg_eq(*terms_in) for terms_in in zip(*series_in)]
+    return primal_out, series_out
+jet_rules[lax.min_p] = _lax_min_taylor_rule
 
 def _abs_taylor_rule(x, series_in, **params):
   x, = x

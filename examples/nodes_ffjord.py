@@ -68,7 +68,7 @@ ode_kwargs = {
 }
 
 # TODO: jet rules for convert_element_type and lax.max
-softplus = jax.nn.softplus
+softplus = lambda x: jnp.logaddexp(x, jax.numpy.zeros_like(x))
 
 
 def sol_recursive(f, z, t):
