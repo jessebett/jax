@@ -257,6 +257,10 @@ class JetTest(jtu.JaxTestCase):
   def test_pow(self):  self.binary_check(lambda x, y: x ** y, lims=([0.2, 500], [-500, 500]), finite=False)
   @jtu.skip_on_devices("tpu")
   def test_atan2(self):      self.binary_check(lax.atan2, lims=[-40, 40])
+  @jtu.skip_on_devices("tpu")
+  def test_lax_max(self):    self.binary_check(lax.max)
+  @jtu.skip_on_devices("tpu")
+  def test_lax_min(self):    self.binary_check(lax.min)
 
   def test_process_call(self):
     def f(x):
