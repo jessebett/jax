@@ -398,6 +398,42 @@ def _gen_reduce_choose_taylor_rule(chooser_fun):
 jet_rules[lax.reduce_max_p] = _gen_reduce_choose_taylor_rule(lax.reduce_max_p.bind)
 jet_rules[lax.reduce_min_p] = _gen_reduce_choose_taylor_rule(lax.reduce_min_p.bind)
 
+def _lax_max_taylor_rule(primal_in, series_in, **params):
+    # TODO: (Jesse) doesn't use params
+    # TODO: (Jesse) Could probably be done with a single pass
+    x,y = primal_in
+    xgy = x>y  # greater than mask
+    xey = x==y # equal to mask
+    primal_out = lax.select(xgy,x,y)
+
+    def select_max_and_avg_eq(x_i,y_i):
+        """Select x where x>y or average when x==y"""
+        max_i = lax.select(xgy,x_i,y_i)
+        max_i = lax.select(xey, (x_i + y_i)/2, max_i)
+        return max_i
+
+    series_out = [select_max_and_avg_eq(*terms_in) for terms_in in zip(*series_in)]
+    return primal_out, series_out
+jet_rules[lax.max_p] = _lax_max_taylor_rule
+
+def _lax_min_taylor_rule(primal_in, series_in, **params):
+    # TODO: (Jesse) doesn't use params
+    # TODO: (Jesse) could be 1 function with max
+    x,y = primal_in
+    xgy = x<y  # less than mask
+    xey = x==y # equal to mask
+    primal_out = lax.select(xgy,x,y)
+
+    def select_min_and_avg_eq(x_i,y_i):
+        """Select x where x>y or average when x==y"""
+        min_i = lax.select(xgy,x_i,y_i)
+        min_i = lax.select(xey, (x_i + y_i)/2, min_i)
+        return min_i
+
+    series_out = [select_min_and_avg_eq(*terms_in) for terms_in in zip(*series_in)]
+    return primal_out, series_out
+jet_rules[lax.min_p] = _lax_min_taylor_rule
+
 def _abs_taylor_rule(x, series_in, **params):
   x, = x
   primal_out = lax.abs_p.bind(x, **params)
