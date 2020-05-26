@@ -67,8 +67,19 @@ ode_kwargs = {
     # "init_step": parse_args.init_step
 }
 
-# TODO: jet rules for convert_element_type and lax.max
-softplus = jax.nn.softplus
+
+def _logaddexp(x1, x2):
+  """
+  Logaddexp while ignoring the custom_jvp rule.
+  """
+  amax = lax.max(x1, x2)
+  delta = lax.sub(x1, x2)
+  return lax.select(jnp.isnan(delta),
+                    lax.add(x1, x2),  # NaNs or infinities of the same sign.
+                    lax.add(amax, lax.log1p(lax.exp(-lax.abs(delta)))))
+
+
+softplus = lambda x: _logaddexp(x, jnp.zeros_like(x))
 
 
 def sol_recursive(f, z, t):
