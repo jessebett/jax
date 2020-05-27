@@ -6,6 +6,7 @@ import pickle
 from glob import glob
 from functools import reduce, partial
 import argparse
+import operator as op
 
 import jax
 from jax.experimental.ode import _heun_odeint, _fehlberg_odeint, _bosh_odeint, _owrenzen_odeint, _dopri5_odeint
@@ -62,6 +63,13 @@ num_stages = {"heun": 1,
               "owrenzen": 5,
               "dopri": 6
               }
+
+reg_dirs = {
+        "r2": "2020-05-02-22-08-30",
+        "r3": "2020-05-01-12-02-58",
+        "r4": "2020-05-15-23-34-14",
+        "r5": "2020-05-17-10-34-06"
+    }
 
 forward, model = init_model(reg_result)
 _loss_fn = jax.jit(_loss_fn)
@@ -214,6 +222,7 @@ def pareto_plot_nfe():
     plt.clf()
     plt.close(fig)
 
+
 def pareto_plot_nfe_all_orders():
     """
     Create pareto plot.
@@ -229,19 +238,12 @@ def pareto_plot_nfe_all_orders():
 
     sorted_lams = sorted(lams)
 
-    reg_dirs = {
-        "r2": "2020-05-02-22-08-30",
-        "r3": "2020-05-01-12-02-58",
-        "r4": "2020-05-15-23-34-14",
-        "r5": "2020-05-17-10-34-06"
-    }
-
     regs = ["r2", "r3", "r4", "r5"]
     num_points = len(regs)
     c_spacing = onp.linspace(0, 1, num=num_points)
     cmap = lambda ind: cm(c_spacing[ind])
 
-    # for dopri
+    # for different order solvers
     slices = {
         "r2": slice(None),
         "r3": slice(None),
@@ -297,6 +299,351 @@ def pareto_plot_nfe_all_orders():
     plt.clf()
     plt.close(fig)
 
+
+def pareto_reg():
+    """
+    Create pareto plot.
+    """
+    cm = plt.get_cmap('viridis')
+
+    font = {'family' : 'normal',
+            'weight' : 'bold',
+            'size'   : 14}
+    plt.rc('font', **font)
+    plt.rc('text', usetex=True)
+    fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
+
+    reg_train = reg  # the reg we trained on
+    reg_val = reg_result   # the reg we want to report
+
+    lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (dirname, reg_train))))
+    sorted_lams = sorted(lams)
+    reg_x, _ = zip(*map(partial(get_info_r, reg_train, dirname, reg_val), sorted_lams))
+    nfe_y, _ = zip(*map(partial(get_info, reg_train, dirname, method), sorted_lams))
+
+    reg_x = onp.log10(onp.array(reg_x))
+    nfe_y = onp.log10(onp.array(nfe_y))
+
+    anno = onp.array(sorted_lams)
+
+    # filter out nans and corresponding lams
+    finite_mask = onp.isfinite(reg_x)
+    reg_x = reg_x[finite_mask]
+    nfe_y = nfe_y[finite_mask]
+    anno = anno[finite_mask]
+
+    num_points = len(reg_x)
+    c_spacing = onp.linspace(0, 1, num=num_points)
+    cmap = lambda ind: cm(c_spacing[ind])
+
+    for i in range(num_points):
+        ax.scatter(reg_x[i], nfe_y[i], c=cmap(i))
+
+    ax.set_xlabel(r'Log Mean $\mathcal{R}_%s$' % reg_val[1])
+    ax.set_ylabel("Log Average Number of Function Evaluations")
+
+    norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
+    cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
+    cb1.set_label(r'Regularization Weight ($\lambda_%s$)' % reg_train[1])
+
+    plt.gcf().subplots_adjust(right=0.88, left=0.13)
+    # plt.gcf().subplots_adjust(right=0.88)
+
+    plt.savefig("%s/reg_val_%s_nfe_reg_train_%s_pareto.pdf" % (dirname, reg_val, reg_train))
+    plt.savefig("%s/reg_val_%s_nfe_reg_train_%s_pareto.png" % (dirname, reg_val, reg_train))
+    plt.clf()
+    plt.close(fig)
+
+
+def pareto_reg_all_orders():
+    """
+    Pareto plot reg and NFE.
+    """
+    cm = plt.get_cmap('viridis')
+    cm2 = plt.get_cmap('autumn')
+
+    font = {'family' : 'normal',
+            'weight' : 'bold',
+            'size'   : 14}
+    plt.rc('font', **font)
+    plt.rc('text', usetex=True)
+    fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
+
+    reg_val = reg_result   # the reg we want to report
+
+    # not sure how to do zorder, so manually do it
+    regs = list(reg_dirs.keys())
+    regs.remove(reg_val)
+    regs.append(reg_val)
+    for reg_train in regs:
+        reg_train_dirname = reg_dirs[reg_train]
+        lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (reg_train_dirname, reg_train))))
+        sorted_lams = sorted(lams)
+        if reg_val == "r3" and reg_train == "r4":
+            # remove one shitty outlier
+            sorted_lams = sorted_lams[:-1]
+        reg_x, _ = zip(*map(partial(get_info_r, reg_train, reg_train_dirname, reg_val), sorted_lams))
+        nfe_y, _ = zip(*map(partial(get_info, reg_train, reg_train_dirname, method), sorted_lams))
+
+        reg_x = onp.log10(onp.array(reg_x))
+        nfe_y = onp.log10(onp.array(nfe_y))
+
+        anno = onp.array(sorted_lams)
+
+        # filter out nans and corresponding lams
+        finite_mask = onp.isfinite(reg_x)
+        reg_x = reg_x[finite_mask]
+        nfe_y = nfe_y[finite_mask]
+        anno = anno[finite_mask]
+
+        num_points = len(reg_x)
+        c_spacing = onp.linspace(0, 1, num=num_points)
+        if reg_train == reg_val:
+            cmap = lambda ind: cm2(c_spacing[ind])
+        else:
+            cmap = lambda ind: cm(c_spacing[ind])
+
+        for i in range(num_points):
+            ax.scatter(reg_x[i], nfe_y[i], c=cmap(i))
+
+    ax.set_xlabel(r'Log Mean $\mathcal{R}_%s$' % reg_val[1])
+    ax.set_ylabel("Log Average Number of Function Evaluations")
+
+    # this will go away eventually? maybe not
+    lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (dirname, reg))))
+    sorted_lams = sorted(lams)
+    anno = sorted_lams
+    norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
+    cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
+    cb1.set_label(r'Regularization Weight ($\lambda_k$)')
+
+    plt.gcf().subplots_adjust(right=0.88, left=0.13)
+    # plt.gcf().subplots_adjust(right=0.88)
+
+    plt.savefig("%s/reg_val_%s_nfe_pareto.pdf" % (dirname, reg_val))
+    plt.savefig("%s/reg_val_%s_nfe_pareto.png" % (dirname, reg_val))
+    plt.clf()
+    plt.close(fig)
+
+
+def lam_reg_all_orders():
+    """
+    Plot lam vs. reg for different orders of reg.
+    """
+    cm = plt.get_cmap('copper')
+
+    font = {'family' : 'normal',
+            'weight' : 'bold',
+            'size'   : 14}
+    plt.rc('font', **font)
+    plt.rc('text', usetex=True)
+    fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
+
+    reg_val = reg_result   # the reg we want to report
+
+    reg_match_on_top = False
+    reg_match_on_bottom = True
+    regs = list(reg_dirs.keys())
+    if reg_match_on_top:
+        regs.remove(reg_val)
+        regs.append(reg_val)
+    elif reg_match_on_bottom:
+        regs.remove(reg_val)
+        regs.insert(0, reg_val)
+
+    num_points = len(regs)
+    c_spacing = onp.linspace(0, 1, num=num_points)
+    cmap = lambda ind: cm(c_spacing[ind])
+
+    log_reg = True
+
+    for reg_train in regs:
+        reg_train_dirname = reg_dirs[reg_train]
+        lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (reg_train_dirname, reg_train))))
+        sorted_lams = sorted(lams)
+        if reg_val == "r3" and reg_train == "r4":
+            # remove one shitty outlier
+            sorted_lams = sorted_lams[:-1]
+        reg_y, _ = zip(*map(partial(get_info_r, reg_train, reg_train_dirname, reg_val), sorted_lams))
+
+        lam_x = onp.log10(sorted_lams)
+        reg_y = onp.array(reg_y)
+        if log_reg:
+            reg_y = onp.log10(reg_y)
+
+        # filter out nans and corresponding lams
+        finite_mask = onp.isfinite(reg_y)
+        lam_x = lam_x[finite_mask]
+        reg_y = reg_y[finite_mask]
+
+        for i in range(len(lam_x)):
+            ax.scatter(lam_x[i], reg_y[i], c=cmap(int(reg_train[1]) - 2))
+
+    ax.set_xlabel(r'Log $\lambda_k$')
+    ax.set_ylabel(r'Mean $\mathcal{R}_%s$' % reg_val[1])
+
+    norm = mpl.colors.Normalize(vmin=2, vmax=5)  # other option is LogNorm
+    cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
+    cb1.set_label(r'Regularization Order ($k$)')
+
+    plt.gcf().subplots_adjust(right=0.88, left=0.13)
+    # plt.gcf().subplots_adjust(right=0.88)
+
+    log_str = "log" if log_reg else ""
+    plt.savefig("%s/lam_%sreg_val_%s_pareto.pdf" % (dirname, log_str, reg_val))
+    plt.savefig("%s/lam_%sreg_val_%s_pareto.png" % (dirname, log_str, reg_val))
+    plt.clf()
+    plt.close(fig)
+
+
+def reg_loss_all_orders():
+    """
+    Plot reg vs. log for different orders of reg.
+    """
+    cm = plt.get_cmap('copper')
+
+    font = {'family' : 'normal',
+            'weight' : 'bold',
+            'size'   : 14}
+    plt.rc('font', **font)
+    plt.rc('text', usetex=True)
+    fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
+
+    reg_val = reg_result   # the reg we want to report
+
+    reg_match_on_top = False
+    reg_match_on_bottom = True
+    regs = list(reg_dirs.keys())
+    if reg_match_on_top:
+        regs.remove(reg_val)
+        regs.append(reg_val)
+    elif reg_match_on_bottom:
+        regs.remove(reg_val)
+        regs.insert(0, reg_val)
+
+    num_points = len(regs)
+    c_spacing = onp.linspace(0, 1, num=num_points)
+    cmap = lambda ind: cm(c_spacing[ind])
+
+    log_reg = True
+    log_loss = False
+
+    for reg_train in regs:
+        reg_train_dirname = reg_dirs[reg_train]
+        lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (reg_train_dirname, reg_train))))
+        sorted_lams = sorted(lams)
+        if reg_val == "r3" and reg_train == "r4":
+            # remove one shitty outlier
+            sorted_lams = sorted_lams[:-1]
+        reg_x, loss_y = zip(*map(partial(get_info_r, reg_train, reg_train_dirname, reg_val), sorted_lams))
+        reg_x = onp.array(reg_x)
+        loss_y = onp.array(loss_y)
+
+        if log_reg:
+            reg_x = onp.log10(reg_x)
+        if log_loss:
+            loss_y = onp.log10(loss_y)
+
+        # filter out nans and corresponding lams
+        finite_mask = onp.isfinite(reg_x)
+        reg_x = reg_x[finite_mask]
+        loss_y = loss_y[finite_mask]
+
+        for i in range(len(reg_x)):
+            ax.scatter(reg_x[i], loss_y[i], c=cmap(int(reg_train[1]) - 2))
+
+    ax.set_ylabel(r'%s Average Loss' % ("Log" if log_loss else ""))
+    ax.set_xlabel(r'%s Mean $\mathcal{R}_%s$' % ("Log" if log_reg else "", reg_val[1]))
+
+    norm = mpl.colors.Normalize(vmin=2, vmax=5)  # other option is LogNorm
+    cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
+    cb1.set_label(r'Regularization Order ($k$)')
+
+    plt.gcf().subplots_adjust(right=0.88, left=0.13)
+    # plt.gcf().subplots_adjust(right=0.88)
+
+    reg_log_str = "log" if log_reg else ""
+    loss_log_str = "log" if log_loss else ""
+    plt.savefig("%s/%sreg_val_%s_%sloss_pareto.pdf" % (dirname, reg_log_str, reg_val, loss_log_str))
+    plt.savefig("%s/%sreg_val_%s_%sloss_pareto.png" % (dirname, reg_log_str, reg_val, loss_log_str))
+    plt.clf()
+    plt.close(fig)
+
+
+def reg_nfe_all_orders():
+    """
+    Plot reg vs. NFE for different order solvers.
+    """
+    cm = plt.get_cmap('copper')
+
+    font = {'family' : 'normal',
+            'weight' : 'bold',
+            'size'   : 14}
+    plt.rc('font', **font)
+    plt.rc('text', usetex=True)
+    fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
+
+    reg_order = int(reg[1])
+
+    reg_match_on_top = False
+    reg_match_on_bottom = True
+    methods_lst = list(method_orders.items())
+    methods_lst.sort(key=op.itemgetter(1))
+    if reg_match_on_top:
+        method_ = methods_lst.pop(reg_order - 2)
+        methods_lst.append(method_)
+    elif reg_match_on_bottom:
+        method_ = methods_lst.pop(reg_order - 2)
+        methods_lst.insert(0, method_)
+
+    num_points = len(methods_lst)
+    c_spacing = onp.linspace(0, 1, num=num_points)
+    cmap = lambda ind: cm(c_spacing[ind])
+
+    log_reg = True
+    log_nfe = False
+
+    for method_, method_order in methods_lst:
+        lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (dirname, reg))))
+        sorted_lams = sorted(lams)
+        reg_x, _ = zip(*map(partial(get_info_r, reg, dirname, reg), sorted_lams))
+        nfe_y, _ = zip(*map(partial(get_info, reg, dirname, method_), sorted_lams))
+        reg_x = onp.array(reg_x)
+        nfe_y = onp.array(nfe_y)
+
+        # convert to stps and normalize
+        stps_y = (nfe_y - 2) / num_stages[method_]
+        stps_y /= onp.max(stps_y)
+
+        if log_reg:
+            reg_x = onp.log10(reg_x)
+        if log_nfe:
+            stps_y = onp.log10(stps_y)
+
+        # filter out nans and corresponding lams
+        finite_mask = onp.isfinite(reg_x)
+        reg_x = reg_x[finite_mask]
+        stps_y = stps_y[finite_mask]
+
+        for i in range(len(reg_x)):
+            ax.scatter(reg_x[i], stps_y[i], c=cmap(method_order - 2))
+
+    ax.set_xlabel(r'%s Mean $\mathcal{R}_%s$' % ("Log" if log_reg else "", reg[1]))
+    ax.set_ylabel(r'%s Average Number of Steps (Normalized)' % ("Log" if log_nfe else ""))
+
+    norm = mpl.colors.Normalize(vmin=2, vmax=5)  # other option is LogNorm
+    cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
+    cb1.set_label(r'Order of Solver')
+
+    plt.gcf().subplots_adjust(right=0.88, left=0.13)
+    # plt.gcf().subplots_adjust(right=0.88)
+
+    reg_log_str = "log" if log_reg else ""
+    nfe_log_str = "log" if log_nfe else ""
+    plt.savefig("%s/%sreg_val_%s_%snfe_pareto.pdf" % (dirname, reg_log_str, reg, nfe_log_str))
+    plt.savefig("%s/%sreg_val_%s_%snfe_pareto.png" % (dirname, reg_log_str, reg, nfe_log_str))
+    plt.clf()
+    plt.close(fig)
 
 def nfe_train_test():
     """
@@ -419,30 +766,30 @@ def get_info_r(reg, dirname, reg_result, lam):
 
     itr = 96000
 
-    # if reg_result == reg:
-    #     reg_val = meta["info"][itr]["loss_reg"]
-    # else:
-    reg_filename = "%s/reg_%s_lam_%.18e_%d_%s_reg.pickle" % (dirname, reg, lam, itr, reg_result)
-    try:
-        reg_file = open(reg_filename, "rb")
-        reg_val = pickle.load(reg_file)
-        reg_file.close()
-    except IOError:
-        print("Calculating %s for %.4e regularizing %s" % (reg_result, lam, reg))
-        param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
-        params = pickle.load(param_file)
-        regs = []
-        for test_batch_num in range(num_test_batches):
-            print(test_batch_num, num_test_batches)
-            test_batch = next(ds_train_eval)
-            regs.append(get_reg(params, test_batch[0]))
-        reg_val = onp.mean(regs)
-        reg_file = open(reg_filename, "wb")
-        pickle.dump(reg_val, reg_file)
-        reg_file.close()
+    if reg_result == reg:
+        reg_val = meta["info"][itr]["loss_reg"]
+    else:
+        reg_filename = "%s/reg_%s_lam_%.18e_%d_%s_reg.pickle" % (dirname, reg, lam, itr, reg_result)
+        try:
+            reg_file = open(reg_filename, "rb")
+            reg_val = pickle.load(reg_file)
+            reg_file.close()
+        except IOError:
+            print("Calculating %s for %.4e regularizing %s" % (reg_result, lam, reg))
+            param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+            params = pickle.load(param_file)
+            regs = []
+            for test_batch_num in range(num_test_batches):
+                print(test_batch_num, num_test_batches)
+                test_batch = next(ds_train_eval)
+                regs.append(get_reg(params, test_batch[0]))
+            reg_val = onp.mean(regs)
+            reg_file = open(reg_filename, "wb")
+            pickle.dump(reg_val, reg_file)
+            reg_file.close()
 
-    nfe = meta["info"][itr]["nfe"]
-    return reg_val, nfe
+    loss = meta["info"][itr]["loss"]
+    return reg_val, loss
 
 
 def nfe_r():
@@ -686,17 +1033,16 @@ def r_over_training():
     plt.close(fig)
 
 
-def plot_nfe_over_training():
-    cm = plt.get_cmap('viridis')
+def plot_nfe_loss_over_training():
 
     font = {'family' : 'normal',
             'weight' : 'bold',
             'size'   : 14}
     plt.rc('font', **font)
     plt.rc('text', usetex=True)
-    fig, ax = plt.subplots()
+    fig, ax_nfe = plt.subplots()
 
-    lam = 1e3
+    lam = sorted(lams)[54]
     meta_reg_file = open("%s/reg_%s_lam_%.18e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
     meta_reg = pickle.load(meta_reg_file)
 
@@ -704,24 +1050,56 @@ def plot_nfe_over_training():
     meta_none = pickle.load(meta_none_file)
 
     itrs = list(meta_reg["info"].keys())
+    plot_itrs = onp.array(itrs) / 600  # change to epochs
+
+    line_kwargs = {
+        "lw": 3
+    }
+
     reg_nfe = [meta_reg["info"][itr]["nfe"] for itr in itrs]
     none_nfe = [meta_none["info"][itr]["nfe"] for itr in itrs]
 
-    ax.plot(itrs, reg_nfe, c="blue", label="regularized")
-    ax.plot(itrs, none_nfe, c='red', label="unregularized")
+    nfe_colour = 'tab:blue'
+    ax_nfe.plot(plot_itrs, reg_nfe, c=nfe_colour, **line_kwargs)
+    ax_nfe.plot(plot_itrs, none_nfe, c=nfe_colour, linestyle="--", **line_kwargs)
 
-    ax.set_xlabel("Training Iteration")
-    ax.set_ylabel("Average Number of Function Evaluations")
+    ax_acc = ax_nfe.twinx()
 
-    plt.legend()
-    plt.savefig("%s/nfe_over_training.pdf" % dirname)
-    plt.savefig("%s/nfe_over_training.png" % dirname)
+    reg_acc = (1 - onp.array([meta_reg["info"][itr]["acc"] for itr in itrs])) * 100
+    none_acc = (1 - onp.array([meta_none["info"][itr]["acc"] for itr in itrs])) * 100
+
+    acc_colour = 'tab:red'
+
+    ax_acc.plot(plot_itrs, reg_acc, c=acc_colour, **line_kwargs)
+    ax_acc.plot(plot_itrs, none_acc, c=acc_colour, linestyle="--", **line_kwargs)
+
+    ax_nfe.set_xlabel("Training Epoch")
+
+    ax_nfe.set_ylabel("Average Number of Function Evaluations", color=nfe_colour)
+    ax_nfe.tick_params(axis='y', labelcolor=nfe_colour)
+
+    ax_acc.set_ylabel(r"Training Error ($\%$)", color=acc_colour)
+    ax_acc.tick_params(axis='y', labelcolor=acc_colour)
+
+    plt.legend(
+        [mpl.lines.Line2D([0], [0], color="black", **line_kwargs),
+         mpl.lines.Line2D([0], [0], color="black", linestyle="--", **line_kwargs)],
+        [r"$\lambda_3=\verb|%.2e|$" % lam, r"$\lambda_3=\verb|0|$" ],
+        loc=(0.55, 0.55))
+    plt.savefig("%s/nfe_loss_over_training.pdf" % dirname)
+    plt.savefig("%s/nfe_loss_over_training.png" % dirname)
     plt.clf()
     plt.close(fig)
 
 
 if __name__ == "__main__":
-    get_info_r(reg, dirname, reg_result, parse_args.lam)
+    plot_nfe_loss_over_training()
+    # reg_nfe_all_orders()
+    # reg_loss_all_orders()
+    # lam_reg_all_orders()
+    # pareto_reg()
+    # pareto_reg_all_orders()
+    # get_info_r(reg, dirname, reg_result, parse_args.lam)
 
     # for ind, lam in enumerate(lams):
     #     print(ind, len(lams))
