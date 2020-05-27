@@ -8,6 +8,7 @@ from functools import reduce, partial
 import argparse
 
 import jax
+import jax.numpy as jnp
 from jax.experimental.ode import _heun_odeint, _fehlberg_odeint, _bosh_odeint, _owrenzen_odeint, _dopri5_odeint
 
 import matplotlib as mpl
@@ -37,6 +38,8 @@ dirname = parse_args.dirname
 reg = parse_args.reg
 reg_result = parse_args.reg_result
 rng = jax.random.PRNGKey(0)
+lam = parse_args.lam
+final_itr = 12800
 num_blocks = 0
 ode_kwargs = {
     "atol": 1.4e-8,
@@ -59,6 +62,10 @@ num_stages = {"heun": 1,
 model = init_model(ode_kwargs, ode_kwargs)
 get_reg = lambda *args: partial(model["forward"], reg_result, methods[method])(*args)[3]  # TODO: always uses dopri
 get_reg = jax.jit(get_reg)
+def get_sol(*args, **kwargs):
+    res = partial(model["forward"], reg_result, methods[method])(*args, **kwargs)
+    return res[1], res[-1]["gen"]
+get_z = lambda *args: partial(model["forward"], reg_result, methods[method])(*args)[0]
 method = parse_args.method
 model["nfe"] = jax.jit(partial(model["nfe"], methods[method]))
 _, ds_train_eval, meta = init_physionet_data(rng, parse_args)
@@ -114,13 +121,13 @@ def get_info(reg, dirname, method, lam):
     # loss = 1 - meta["info"][itr]["acc"]
     # log-log and log-linear both look good
     # reg_val = meta["info"][itr]["loss_reg"]
-    reg_val = meta["info"][itr]["gen_r"]
-    # loss = meta["info"][itr]["mse"]
-    loss = meta["info"][itr]["loss"]
+    # reg_val = meta["info"][itr]["gen_r"]
+    loss = meta["info"][itr]["mse"]
+    # loss = meta["info"][itr]["loss"]
 
     meta_file.close()
     # print(nfe, nfe_)
-    return nfe, reg_val
+    return nfe, loss
 
 
 def get_info_r(reg, dirname, reg_result, lam):
@@ -175,7 +182,7 @@ def pareto_plot_nfe():
     fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
 
     sorted_lams = sorted(lams)
-    x, y = zip(*map(partial(get_info, reg, dirname), sorted_lams))
+    x, y = zip(*map(partial(get_info, reg, dirname, method), sorted_lams))
     anno = sorted_lams
 
     num_points = len(x)
@@ -189,7 +196,7 @@ def pareto_plot_nfe():
     maxY = False
     sorted_list = sorted([[x[i], y[i]] for i in range(len(x))], reverse=maxY)
     pareto_front = [sorted_list[0]]
-    for pair in sorted_list[1:]:
+    for i, pair in enumerate(sorted_list[1:]):
         if maxY:
             if pair[1] >= pareto_front[-1][1]:
                 pareto_front.append(pair)
@@ -199,6 +206,11 @@ def pareto_plot_nfe():
     pf_X = [pair[0] for pair in pareto_front]
     pf_Y = [pair[1] for pair in pareto_front]
     ax.plot(pf_X, pf_Y, c='0.35')
+    print(pf_X[-1])
+    print(pf_Y[-1])
+    print(x.index(pf_X[-1]))
+    print(y.index(pf_Y[-1]))
+    print(sorted_lams[y.index(pf_Y[-1])])
 
     ax.set_xlabel("Average Number of Function Evaluations")
     ax.set_ylabel("Mean Regularization")
@@ -212,8 +224,8 @@ def pareto_plot_nfe():
     plt.gcf().subplots_adjust(right=0.88, left=0.14)
     # plt.gcf().subplots_adjust(right=0.88)
 
-    plt.savefig("%s/nfe_reg_%s_pareto.pdf" % (dirname, reg))
-    plt.savefig("%s/nfe_reg_%s_pareto.png" % (dirname, reg))
+    # plt.savefig("%s/nfe_reg_%s_pareto.pdf" % (dirname, reg))
+    # plt.savefig("%s/nfe_reg_%s_pareto.png" % (dirname, reg))
     plt.clf()
     plt.close(fig)
 
@@ -645,8 +657,106 @@ def r_over_training():
     plt.close(fig)
 
 
+def visualize_data():
+    """
+    Visualize data to see a spicy example we can use for plots.
+    """
+    ds_train, ds_test, meta = init_physionet_data(rng, parse_args)
+    num_batches = meta["num_batches"]
+    all_features = [
+        'Weight', 'Albumin', 'ALP', 'ALT', 'AST', 'Bilirubin', 'BUN',
+        'Cholesterol', 'Creatinine', 'DiasABP', 'FiO2', 'GCS', 'Glucose', 'HCO3', 'HCT', 'HR', 'K', 'Lactate', 'Mg',
+        'MAP', 'MechVent', 'Na', 'NIDiasABP', 'NIMAP', 'NISysABP', 'PaCO2', 'PaO2', 'pH', 'Platelets', 'RespRate',
+        'SaO2', 'SysABP', 'Temp', 'TroponinI', 'TroponinT', 'Urine', 'WBC'
+    ]
+    features = ['DiasABP', 'Lactate', 'Mg', 'MAP', 'MechVent', 'Na', 'RespRate', 'Temp']
+
+    none_dirname = "2020-05-08-21-22-39"
+    param_file = open("%s/reg_%s_lam_%.12e_%d_fargs.pickle" % (none_dirname, "none", 0, final_itr), "rb")
+    params = pickle.load(param_file)
+    param_file.close()
+
+    reg_dirname = "2020-05-10-21-22-28"
+    reg_lam = sorted(lams)[0]
+    reg = "r5"
+    num_samples = 3
+    reg_param_file = open("%s/reg_%s_lam_%.12e_%d_fargs.pickle" % (reg_dirname, reg, reg_lam, final_itr), "rb")
+    reg_params = pickle.load(reg_param_file)
+    reg_param_file.close()
+
+    none_meta_file = open("%s/reg_%s_lam_%.12e_num_blocks_%d_meta.pickle" % (none_dirname, "none", 0, 1), "rb")
+    none_meta = pickle.load(none_meta_file)
+    none_meta_file.close()
+
+    reg_meta_file = open("%s/reg_%s_lam_%.12e_num_blocks_%d_meta.pickle" % (reg_dirname, reg, reg_lam, 0), "rb")
+    reg_meta = pickle.load(reg_meta_file)
+    reg_meta_file.close()
+
+    none_nfe = none_meta["info"][final_itr]["gen_nfe"]
+    reg_nfe = reg_meta["info"][final_itr]["gen_nfe"]
+
+    print(none_nfe, reg_nfe)
+
+    for batch_num in range(num_batches):
+        train_batch = next(ds_train)
+        tp_to_predict = jnp.linspace(train_batch["observed_tp"][0], train_batch["observed_tp"][-1], num=1000)
+        sol, sol_nfe = get_sol(params,
+                               train_batch["observed_data"],
+                               train_batch["observed_tp"],
+                               tp_to_predict,
+                               train_batch["observed_mask"],
+                               num_samples)
+        reg_sol, reg_nfe = get_sol(reg_params,
+                                   train_batch["observed_data"],
+                                   train_batch["observed_tp"],
+                                   tp_to_predict,
+                                   train_batch["observed_mask"],
+                                   num_samples)
+        feature = features[0]
+        feature_ind = all_features.index(feature)
+        print(sol.shape)
+        print(sol_nfe, reg_nfe)
+        plot_ind = 28
+        for batch_ind in range(parse_args.batch_size):
+            if batch_ind == plot_ind:
+                ex = train_batch["observed_data"][batch_ind]
+                mask = train_batch["observed_mask"][batch_ind]
+
+                mask_ = mask[:, feature_ind] == 1
+                t_obs = train_batch["observed_tp"][mask_]
+                obs = ex[mask_, feature_ind]
+
+                print(batch_ind, t_obs.shape, obs.shape)
+
+                if len(t_obs) > 10:
+                    for t_ in t_obs:
+                        plt.axvline(t_, c="red", alpha=0.2)
+                    clrs = ["blue", "orange", "green"]
+                    for i in range(num_samples):
+                        sol_kwargs = {"label": "reg (%.2f NFE)" % sol_nfe} if i == 0 else {}
+                        reg_kwargs = {"label": "unreg (%.2f NFE)" % reg_nfe} if i == 0 else {}
+                        plt.plot(tp_to_predict, sol[i, batch_ind, :, feature_ind], c="blue", **sol_kwargs)
+                        plt.plot(tp_to_predict, reg_sol[i, batch_ind, :, feature_ind], c="orange", **reg_kwargs)
+                    # plt.scatter(t_obs, obs)
+                    plt.legend()
+                    plt.xlabel("Time")
+                    plt.ylabel(feature)
+                    plt.savefig("%s/viz_%d.png" % (none_dirname, plot_ind))
+                    plt.savefig("%s/viz_%d.pdf" % (none_dirname, plot_ind))
+                    plt.clf()
+                    return
+
+        # if plt.waitforbuttonpress():
+        #     continue
+
+        # for pt, m_ in zip(ex, mask):
+        #     if m_[feature_ind] == 1:
+        #         print(pt[feature_ind])
+
+
 if __name__ == "__main__":
-    get_info_r(reg, dirname, reg_result, parse_args.lam)
+    visualize_data()
+    # get_info_r(reg, dirname, reg_result, parse_args.lam)
 
     # sanity_check_nfe()
 
