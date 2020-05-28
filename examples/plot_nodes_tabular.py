@@ -17,7 +17,7 @@ import numpy as onp
 
 import jax.numpy as jnp
 
-from nodes_tabular import init_model, init_data
+from nodes_tabular import init_model, init_data, _loss_fn
 
 parser = argparse.ArgumentParser('Plot')
 parser.add_argument('--lam', type=float, default=0)
@@ -42,7 +42,7 @@ def parse_lam(filename):
     return float(filename.split("_")[3])
 
 
-lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (dirname, reg))))
+# lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (dirname, reg))))
 
 
 def get_nfe(reg, dirname, lam):
@@ -100,7 +100,9 @@ def get_exact_likelihood(reg, dirname, lam):
             _key, = jax.random.split(_key, num=1)
             batch = next(ds_train)
 
-            loss.append(forward_exact(_key, params, batch))
+            z, delta_logp, _ = forward_exact(_key, params, batch)
+            loss_ = _loss_fn(z, delta_logp)
+            loss.append(loss_)
             bs.append(len(batch))
 
         loss = jnp.array(loss)
@@ -179,4 +181,4 @@ def pareto_plot_nfe():
 
 
 if __name__ == "__main__":
-    print(get_nfe(reg, dirname, lam))
+    print(get_exact_likelihood(reg, dirname, lam))
