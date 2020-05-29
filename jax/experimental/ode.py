@@ -512,6 +512,44 @@ def odeint_grid(func, y0, t, *args, step_size):
   """
   return _odeint_grid_wrapper(func, step_size, y0, t, *args)
 
+def odeint_grid_sepaux(fwd_func, rev_func, y0, t, *args, step_size):
+  """Fixed-grid solver for integrating augmented dynamics. Assumes two auxiliary terms since we want to do the
+  sum for Finlay.
+
+  Args:
+    func: function to evaluate the time derivative of the solution `y` at time
+      `t` as `func(y, t, *args)`, producing the same shape/structure as `y0`.
+    y0: array or pytree of arrays representing the initial value for the state.
+    t: array of float times for evaluation, like `np.linspace(0., 10., 101)`,
+      in which the values must be strictly increasing.
+    *args: tuple of additional arguments for `func`.
+    step_size: step size for the fixed-grid solver
+  Returns:
+    Values of the solution `y` (i.e. integrated system values) at each time
+    point in `t`, represented as an array (or pytree of arrays) with the same
+    shape/structure as `y0` except with a new leading axis of length `len(t)`.
+  """
+  return _odeint_grid_sepaux_wrapper(fwd_func, rev_func, step_size, y0, t, *args)
+
+def odeint_grid_sepaux_one(fwd_func, rev_func, y0, t, *args, step_size):
+  """Fixed-grid solver for integrating augmented dynamics. Assumes two auxiliary terms since we want to do the
+  sum for Finlay.
+
+  Args:
+    func: function to evaluate the time derivative of the solution `y` at time
+      `t` as `func(y, t, *args)`, producing the same shape/structure as `y0`.
+    y0: array or pytree of arrays representing the initial value for the state.
+    t: array of float times for evaluation, like `np.linspace(0., 10., 101)`,
+      in which the values must be strictly increasing.
+    *args: tuple of additional arguments for `func`.
+    step_size: step size for the fixed-grid solver
+  Returns:
+    Values of the solution `y` (i.e. integrated system values) at each time
+    point in `t`, represented as an array (or pytree of arrays) with the same
+    shape/structure as `y0` except with a new leading axis of length `len(t)`.
+  """
+  return _odeint_grid_sepaux_one_wrapper(fwd_func, rev_func, step_size, y0, t, *args)
+
 def odeint_aux(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
   """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
 
@@ -611,6 +649,18 @@ def _odeint_grid_wrapper(func, step_size, y0, ts, *args):
   out, nfe = _rk4_odeint(func, step_size, y0, ts, *args)
   return jax.vmap(unravel)(out), nfe
 
+@partial(jax.jit, static_argnums=(0, 1, 2))
+def _odeint_grid_sepaux_wrapper(fwd_func, rev_func, step_size, y0, ts, *args):
+  fwd_func = ravel_first_arg(fwd_func, ravel_pytree(y0[0])[1])
+  rev_func = ravel_first_arg(rev_func, ravel_pytree(y0)[1])
+  return _rk4_odeint_sepaux(fwd_func, rev_func, step_size, y0, ts, *args)
+
+@partial(jax.jit, static_argnums=(0, 1, 2))
+def _odeint_grid_sepaux_one_wrapper(fwd_func, rev_func, step_size, y0, ts, *args):
+  fwd_func = ravel_first_arg(fwd_func, ravel_pytree(y0[0])[1])
+  rev_func = ravel_first_arg(rev_func, ravel_pytree(y0)[1])
+  return _rk4_odeint_sepaux_one(fwd_func, rev_func, step_size, y0, ts, *args)
+
 @partial(jax.jit, static_argnums=(0, 1, 2, 3))
 def _odeint_aux_wrapper(func, rtol, atol, mxstep, y0, ts, *args):
   return _dopri5_odeint_aux(func, rtol, atol, mxstep, y0, ts, *args)
@@ -699,10 +749,6 @@ def _dopri5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
 def _rk4_odeint(func, step_size, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
 
-  nitrs = np.ceil((ts[-1] - ts[0]) / step_size)
-  tgrid = np.concatenate((np.arange(0, nitrs) * step_size + ts[0],
-                          ts[-1][None]))
-
   def step_func(cur_t, dt, cur_y):
     """
     Take one step of RK4.
@@ -713,23 +759,61 @@ def _rk4_odeint(func, step_size, y0, ts, *args):
     k4 = func_(cur_y + dt * k3, cur_t + dt)
     return (k1 + 2 * k2 + 2 * k3 + k4) * (dt / 6)
 
+  def cond_fun(carry):
+    """
+    Check if we've reached the last timepoint.
+    """
+    cur_y, cur_t, cur_nfe = carry
+    return cur_t < ts[-1]
+
   # TODO: this doesn't work for multiple time points
-  def scan_fun(carry, next_t):
+  def body_fun(carry):
     """
-    Scans over time grid.
+    Take one step of RK4.
     """
-    cur_y, cur_t = carry
+    cur_y, cur_t, cur_nfe = carry
+    next_t = lax.min(cur_t + step_size, ts[-1])
     dt = next_t - cur_t
     dy = step_func(cur_t, dt, cur_y)
     next_y = cur_y + dy
-    new_carry = [next_y, next_t]
-    return new_carry, None
+    new_nfe = cur_nfe + 4
+    new_carry = [next_y, next_t, new_nfe]
+    return new_carry
 
   init_t = ts[0]
-  init_carry = [y0, init_t]
-  y1 = lax.scan(scan_fun, init_carry, tgrid[1:])[0][0]
-  nfe = nitrs * 4
+  init_nfe = 0
+  init_carry = [y0, init_t, init_nfe]
+  y1, t1, nfe = lax.while_loop(cond_fun, body_fun, init_carry)
   return np.concatenate((y0[None], y1[None])), nfe
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2))
+def _rk4_odeint_sepaux_one(fwd_func, rev_func, step_size, y0, ts, *args):
+  flat_y0, unravel = ravel_pytree(y0[0])
+  flat_out, nfe = _rk4_odeint(fwd_func, step_size, flat_y0, ts, *args)
+  out = jax.vmap(unravel)(flat_out)
+  def aug_init(y):
+    """
+    Initialize dynamics with 0 for logpx and regs.
+    TODO: this is copied from nodes_ffjord.py
+    """
+    batch_size = y.shape[0]
+    return y, np.zeros((batch_size, 1)), np.zeros((batch_size, 1))
+  return jax.vmap(aug_init)(out), nfe
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2))
+def _rk4_odeint_sepaux(fwd_func, rev_func, step_size, y0, ts, *args):
+  flat_y0, unravel = ravel_pytree(y0[0])
+  flat_out, nfe = _rk4_odeint(fwd_func, step_size, flat_y0, ts, *args)
+  out = jax.vmap(unravel)(flat_out)
+  def aug_init(y):
+    """
+    Initialize dynamics with 0 for logpx and regs.
+    TODO: this is copied from nodes_ffjord.py
+    """
+    batch_size = y.shape[0]
+    return y, np.zeros((batch_size, 1)), np.zeros((batch_size, 1)), np.zeros((batch_size, 1))
+  return jax.vmap(aug_init)(out), nfe
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3))
 def _dopri5_odeint_aux(func, rtol, atol, mxstep, y0, ts, *args):
@@ -1180,6 +1264,14 @@ def _rk4_odeint_fwd(func, step_size, y0, ts, *args):
   ys, nfe = _rk4_odeint(func, step_size, y0, ts, *args)
   return (ys, nfe), (ys, ts, args)
 
+def _rk4_odeint_sepaux_fwd(fwd_func, rev_func, step_size, y0, ts, *args):
+  ys, nfe = _rk4_odeint_sepaux(fwd_func, rev_func, step_size, y0, ts, *args)
+  return (ys, nfe), (ys, ts, args)
+
+def _rk4_odeint_sepaux_one_fwd(fwd_func, rev_func, step_size, y0, ts, *args):
+  ys, nfe = _rk4_odeint_sepaux_one(fwd_func, rev_func, step_size, y0, ts, *args)
+  return (ys, nfe), (ys, ts, args)
+
 def _odeint_aux_fwd(func, rtol, atol, mxstep, y0, ts, *args):
   def aug_init(y):
     """
@@ -1267,10 +1359,10 @@ def _rk4_odeint_rev(func, step_size, res, g):
     t_bar = np.dot(func(ys[i], ts[i], *args), g[i])
     t0_bar = t0_bar - t_bar
     # Run augmented system backwards to previous observation
-    _, y_bar, t0_bar, args_bar = _rk4_odeint(
-        aug_dynamics, step_size, (ys[i], y_bar, t0_bar, args_bar),
+    _, y_bar, t0_bar, args_bar = odeint_grid(
+        aug_dynamics, (ys[i], y_bar, t0_bar, args_bar),
         np.array([-ts[i], -ts[i - 1]]),
-        *args)[0]
+        *args, step_size=step_size)[0]
     y_bar, t0_bar, args_bar = tree_map(op.itemgetter(1), (y_bar, t0_bar, args_bar))
     # Add gradient from current output
     y_bar = y_bar + g[i - 1]
@@ -1281,6 +1373,24 @@ def _rk4_odeint_rev(func, step_size, res, g):
       scan_fun, init_carry, np.arange(len(ts) - 1, 0, -1))
   ts_bar = np.concatenate([np.array([t0_bar]), rev_ts_bar[::-1]])
   return (y_bar, ts_bar, *args_bar)
+
+def _rk4_odeint_sepaux_rev(fwd_func, rev_func, step_size, res, g):
+  flatten_func = jax.vmap(lambda pytree: ravel_pytree(pytree)[0])  # flatten everything but time dim
+  flat_res = flatten_func(res[0])
+  flat_g = flatten_func(g[0])
+  result = _rk4_odeint_rev(rev_func, step_size, (flat_res, *res[1:]), (flat_g, g[1]))
+
+  unravel = ravel_pytree(tree_map(op.itemgetter(0), res[0]))[1]
+  return (unravel(result[0]), *result[1:])
+
+def _rk4_odeint_sepaux_one_rev(fwd_func, rev_func, step_size, res, g):
+  flatten_func = jax.vmap(lambda pytree: ravel_pytree(pytree)[0])  # flatten everything but time dim
+  flat_res = flatten_func(res[0])
+  flat_g = flatten_func(g[0])
+  result = _rk4_odeint_rev(rev_func, step_size, (flat_res, *res[1:]), (flat_g, g[1]))
+
+  unravel = ravel_pytree(tree_map(op.itemgetter(0), res[0]))[1]
+  return (unravel(result[0]), *result[1:])
 
 def _odeint_rev2(func, rtol, atol, mxstep, res, g):
   ys, ts, args = res
@@ -1388,6 +1498,8 @@ methods = {
 }
 _dopri5_odeint.defvjp(_odeint_fwd, _odeint_rev)
 _rk4_odeint.defvjp(_rk4_odeint_fwd, _rk4_odeint_rev)
+_rk4_odeint_sepaux.defvjp(_rk4_odeint_sepaux_fwd, _rk4_odeint_sepaux_rev)
+_rk4_odeint_sepaux_one.defvjp(_rk4_odeint_sepaux_one_fwd, _rk4_odeint_sepaux_one_rev)
 _dopri5_odeint_sepaux.defvjp(_odeint_sepaux_fwd, _odeint_sepaux_rev)
 _dopri5_odeint_fin_sepaux.defvjp(_odeint_fin_sepaux_fwd, _odeint_sepaux_rev)
 _dopri5_odeint_sepaux2.defvjp(_odeint_sepaux2_fwd, _odeint_sepaux2_rev)
