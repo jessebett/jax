@@ -10,7 +10,7 @@ import operator as op
 
 import jax
 from jax.experimental.ode import \
-    _heun_odeint, _fehlberg_odeint, _bosh_odeint, _owrenzen_odeint, _dopri5_odeint, _adams_odeint
+    _heun_odeint, _fehlberg_odeint, _bosh_odeint, _owrenzen_odeint, _dopri5_odeint, _tanyam_odeint, _adams_odeint
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -19,6 +19,7 @@ import numpy as onp
 import jax.numpy as jnp
 
 from nodes_hk2 import init_model, init_data, _reg_loss_fn, _loss_fn
+# from nodes_ffjord import init_data as init_data_train_test
 
 parser = argparse.ArgumentParser('Plot')
 parser.add_argument('--batch_size', type=int, default=50)
@@ -29,7 +30,7 @@ parser.add_argument('--save_freq', type=int, default=640)
 parser.add_argument('--data_root', type=str, default="./")  # TODO: hard code this on cluster
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--method', type=str,
-                    choices=["heun", "fehlberg", "bosh", "owrenzen", "dopri", "adams"],
+                    choices=["heun", "fehlberg", "bosh", "owrenzen", "dopri", "tanyam", "adams"],
                     default="dopri")  # TODO: flag that needs to be set!!
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default='none')
 parser.add_argument('--reg_result', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default=None)
@@ -52,6 +53,7 @@ methods = {"heun": _heun_odeint,
            "bosh": _bosh_odeint,
            "owrenzen": _owrenzen_odeint,
            "dopri": _dopri5_odeint,
+           "tanyam": _tanyam_odeint,
            "adams": _adams_odeint
            }
 method_orders = {"heun": 2,
@@ -80,6 +82,8 @@ method = parse_args.method
 count_nfe = jax.jit(partial(model["plot_nfe"], methods[method]))
 # info_per_ex = jax.jit(partial(model["plot_nfe_per_ex"], methods[method]))
 _, ds_train_eval, meta = init_data()
+num_eval_batches = meta["num_test_batches"]
+# _, ds_test, meta = init_data_train_test()
 num_test_batches = meta["num_test_batches"]
 
 
@@ -120,6 +124,10 @@ def get_info(reg, dirname, method, lam):
     """
     Get (final NFE, final loss) pair for a given lambda.
     """
+    if reg == "none":
+        num_blocks = 1
+    else:
+        num_blocks = 0
     meta_file = open("%s/reg_%s_lam_%.18e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "rb")
     meta = pickle.load(meta_file)
     meta_file.close()
@@ -137,8 +145,8 @@ def get_info(reg, dirname, method, lam):
         param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
         params = pickle.load(param_file)
         nfes = []
-        for test_batch_num in range(num_test_batches):
-            print(test_batch_num, num_test_batches)
+        for test_batch_num in range(num_eval_batches):
+            print(test_batch_num, num_eval_batches)
             test_batch = next(ds_train_eval)
             nfes.append(count_nfe(params, *test_batch))
         nfe = onp.mean(nfes)
@@ -161,6 +169,33 @@ def get_info(reg, dirname, method, lam):
 
     # TODO: train or test
     return nfe, loss
+
+
+def get_nfe_test(reg, dirname, method, lam):
+    """
+    Get (final NFE, final loss) pair for a given lambda.
+    """
+    itr = 96000
+    nfe_filename = "%s/reg_%s_lam_%.12e_%d_%s_nfe_test.pickle" % (dirname, reg, lam, itr, method)
+    try:
+        nfe_file = open(nfe_filename, "rb")
+        nfe = pickle.load(nfe_file)
+        nfe_file.close()
+    except IOError:
+        print("Calculating NFE for %.4e" % lam)
+        param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+        params = pickle.load(param_file)
+        nfes = []
+        for test_batch_num in range(num_test_batches):
+            print(test_batch_num, num_test_batches)
+            test_batch = next(ds_test)
+            nfes.append(count_nfe(params, *test_batch))
+        nfe = onp.mean(nfes)
+        nfe_file = open(nfe_filename, "wb")
+        pickle.dump(nfe, nfe_file)
+        nfe_file.close()
+
+    return nfe
 
 
 def pareto_plot_nfe():
@@ -804,34 +839,26 @@ def nfe_train_test():
     plt.rc('text', usetex=True)
     fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
 
-    itr = 96000
-
-    def get_nfe_train_test(lam):
-        nfe_filename = "%s/reg_test_%s_lam_%.12e_%d_nfe.pickle" % (dirname, reg, lam, itr)
-        nfe_file = open(nfe_filename, "rb")
-        nfe_test = pickle.load(nfe_file)
-        nfe_file.close()
-
-        nfe_filename = "%s/reg_%s_lam_%.12e_%d_nfe.pickle" % (dirname, reg, lam, itr)
-        nfe_file = open(nfe_filename, "rb")
-        nfe = pickle.load(nfe_file)
-        nfe_file.close()
-
-        return nfe, nfe_test
-
     sorted_lams = sorted(lams)
-    nfe_train, nfe_test = zip(*map(get_nfe_train_test, sorted_lams))
+    nfe_train, _ = zip(*map(partial(get_info, reg, dirname, method), sorted_lams))
+    nfe_test = list(map(partial(get_nfe_test, reg, dirname, method), sorted_lams))
     anno = sorted_lams
+
+    diff_train_test = onp.array(nfe_train) - onp.array(nfe_test)
 
     num_points = len(nfe_train)
     c_spacing = onp.linspace(0, 1, num=num_points)
     cmap = lambda ind: cm(c_spacing[ind])
 
     for i in range(num_points):
-        ax.scatter(nfe_train[i], nfe_test[i], c=cmap(i))
+        ax.scatter(onp.log10(sorted_lams[i]), onp.abs(diff_train_test[i]), c="blue")
 
-    ax.set_xlabel("Final Average NFE on Train")
-    ax.set_ylabel("Final Average NFE on Test")
+    # nfe_train_none, _ = get_info("none", "2020-05-01-12-02-58", "dopri", 0)
+    # nfe_test_none = get_nfe_test("none", "2020-05-01-12-02-58", "dopri", 0)
+    # ax.scatter(0, nfe_train_none - nfe_test_none, c="blue")
+
+    ax.set_xlabel(r"Log $\lambda_%s$" % reg[1])
+    ax.set_ylabel("NFE Train - NFE Test")
 
     norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
     cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
@@ -840,8 +867,8 @@ def nfe_train_test():
     plt.gcf().subplots_adjust(right=0.88, left=0.13)
     # plt.gcf().subplots_adjust(right=0.88)
 
-    plt.savefig("%s/nfe_train_test_%s_pareto.pdf" % (dirname, reg))
-    plt.savefig("%s/nfe_train_test_%s_pareto.png" % (dirname, reg))
+    plt.savefig("%s/nfe_train_test_%s.pdf" % (dirname, reg))
+    plt.savefig("%s/nfe_train_test_%s.png" % (dirname, reg))
     plt.clf()
     plt.close(fig)
 
@@ -865,7 +892,7 @@ def get_nfe_dist(lam):
             param_file = open("%s/reg_%s_lam_%.4e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
             params = pickle.load(param_file)
             nfes_itr = []
-            for test_batch_num in range(num_test_batches):
+            for test_batch_num in range(num_eval_batches):
                 test_batch = next(ds_train_eval)
                 stuff = model["nfe"](params, *test_batch)
                 nfes_itr.extend(stuff)
@@ -925,8 +952,8 @@ def get_info_r(reg, dirname, reg_result, lam):
             param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
             params = pickle.load(param_file)
             regs = []
-            for test_batch_num in range(num_test_batches):
-                print(test_batch_num, num_test_batches)
+            for test_batch_num in range(num_eval_batches):
+                print(test_batch_num, num_eval_batches)
                 test_batch = next(ds_train_eval)
                 regs.append(get_reg(params, test_batch[0]))
             reg_val = onp.mean(regs)
@@ -986,7 +1013,7 @@ def get_r(lam, reg_order):
             param_file = open("%s/reg_%s_lam_%.4e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
             params = pickle.load(param_file)
             regs_itr = []
-            for test_batch_num in range(num_test_batches):
+            for test_batch_num in range(num_eval_batches):
                 test_batch = next(ds_train_eval)
                 _, regs = forward(params, test_batch[0])
                 regs_itr.extend(regs)
@@ -1025,8 +1052,8 @@ def get_test_loss(lam):
         itr = 96000
         param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
         params = pickle.load(param_file)
-        losses = onp.zeros(num_test_batches)
-        for test_batch_num in range(num_test_batches):
+        losses = onp.zeros(num_eval_batches)
+        for test_batch_num in range(num_eval_batches):
             print(test_batch_num)
             test_batch = next(ds_train_eval)
             images, labels = test_batch
@@ -1255,9 +1282,45 @@ def get_nfe_per_example(reg, dirname, lam):
         losses = []
         accs = []
         nfes = []
+        for test_batch_num in range(num_eval_batches):
+            print(test_batch_num, num_eval_batches)
+            test_batch = next(ds_train_eval)
+            loss_, acc_, nfe_ = (info_per_ex(params, *test_batch))
+            losses.extend(loss_)
+            accs.extend(acc_)
+            nfes.extend(nfe_)
+        data = {
+            "loss": losses,
+            "acc": accs,
+            "nfe": nfes
+        }
+        data_file = open(data_filename, "wb")
+        pickle.dump(data, data_file)
+        data_file.close()
+
+    return data
+
+
+def get_nfe_test_per_example(reg, dirname, lam):
+    """
+    Get NFE per example for one lam.
+    """
+    itr = 96000
+    data_filename = "%s/reg_%s_lam_%.12e_%d_%s_nfe_per_ex_test.pickle" % (dirname, reg, lam, itr, method)
+    try:
+        data_file = open(data_filename, "rb")
+        data = pickle.load(data_file)
+        data_file.close()
+    except IOError:
+        print("Calculating NFE for %.4e" % lam)
+        param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+        params = pickle.load(param_file)
+        losses = []
+        accs = []
+        nfes = []
         for test_batch_num in range(num_test_batches):
             print(test_batch_num, num_test_batches)
-            test_batch = next(ds_train_eval)
+            test_batch = next(ds_test)
             loss_, acc_, nfe_ = (info_per_ex(params, *test_batch))
             losses.extend(loss_)
             accs.extend(acc_)
@@ -1334,6 +1397,11 @@ def nfe_dist():
 
 
 if __name__ == "__main__":
+    # nfe_train_test()
+    # for i, lam in enumerate(sorted(lams)):
+    #     print(i, lam)
+    #     # get_nfe_test(reg, dirname, method, lam)
+    #     get_nfe_test_per_example(reg, dirname, lam)
     get_info(reg, dirname, method, parse_args.lam)
     # nfe_dist()
     # sorted_lams = sorted(lams)

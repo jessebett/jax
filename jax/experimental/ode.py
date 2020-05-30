@@ -313,6 +313,68 @@ def owrenzen5_step(func, y0, f0, t0, dt):
   f1 = k[-1]
   return y1, f1, y1_error, k
 
+def tanyam_step(func, y0, f0, t0, dt):
+  # Tanyam7 tableau
+  alpha = np.array([0.07816646510113846,
+                    0.1172496976517077,
+                    0.17587454647756157,
+                    0.4987401101913988,
+                    0.772121690184484,
+                    0.9911856696047768,
+                    0.9995019582097662,
+                    1,
+                    0,
+                    0])
+  beta = np.array([
+    [0.07816646510113846, 0, 0, 0, 0, 0,
+      0, 0, 0, 0],
+    [0.029312424412926925, 0.08793727323878078, 0, 0, 0, 0,
+      0, 0, 0, 0],
+    [0.04396863661939039, 0, 0.13190590985817116, 0, 0, 0,
+      0, 0, 0, 0],
+    [0.7361834837738382, 0, -2.8337999624233303, 2.5963565888408913, 0, 0,
+      0, 0, 0, 0],
+    [-12.062819391370866, 0, 48.20838100175243, -38.05863046463434, 2.6851905444372632, 0,
+      0, 0, 0, 0],
+    [105.21957276320198, 0, -417.92888626241256, 332.3155504499333, -19.827591183572938, 1.2125399024549859,
+      0, 0, 0, 0],
+    [114.67755718631742, 0, -455.5612169896097, 362.24095553923144, -21.67190442182809, 1.3189132007137807,
+      -0.0048025566150346555, 0, 0, 0],
+    [115.21334870553768, 0, -457.69356568613233, 363.93688218862735, -21.776682078900294, 1.3250670887878468,
+      -0.004518190986768983, -0.0005320269334859959, 0, 0],
+    [115.18928245800194, 0, -457.598022271643, 363.8610256312148, -21.77212754027556, 1.3248804645074317,
+      -0.0045057252106918315, -0.0005330165949429136, 0, 0]
+    ])
+  c_sol = np.array([0.05126014249744686, 0,
+                    0, 0.27521638456212627,
+                    0.33696650340710543, 0.18986072244906577,
+                    8.461099418514403, -130.15941672640542,
+                    121.84501355497527, 0]) +\
+          np.array([0.0002577249070696835, 0,
+                      0, -0.0009229104845391819,
+                      0.0031779013374194105, -0.01210458894174817,
+                      2.706023959472591, -44.541445641266066,
+                      121.84501355497527, -80])
+  c_error = np.array([0.0002577249070696835, 0,
+                      0, -0.0009229104845391819,
+                      0.0031779013374194105, -0.01210458894174817,
+                      2.706023959472591, -44.541445641266066,
+                      121.84501355497527, -80])
+
+  def body_fun(i, k):
+    ti = t0 + dt * alpha[i-1]
+    yi = y0 + dt * np.dot(beta[i-1, :], k)
+    ft = func(yi, ti)
+    return ops.index_update(k, jax.ops.index[i, :], ft)
+
+  k = ops.index_update(np.zeros((10, f0.shape[0])), ops.index[0, :], f0)
+  k = lax.fori_loop(1, 10, body_fun, k)
+
+  y1 = dt * np.dot(c_sol, k) + y0
+  y1_error = dt * np.dot(c_error, k)
+  f1 = k[-1]
+  return y1, f1, y1_error, k
+
 def _g_and_explicit_phi(prev_t, next_t, implicit_phi, k):
   curr_t = prev_t[0]
   dt = next_t - prev_t[0]
@@ -1172,10 +1234,10 @@ def _owrenzen5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
     def body_fun(state):
       i, y, f, t, dt, last_t, interp_coeff = state
       dt = np.where(t + dt > target_t, target_t - t, dt)
-      next_y, next_f, next_y_error, k = cash_karp_step(func_, y, f, t, dt)
+      next_y, next_f, next_y_error, k = owrenzen5_step(func_, y, f, t, dt)
       next_t = t + dt
       error_ratios = error_ratio(next_y_error, rtol, atol, y, next_y)
-      y_mid, _, _, _ = cash_karp_step(func_, y, f, t, dt / 2)
+      y_mid, _, _, _ = owrenzen5_step(func_, y, f, t, dt / 2)
       new_interp_coeff = np.array(fit_4th_order_polynomial(y0, next_y, y_mid, k[0], k[-1], dt))
       # new_interp_coeff = interp_fit_bosh(y, next_y, k, dt)
       dt = optimal_step_size(dt, error_ratios, order=5)
@@ -1187,6 +1249,49 @@ def _owrenzen5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
     nfe = carry[-1]
     n_steps, *carry_ = lax.while_loop(cond_fun, body_fun, [0] + carry[:-1])
     carry = carry_ + [nfe + 7 * n_steps]
+    _, _, t, _, last_t, interp_coeff = carry[:-1]
+    relative_output_time = (target_t - last_t) / (t - last_t)
+    y_target = np.polyval(interp_coeff, relative_output_time)
+    return carry, y_target
+
+  f0 = func_(y0, ts[0])
+  # init_nfe = 1.
+  # dt = 0.1
+  init_nfe = 2.
+  dt = initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0)
+  interp_coeff = np.array([y0] * 5)
+  init_carry = [y0, f0, ts[0], dt, ts[0], interp_coeff, init_nfe]
+  carry, ys = lax.scan(scan_fun, init_carry, ts[1:])
+  nfe = carry[-1]
+  return np.concatenate((y0[None], ys)), nfe
+
+def _tanyam_odeint(func, rtol, atol, mxstep, y0, ts, *args):
+  func_ = lambda y, t: func(y, t, *args)
+
+  def scan_fun(carry, target_t):
+
+    def cond_fun(state):
+      i, _, _, t, dt, _, _ = state
+      return (t < target_t) & (i < mxstep) & (dt > 0)
+
+    def body_fun(state):
+      i, y, f, t, dt, last_t, interp_coeff = state
+      dt = np.where(t + dt > target_t, target_t - t, dt)
+      next_y, next_f, next_y_error, k = tanyam_step(func_, y, f, t, dt)
+      next_t = t + dt
+      error_ratios = error_ratio(next_y_error, rtol, atol, y, next_y)
+      y_mid, _, _, _ = tanyam_step(func_, y, f, t, dt / 2)
+      new_interp_coeff = np.array(fit_4th_order_polynomial(y0, next_y, y_mid, k[0], k[-1], dt))
+      # new_interp_coeff = interp_fit_bosh(y, next_y, k, dt)
+      dt = optimal_step_size(dt, error_ratios, order=5)
+
+      new = [i + 1, next_y, next_f, next_t, dt,      t, new_interp_coeff]
+      old = [i + 1,      y,      f,      t, dt, last_t,     interp_coeff]
+      return map(partial(np.where, np.all(error_ratios <= 1.)), new, old)
+
+    nfe = carry[-1]
+    n_steps, *carry_ = lax.while_loop(cond_fun, body_fun, [0] + carry[:-1])
+    carry = carry_ + [nfe + 9 * n_steps]
     _, _, t, _, last_t, interp_coeff = carry[:-1]
     relative_output_time = (target_t - last_t) / (t - last_t)
     y_target = np.polyval(interp_coeff, relative_output_time)
