@@ -9,7 +9,8 @@ import argparse
 import operator as op
 
 import jax
-from jax.experimental.ode import _heun_odeint, _fehlberg_odeint, _bosh_odeint, _owrenzen_odeint, _dopri5_odeint
+from jax.experimental.ode import \
+    _heun_odeint, _fehlberg_odeint, _bosh_odeint, _owrenzen_odeint, _dopri5_odeint, _adams_odeint
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -28,7 +29,7 @@ parser.add_argument('--save_freq', type=int, default=640)
 parser.add_argument('--data_root', type=str, default="./")  # TODO: hard code this on cluster
 parser.add_argument('--lam', type=float, default=0)
 parser.add_argument('--method', type=str,
-                    choices=["heun", "fehlberg", "bosh", "owrenzen", "dopri"],
+                    choices=["heun", "fehlberg", "bosh", "owrenzen", "dopri", "adams"],
                     default="dopri")  # TODO: flag that needs to be set!!
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default='none')
 parser.add_argument('--reg_result', type=str, choices=['none', 'r2', 'r3', 'r4', 'r5'], default=None)
@@ -50,7 +51,8 @@ methods = {"heun": _heun_odeint,
            "fehlberg": _fehlberg_odeint,
            "bosh": _bosh_odeint,
            "owrenzen": _owrenzen_odeint,
-           "dopri": _dopri5_odeint
+           "dopri": _dopri5_odeint,
+           "adams": _adams_odeint
            }
 method_orders = {"heun": 2,
                  "fehlberg": 2,
@@ -76,6 +78,7 @@ _loss_fn = jax.jit(_loss_fn)
 get_reg = jax.jit(lambda *args: jnp.mean(forward(*args)[1]))
 method = parse_args.method
 count_nfe = jax.jit(partial(model["plot_nfe"], methods[method]))
+# info_per_ex = jax.jit(partial(model["plot_nfe_per_ex"], methods[method]))
 _, ds_train_eval, meta = init_data()
 num_test_batches = meta["num_test_batches"]
 
@@ -150,7 +153,7 @@ def get_info(reg, dirname, method, lam):
     reg_val = meta["info"][itr]["loss_reg"]
 
     # TODO: train or test
-    loss = meta["info"][itr]["loss"]
+    loss = meta["info"][itr]["acc"]
     # test_loss_filename = "%s/test_loss_%s_lam_%.18e.pickle" % (dirname, reg, lam)
     # test_loss_file = open(test_loss_filename, "rb")
     # test_loss = pickle.load(test_loss_file)
@@ -212,13 +215,76 @@ def pareto_plot_nfe():
 
     norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
     cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
-    cb1.set_label(r'Regularization Weight ($\lambda$)')
+    cb1.set_label(r'Regularization Weight ($\lambda_%s$)' % reg[1])
 
     plt.gcf().subplots_adjust(right=0.88, left=0.13)
     # plt.gcf().subplots_adjust(right=0.88)
 
     plt.savefig("%s/loss_nfe_%s_pareto.pdf" % (dirname, reg))
     plt.savefig("%s/loss_nfe_%s_pareto.png" % (dirname, reg))
+    plt.clf()
+    plt.close(fig)
+
+
+def pareto_plot_nfe_acc():
+    """
+    Create pareto plot.
+    """
+    cm = plt.get_cmap('viridis')
+
+    font = {'family' : 'normal',
+            'weight' : 'bold',
+            'size'   : 14}
+    plt.rc('font', **font)
+    plt.rc('text', usetex=True)
+    fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
+
+    sorted_lams = sorted(lams)
+    x, y = zip(*map(partial(get_info, reg, dirname, method), sorted_lams))
+    x = onp.array(x)
+    y = 1 - onp.array(y)  # convert accuracy to error
+    anno = onp.array(sorted_lams)
+
+    # filter out nans and corresponding lams
+    finite_mask = onp.isfinite(y)
+    x = x[finite_mask]
+    y = y[finite_mask]
+    anno = anno[finite_mask]
+
+    num_points = len(x)
+    c_spacing = onp.linspace(0, 1, num=num_points)
+    cmap = lambda ind: cm(c_spacing[ind])
+
+    for i in range(num_points):
+        ax.scatter(x[i], y[i], c=cmap(i))
+
+    # plot the pareto front
+    maxY = False
+    sorted_list = sorted([[x[i], y[i]] for i in range(len(x))], reverse=maxY)
+    pareto_front = [sorted_list[0]]
+    for pair in sorted_list[1:]:
+        if maxY:
+            if pair[1] >= pareto_front[-1][1]:
+                pareto_front.append(pair)
+        else:
+            if pair[1] <= pareto_front[-1][1]:
+                pareto_front.append(pair)
+    pf_X = [pair[0] for pair in pareto_front]
+    pf_Y = [pair[1] for pair in pareto_front]
+    ax.plot(pf_X, pf_Y, c='0.35')
+
+    ax.set_xlabel("Average Number of Function Evaluations")
+    ax.set_ylabel("Training Classification Error")
+
+    norm = mpl.colors.LogNorm(vmin=anno[0], vmax=anno[-1])
+    cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
+    cb1.set_label(r'Regularization Weight ($\lambda_%s$)' % reg[1])
+
+    plt.gcf().subplots_adjust(right=0.88, left=0.13)
+    # plt.gcf().subplots_adjust(right=0.88)
+
+    plt.savefig("%s/acc_nfe_%s_pareto.pdf" % (dirname, reg))
+    plt.savefig("%s/acc_nfe_%s_pareto.png" % (dirname, reg))
     plt.clf()
     plt.close(fig)
 
@@ -235,8 +301,6 @@ def pareto_plot_nfe_all_orders():
     plt.rc('font', **font)
     plt.rc('text', usetex=True)
     fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
-
-    sorted_lams = sorted(lams)
 
     regs = ["r2", "r3", "r4", "r5"]
     num_points = len(regs)
@@ -257,6 +321,8 @@ def pareto_plot_nfe_all_orders():
     #     "r5": slice(0, -9)
     # }
     for i, (reg, dir) in enumerate(reg_dirs.items()):
+        lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (dir, reg))))
+        sorted_lams = sorted(lams)
         x, y = zip(*map(partial(get_info, reg, dir, method), sorted_lams[slices[reg]]))
 
         x = onp.array(x)
@@ -267,20 +333,23 @@ def pareto_plot_nfe_all_orders():
         x = x[finite_mask]
         y = y[finite_mask]
 
+        for j in range(len(x)):
+            ax.scatter(x[j], y[j], c=cmap(i))
+
         # plot the pareto front
-        maxY = False
-        sorted_list = sorted([[x[i], y[i]] for i in range(len(x))], reverse=maxY)
-        pareto_front = [sorted_list[0]]
-        for pair in sorted_list[1:]:
-            if maxY:
-                if pair[1] >= pareto_front[-1][1]:
-                    pareto_front.append(pair)
-            else:
-                if pair[1] <= pareto_front[-1][1]:
-                    pareto_front.append(pair)
-        pf_X = [pair[0] for pair in pareto_front]
-        pf_Y = [pair[1] for pair in pareto_front]
-        ax.plot(pf_X, pf_Y, c=cmap(i))
+        # maxY = False
+        # sorted_list = sorted([[x[i], y[i]] for i in range(len(x))], reverse=maxY)
+        # pareto_front = [sorted_list[0]]
+        # for pair in sorted_list[1:]:
+        #     if maxY:
+        #         if pair[1] >= pareto_front[-1][1]:
+        #             pareto_front.append(pair)
+        #     else:
+        #         if pair[1] <= pareto_front[-1][1]:
+        #             pareto_front.append(pair)
+        # pf_X = [pair[0] for pair in pareto_front]
+        # pf_Y = [pair[1] for pair in pareto_front]
+        # ax.plot(pf_X, pf_Y, c=cmap(i))
 
     ax.set_xlabel("Average Number of Function Evaluations on %s%d" % (method, method_orders[method]))
     ax.set_ylabel("Unregularized Training Loss")
@@ -644,6 +713,83 @@ def reg_nfe_all_orders():
     plt.savefig("%s/%sreg_val_%s_%snfe_pareto.png" % (dirname, reg_log_str, reg, nfe_log_str))
     plt.clf()
     plt.close(fig)
+
+
+def all_orders_reg_nfe():
+    """
+    Plot reg vs. NFE for different order solvers.
+    """
+    cm = plt.get_cmap('copper')
+
+    font = {'family' : 'normal',
+            'weight' : 'bold',
+            'size'   : 14}
+    plt.rc('font', **font)
+    plt.rc('text', usetex=True)
+    fig, (ax, ax_leg) = plt.subplots(nrows=1, ncols=2, gridspec_kw={"width_ratios": [30, 1], "wspace": 0.05})
+
+    reg_val = reg_result   # the reg we want to report
+
+    reg_match_on_top = False
+    reg_match_on_bottom = True
+    regs = list(reg_dirs.keys())
+    if reg_match_on_top:
+        regs.remove(reg_val)
+        regs.append(reg_val)
+    elif reg_match_on_bottom:
+        regs.remove(reg_val)
+        regs.insert(0, reg_val)
+
+    num_points = len(regs)
+    c_spacing = onp.linspace(0, 1, num=num_points)
+    cmap = lambda ind: cm(c_spacing[ind])
+
+    log_reg = True
+    log_nfe = False
+
+    for reg_train in regs:
+        reg_train_dirname = reg_dirs[reg_train]
+        lams = list(map(parse_lam, glob("%s/*%s*meta.pickle" % (reg_train_dirname, reg_train))))
+        sorted_lams = sorted(lams)
+        # if reg_val == "r3" and reg_train == "r4":
+        #     # remove one shitty outlier
+        #     sorted_lams = sorted_lams[:-1]
+        reg_x, _ = zip(*map(partial(get_info_r, reg_train, reg_train_dirname, reg_val), sorted_lams))
+        nfe_y, _ = zip(*map(partial(get_info, reg_train, reg_train_dirname, method), sorted_lams))
+        reg_x = onp.array(reg_x)
+        nfe_y = onp.array(nfe_y)
+
+        if log_reg:
+            reg_x = onp.log10(reg_x)
+        if log_nfe:
+            nfe_y = onp.log10(nfe_y)
+
+        # filter out nans and corresponding lams
+        finite_mask = onp.isfinite(reg_x)
+        reg_x = reg_x[finite_mask]
+        nfe_y = nfe_y[finite_mask]
+
+        for i in range(len(reg_x)):
+            ax.scatter(reg_x[i], nfe_y[i], c=cmap(int(reg_train[1]) - 2))
+
+    ax.set_ylabel(r'%s Average Number of Function Evaluations on %s%s'
+                  % ("Log" if log_nfe else "", method, method_orders[method]))
+    ax.set_xlabel(r'%s Mean $\mathcal{R}_%s$' % ("Log" if log_reg else "", reg_val[1]))
+
+    norm = mpl.colors.Normalize(vmin=2, vmax=5)  # other option is LogNorm
+    cb1 = mpl.colorbar.ColorbarBase(ax_leg, cmap=cm, norm=norm, orientation='vertical')
+    cb1.set_label(r'Regularization Order ($k$)')
+
+    plt.gcf().subplots_adjust(right=0.88, left=0.13)
+    # plt.gcf().subplots_adjust(right=0.88)
+
+    reg_log_str = "log" if log_reg else ""
+    nfe_log_str = "log" if log_nfe else ""
+    plt.savefig("%s/%sreg_val_%s_%snfe_%s_pareto.pdf" % (dirname, reg_log_str, reg_val, nfe_log_str, method))
+    plt.savefig("%s/%sreg_val_%s_%snfe_%s_pareto.png" % (dirname, reg_log_str, reg_val, nfe_log_str, method))
+    plt.clf()
+    plt.close(fig)
+
 
 def nfe_train_test():
     """
@@ -1092,8 +1238,113 @@ def plot_nfe_loss_over_training():
     plt.close(fig)
 
 
+def get_nfe_per_example(reg, dirname, lam):
+    """
+    Get NFE per example for one lam.
+    """
+    itr = 96000
+    data_filename = "%s/reg_%s_lam_%.12e_%d_%s_nfe_per_ex.pickle" % (dirname, reg, lam, itr, method)
+    try:
+        data_file = open(data_filename, "rb")
+        data = pickle.load(data_file)
+        data_file.close()
+    except IOError:
+        print("Calculating NFE for %.4e" % lam)
+        param_file = open("%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr), "rb")
+        params = pickle.load(param_file)
+        losses = []
+        accs = []
+        nfes = []
+        for test_batch_num in range(num_test_batches):
+            print(test_batch_num, num_test_batches)
+            test_batch = next(ds_train_eval)
+            loss_, acc_, nfe_ = (info_per_ex(params, *test_batch))
+            losses.extend(loss_)
+            accs.extend(acc_)
+            nfes.extend(nfe_)
+        data = {
+            "loss": losses,
+            "acc": accs,
+            "nfe": nfes
+        }
+        data_file = open(data_filename, "wb")
+        pickle.dump(data, data_file)
+        data_file.close()
+
+    return data
+
+
+def nfe_hist(lam_ind):
+    """
+    Draw a histogram of NFE.
+    """
+    reg = "r3"
+    dir = "2020-05-01-12-02-58"
+    lam = sorted(lams)[lam_ind]
+    data = get_nfe_per_example(reg, dir, lam)
+
+    data["nfe"] = (onp.array(data["nfe"]) - 2) / 6
+    data["acc"] = onp.array(data["acc"])
+
+    bins_ = [i for i in range(4, 20)]
+    plt.hist(data["nfe"], density=True, bins=bins_)
+    plt.hist(data["nfe"][data["acc"] == 0], color="red", alpha=0.5, density=True, bins=bins_)
+    plt.savefig("{}/nfe_hist_{}_{:04d}.png".format(dir, reg, lam_ind))
+    plt.clf()
+
+
+def nfe_dist():
+    """
+    Calculate mean NFE of misclassified examples compare to correctly classified examples.
+    """
+    reg = "r3"
+    dir = "2020-05-01-12-02-58"
+    sorted_lams = sorted(lams)
+    data = list(map(partial(get_nfe_per_example, reg, dir), sorted_lams))
+
+    def get_mean_nfe(data_):
+        data_["nfe"] = (onp.array(data_["nfe"]) - 2) / 6
+        data_["acc"] = onp.array(data_["acc"])
+        return onp.mean(data_["nfe"]), onp.mean(data_["nfe"][data_["acc"] == 0])
+
+    def get_nfe_corr_loss(data_):
+        data_["nfe"] = (onp.array(data_["nfe"]) - 2) / 6
+        data_["loss"] = onp.array(data_["loss"])
+        return onp.corrcoef(data_["nfe"], data_["loss"])
+
+    # all_nfe, bad_nfe = zip(*map(get_mean_nfe, data))
+    # print(onp.where(onp.array(all_nfe) - onp.array(bad_nfe) >= 0))
+
+    # corrs = onp.array(list(map(get_nfe_corr_loss, data)))
+    # print(corrs)
+
+    for i, data_ in enumerate(data):
+        print(i)
+        if i != 100 and i != 0:
+            continue
+        plt.scatter((onp.array(data_["nfe"]) - 2) / 6, data_["loss"])
+        plt.title("lam %.2e" % sorted_lams[i])
+        plt.xlabel("Num Steps of Solver")
+        plt.ylabel("Loss")
+        plt.savefig("{}/special_nfe_scat_{}_{:04d}.png".format(dir, reg, i))
+        plt.clf()
+
+    # plt.savefig("{}/nfe_hist_{}_{:04d}.png".format(dir, reg, lam_ind))
+    # plt.clf()
+
+
 if __name__ == "__main__":
-    plot_nfe_loss_over_training()
+    get_info(reg, dirname, method, parse_args.lam)
+    # nfe_dist()
+    # sorted_lams = sorted(lams)
+    # for lam_ind in range(101):
+    #     print(lam_ind)
+    #     nfe_hist(lam_ind)
+        # get_nfe_per_example(reg, dirname, sorted_lams[lam_ind])
+    # all_orders_reg_nfe()
+    # pareto_plot_nfe_all_orders()
+    # pareto_plot_nfe_acc()
+    # plot_nfe_loss_over_training()
     # reg_nfe_all_orders()
     # reg_loss_all_orders()
     # lam_reg_all_orders()

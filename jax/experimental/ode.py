@@ -1204,7 +1204,7 @@ def _owrenzen5_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   return np.concatenate((y0[None], ys)), nfe
 
 # @partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
-def _adams_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
+def _adams_odeint(func, rtol, atol, mxstep, y0, ts, *args):
   func_ = lambda y, t: func(y, t, *args)
 
   def scan_fun(carry, target_t):
@@ -1226,9 +1226,8 @@ def _adams_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
   t0 = ts[0]
   f0 = func_(y0, t0)
   ode_dim = f0.shape[0]
-  dt, init_nfe = lax.cond(init_step <= 0,
-                          None, lambda _: (initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0), 2),
-                          None, lambda _: (init_step, 1))
+  init_nfe = 2.
+  dt = initial_step_size(func_, ts[0], y0, 4, rtol, atol, f0)
 
   prev_f = np.empty((_ADAMS_MAX_ORDER + 1, ode_dim))
   prev_f = jax.ops.index_update(prev_f, 0, f0)
@@ -1241,8 +1240,6 @@ def _adams_odeint(func, rtol, atol, init_step, mxstep, y0, ts, *args):
 
   next_t = t0 + dt
   init_order = 1
-
-  init_nfe = 2
 
   init_carry = [y0,
                 prev_f,
