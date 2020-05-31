@@ -7,6 +7,7 @@ import os
 import pickle
 import sys
 import time
+from glob import glob
 
 import haiku as hk
 import tensorflow_datasets as tfds
@@ -17,7 +18,7 @@ from jax.tree_util import tree_flatten
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint_grid, odeint_grid_sepaux, odeint_grid_sepaux_one
+from jax.experimental.ode import odeint, odeint_sepaux, odeint_grid, odeint_grid_sepaux, odeint_grid_sepaux_one
 from jax.experimental.jet import jet
 from jax.scipy.special import expit as sigmoid
 
@@ -45,6 +46,8 @@ parser.add_argument('--lam_fro', type=float, default=0)
 parser.add_argument('--lam_kin', type=float, default=0)
 parser.add_argument('--reg_type', type=str, choices=['our', 'fin'], default='our')
 parser.add_argument('--num_steps', type=int, default=2)
+parser.add_argument('--eval', action="store_true")
+parser.add_argument('--eval_dir', type=str)
 parse_args = parser.parse_args()
 
 assert os.path.exists(parse_args.dirname)
@@ -63,9 +66,22 @@ dirname = parse_args.dirname
 count_nfe = not parse_args.no_count_nfe
 vmap = False if parse_args.no_vmap is True else True
 vmap = False
-ode_kwargs = {
-    "step_size": 1 / parse_args.num_steps
-}
+grid = False
+if grid:
+    _odeint = odeint_grid
+    _odeint_aux2 = odeint_grid_sepaux_one   # finlay trick with 2 augmented states
+    _odeint_aux3 = odeint_grid_sepaux       # finlay trick with 3 augmented states
+    ode_kwargs = {
+        "step_size": 1 / parse_args.num_steps
+    }
+else:
+    _odeint = odeint
+    _odeint_aux2 = odeint_sepaux
+    _odeint_aux3 = odeint_sepaux            # TODO: this will break if we try to do fin here
+    ode_kwargs = {
+        "atol": parse_args.atol,
+        "rtol": parse_args.rtol
+    }
 
 
 def _logaddexp(x1, x2):
@@ -328,12 +344,12 @@ def init_model():
         return dy, dp, dr, dfro, dkin
 
     if reg_type == 'our':
-        _odeint = odeint_grid_sepaux_one
+        _odeint_aux = _odeint_aux2
     else:
-        _odeint = odeint_grid_sepaux
-    nodeint_aux = lambda y0, ts, eps, params: _odeint(lambda y, t, eps, params: dynamics_wrap(y, t, params),
-                                                      aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    all_nodeint = lambda y0, ts, eps, params: odeint_grid(all_aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+        _odeint_aux = _odeint_aux3
+    nodeint_aux = lambda y0, ts, eps, params: _odeint_aux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+                                                          aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    all_nodeint = lambda y0, ts, eps, params: _odeint(all_aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
 
     def ode_aux(params, y, delta_logp, eps):
         """
@@ -353,11 +369,11 @@ def init_model():
         # TODO: w/ finlay trick this is not true NFE
         if vmap:
             unreg_nodeint = jax.vmap(lambda z, delta_logp, t, eps, params:
-                                     odeint_grid(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1],
+                                     _odeint(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1],
                                      (0, 0, None, 0, None))
         else:
             unreg_nodeint = lambda z, delta_logp, t, eps, params: \
-                odeint_grid(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1]
+                _odeint(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1]
 
         @jax.jit
         def nfe_fn(key, params, _images):
@@ -601,6 +617,7 @@ def run():
         sep_loss_aug_, sep_loss_, sep_loss_r2_reg_, sep_loss_fro_reg_, sep_loss_kin_reg_, nfe = [], [], [], [], [], []
 
         for test_batch_num in range(num_test_batches):
+            print(test_batch_num, num_test_batches)
             _key, _key2 = jax.random.split(_key, num=2)
             test_batch = next(ds_eval)[0]
             test_batch = (test_batch.astype(jnp.float32) + jax.random.uniform(_key2,
@@ -652,17 +669,35 @@ def run():
             if itr <= load_itr:
                 continue
 
-            update_start = time.time()
-            opt_state = update(itr, opt_state, key, batch)
-            tree_flatten(opt_state)[0][0].block_until_ready()
-            update_end = time.time()
-            time_str = "%d %.18f %d\n" % (itr, update_end - update_start, load_itr)
-            outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_time.txt"
-                           % (dirname, reg, reg_type, lam, lam_fro, lam_kin), "a")
-            outfile.write(time_str)
-            outfile.close()
+            if not parse_args.eval:
+                update_start = time.time()
+                opt_state = update(itr, opt_state, key, batch)
+                tree_flatten(opt_state)[0][0].block_until_ready()
+                update_end = time.time()
+                time_str = "%d %.18f %d\n" % (itr, update_end - update_start, load_itr)
+                outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_time.txt"
+                               % (dirname, reg, reg_type, lam, lam_fro, lam_kin), "a")
+                outfile.write(time_str)
+                outfile.close()
+            else:
+                # immediately go to testing
+                itr = parse_args.test_freq
 
             if itr % parse_args.test_freq == 0:
+                if parse_args.eval:
+                    # find params in eval_dir
+                    files = glob("%s/*30000_fargs.pickle" % parse_args.eval_dir)
+                    if len(files) != 1:
+                        print("Couldn't find param file!!")
+                        print("Couldn't find param file!!", file=sys.stderr)
+                        return
+                    eval_pth = files[0]
+                    eval_param_file = open(eval_pth, "rb")
+                    eval_params = pickle.load(eval_param_file)
+                    eval_param_file.close()
+                    # shove them in opt_state
+                    opt_state = opt_init(eval_params)
+
                 loss_aug_, loss_, loss_r2_reg_, loss_fro_reg_, loss_kin_reg_, nfe_ = \
                     evaluate_loss(opt_state, key, ds_test_eval)
 
@@ -671,6 +706,12 @@ def run():
                             'NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_r2_reg_, loss_fro_reg_, loss_kin_reg_, nfe_)
 
                 print(print_str)
+
+                if parse_args.eval:
+                    outfile = open("%s/eval_info.txt" % parse_args.eval, "w")
+                    outfile.write(print_str + "\n")
+                    outfile.close()
+                    return
 
                 outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_info.txt"
                                % (dirname, reg, reg_type, lam, lam_fro, lam_kin), "a")
