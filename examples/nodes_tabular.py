@@ -11,15 +11,18 @@ import time
 import haiku as hk
 
 import jax
+from jax import lax
 from jax.tree_util import tree_flatten
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint, odeint_sepaux
+from jax.experimental.ode import odeint, odeint_sepaux, odeint_grid, odeint_grid_sepaux, odeint_grid_sepaux_one
 from jax.experimental.jet import jet
 
+float_64 = False
+
 from jax.config import config
-config.update("jax_enable_x64", True)
+config.update("jax_enable_x64", float_64)
 
 import datasets
 
@@ -60,6 +63,9 @@ assert os.path.exists(parse_args.dirname)
 
 reg = parse_args.reg
 lam = parse_args.lam
+lam_fro = parse_args.lam_fro
+lam_kin = parse_args.lam_kin
+reg_type = parse_args.reg_type
 lam_w = parse_args.lam_w
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
@@ -67,21 +73,36 @@ dirname = parse_args.dirname
 count_nfe = not parse_args.no_count_nfe
 vmap = False if parse_args.no_vmap is True else True
 vmap = False
-num_blocks = 0
-ode_kwargs = {
-    "atol": parse_args.atol,
-    "rtol": parse_args.rtol,
-    # "method": parse_args.method,
-    # "init_step": parse_args.init_step
-}
+grid = False
+if grid:
+    _odeint = odeint_grid
+    _odeint_aux2 = odeint_grid_sepaux_one   # finlay trick w/ 2 augmented states
+    _odeint_aux3 = odeint_grid_sepaux       # finlay trick w/ 3 augmented states
+    ode_kwargs = {
+        "step_size": 1 / parse_args.num_steps
+    }
+else:
+    _odeint = odeint
+    _odeint_aux2 = odeint_sepaux
+    _odeint_aux3 = odeint_sepaux            # TODO: this will break for fin, but we shouldn't use it anyway
+    ode_kwargs = {
+        "atol": parse_args.atol,
+        "rtol": parse_args.rtol
+    }
 
-# jax.nn.softplus jet will fail because of convert element type
-# logaddexp will fail because no lax.max primitive implemented
-# TODO: maybe use jax.nn.softplus when not doing jet?
-# softplus = jax.nn.softplus
-softplus = lambda x: jnp.where(x >= 0,
-                               x + jnp.log1p(jnp.exp(-x)),
-                               jnp.log1p(jnp.exp(x)))
+
+def _logaddexp(x1, x2):
+  """
+  Logaddexp while ignoring the custom_jvp rule.
+  """
+  amax = lax.max(x1, x2)
+  delta = lax.sub(x1, x2)
+  return lax.select(jnp.isnan(delta),
+                    lax.add(x1, x2),  # NaNs or infinities of the same sign.
+                    lax.add(amax, lax.log1p(lax.exp(-lax.abs(delta)))))
+
+
+softplus = lambda x: _logaddexp(x, jnp.zeros_like(x))
 
 
 def sigmoid(z):
@@ -130,9 +151,6 @@ class ConcatSquashLinear(hk.Module):
         self._hyper_gate = hk.Linear(dim_out)
 
     def __call__(self, x, t):
-        thing1 = self._layer(x)
-        thing = self._layer(x) * sigmoid(self._hyper_gate(jnp.reshape(t, (1, 1)))) \
-               + self._hyper_bias(jnp.reshape(t, (1, 1)))
         return self._layer(x) * sigmoid(self._hyper_gate(jnp.reshape(t, (1, 1)))) \
                + self._hyper_bias(jnp.reshape(t, (1, 1)))
 
@@ -144,7 +162,7 @@ def get_epsilon(key, shape):
     # normal
     return jax.random.normal(key, shape)
     # rademacher
-    # return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float64) * 2 - 1
+    # return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float64) * 2 - 1  # TODO: (set dtype)
 
 
 class NN_Dynamics(hk.Module):
@@ -162,7 +180,7 @@ class NN_Dynamics(hk.Module):
         base_layer = ConcatSquashLinear
 
         for dim_out in hidden_dims + (input_shape[-1], ):
-            layer = base_layer(dim_out)
+            layer = base_layer(dim_out)  # TODO: last layer 0?
             layers.append(layer)
             activation_fns.append(nonlinearity)
 
@@ -200,7 +218,7 @@ def initialization_data(input_shape):
     # use the batch size to allocate memory
     input_shape = (parse_args.test_batch_size, ) + input_shape[1:]
     data = {
-        "ode": aug_init(jnp.zeros(input_shape))[:-2] + (0., )
+        "ode": aug_init(jnp.zeros(input_shape))[:1] + (0., )  # (z, t)
     }
     return data
 
@@ -245,6 +263,16 @@ def init_model(n_dims):
         div = jnp.sum(jnp.reshape(eps_dy * eps, (y.shape[0], -1)), axis=1, keepdims=True)
         return dy, -div
 
+    def ffjord2_dynamics(yp, t, eps, params):
+        """
+        Dynamics of augmented ffjord state.
+        """
+        y, p = yp
+        f = lambda y: dynamics_wrap(y, t, params)
+        dy, eps_dy = jax.jvp(f, (y,), (eps,))
+        div = jnp.sum(jnp.reshape(eps_dy * eps, (y.shape[0], -1)), axis=1, keepdims=True)
+        return dy, -div, eps_dy
+
     def ffjord_exact_dynamics(yp, t, eps, params):
         """
         Dynamics of augmented ffjord state.
@@ -261,11 +289,30 @@ def init_model(n_dims):
         """
         NN_Dynamics augmented with logp and regularization.
         """
-        y, p, r = ypr
+        y, p, *_ = ypr
 
-        dy, dp = ffjord_dynamics((y, p), t, eps, params)
+        dy, dp, eps_dy = ffjord2_dynamics((y, p), t, eps, params)
+
+        if reg_type == "our":
+            dr = reg_dynamics(y, t, params)
+            return dy, dp, dr
+        else:
+            dfro = jnp.mean(jnp.square(eps_dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
+            dkin = jnp.mean(jnp.square(dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
+            return dy, dp, dfro, dkin
+
+    def all_aug_dynamics(ypr, t, eps, params):
+        """
+        NN_Dynamics augmented with logp and regularization.
+        """
+        y, p, *_ = ypr
+
+        dy, dp, eps_dy = ffjord2_dynamics((y, p), t, eps, params)
+
         dr = reg_dynamics(y, t, params)
-        return dy, dp, dr
+        dfro = jnp.mean(jnp.square(eps_dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
+        dkin = jnp.mean(jnp.square(dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
+        return dy, dp, dr, dfro, dkin
 
     def aug_exact_dynamics(ypr, t, eps, params):
         """
@@ -276,25 +323,28 @@ def init_model(n_dims):
         dy, dp = ffjord_exact_dynamics((y, p), t, eps, params)
         dr = reg_dynamics(y, t, params)
         return dy, dp, dr
-    nodeint_aux = lambda y0, ts, eps, params: odeint_sepaux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
-                                                            aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    # nodeint_aux = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    nodeint = lambda y0, ts, eps, params: odeint(aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-    nodeint_exact = lambda y0, ts, eps, params: odeint(aug_exact_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    if reg_type == 'our':
+        _odeint_aux = _odeint_aux2
+    else:
+        _odeint_aux = _odeint_aux3
+    nodeint_aux = lambda y0, ts, eps, params: _odeint_aux(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+                                                          aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    all_nodeint = lambda y0, ts, eps, params: _odeint(all_aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+    nodeint_exact = lambda y0, ts, eps, params: _odeint(aug_exact_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
 
     def ode_aux(params, y, delta_logp, eps):
         """
         Apply the ODE block.
         """
-        ys, delta_logps, rs = nodeint_aux(reg_init(y, delta_logp), ts, eps, params)
-        return ys[-1], delta_logps[-1], rs[-1]
+        ys, delta_logps, *rs = nodeint_aux(reg_init(y, delta_logp), ts, eps, params)
+        return (ys[-1], delta_logps[-1], *(rs_[-1] for rs_ in rs))
 
-    def ode(params, y, delta_logp, eps):
+    def all_ode(params, y, delta_logp, eps):
         """
         Apply the ODE block.
         """
-        ys, delta_logps, rs = nodeint(reg_init(y, delta_logp), ts, eps, params)
-        return ys[-1], delta_logps[-1], rs[-1]
+        ys, delta_logps, *rs = all_nodeint(all_reg_init(y, delta_logp), ts, eps, params)
+        return (ys[-1], delta_logps[-1], *(rs_[-1] for rs_ in rs))
 
     def ode_exact(params, y, delta_logp, eps):
         """
@@ -306,13 +356,12 @@ def init_model(n_dims):
     if count_nfe:
         # TODO: w/ finlay trick this is not true NFE
         if vmap:
-            # TODO: note that this does not work!
             unreg_nodeint = jax.vmap(lambda z, delta_logp, t, eps, params:
-                                     odeint(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1],
+                                     _odeint(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1],
                                      (0, 0, None, 0, None))
         else:
             unreg_nodeint = lambda z, delta_logp, t, eps, params: \
-                odeint(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1]
+                _odeint(ffjord_dynamics, (z, delta_logp), t, eps, params, **ode_kwargs)[1]
 
         @jax.jit
         def nfe_fn(key, params, _x):
@@ -321,7 +370,7 @@ def init_model(n_dims):
             """
             eps = get_epsilon(key, _x.shape)
 
-            f_nfe = unreg_nodeint(*aug_init(_x)[:-1], ts, eps, params["ode"])
+            f_nfe = unreg_nodeint(*aug_init(_x)[:2], ts, eps, params["ode"])
             return jnp.mean(f_nfe)
 
         @jax.jit
@@ -332,7 +381,7 @@ def init_model(n_dims):
             eps = get_epsilon(key, _x.shape)
 
             unreg_nodeint = jax.vmap(lambda x, t, eps, params:
-                                     odeint(ffjord_dynamics, aug_init(x)[:-1], t, eps, params, **ode_kwargs)[1],
+                                     odeint(ffjord_dynamics, aug_init(x)[:2], t, eps, params, **ode_kwargs)[1],
                                      (0, None, 0, None))
 
             f_nfe = unreg_nodeint(_x, ts, eps, params["ode"])
@@ -348,19 +397,15 @@ def init_model(n_dims):
         """
         eps = get_epsilon(key, _x.shape)
 
-        z, delta_logp, regs = ode_aux(params["ode"], *aug_init(_x)[:-1], eps)
+        return ode_aux(params["ode"], *aug_init(_x)[:2], eps)
 
-        return z, delta_logp, regs
-
-    def forward(key, params, _x):
+    def forward_all(key, params, _x):
         """
         Forward pass of the model.
         """
         eps = get_epsilon(key, _x.shape)
 
-        z, delta_logp, regs = ode(params["ode"], *aug_init(_x)[:-1], eps)
-
-        return z, delta_logp, regs
+        return all_ode(params["ode"], *aug_init(_x)[:2], eps)
 
     def forward_exact(key, params, _x):
         """
@@ -368,19 +413,17 @@ def init_model(n_dims):
         """
         eps = get_epsilon(key, _x.shape)
 
-        z, delta_logp, regs = ode_exact(params["ode"], *aug_init(_x)[:-1], eps)
-
-        return z, delta_logp, regs
+        return ode_exact(params["ode"], *aug_init(_x)[:2], eps)
 
     model = {
         "model": {
-            "ode": ode
+            "ode": all_ode
         },
         "params": {
             "ode": dynamics_params
         }, "nfe": nfe_fn,
         "plot_nfe": plot_nfe_fn,
-        "forward": forward,
+        "forward_all": forward_all,
         "forward_exact": forward_exact
     }
 
@@ -392,7 +435,10 @@ def aug_init(y):
     Initialize dynamics with 0 for logpx and regs.
     """
     batch_size = y.shape[0]
-    return y, jnp.zeros((batch_size, 1)), jnp.zeros((batch_size, 1))
+    if reg_type == "our":
+        return y, jnp.zeros((batch_size, 1)), jnp.zeros((batch_size, 1))
+    else:
+        return y, jnp.zeros((batch_size, 1)), jnp.zeros((batch_size, 1)), jnp.zeros((batch_size, 1))
 
 
 def reg_init(y, delta_logp):
@@ -400,15 +446,18 @@ def reg_init(y, delta_logp):
     Initialize dynamics with 0 for and regs.
     """
     batch_size = y.shape[0]
-    return y, delta_logp, jnp.zeros((batch_size, 1))
+    if reg_type == "our":
+        return y, delta_logp, jnp.zeros((batch_size, 1))
+    else:
+        return y, delta_logp, jnp.zeros((batch_size, 1)), jnp.zeros((batch_size, 1))
 
 
-def _acc_fn(logits, labels):
+def all_reg_init(y, delta_logp):
     """
-    Classification accuracy of the model.
+    Initialize dynamics with 0 for and regs.
     """
-    predicted_class = jnp.argmax(logits, axis=1)
-    return jnp.mean(predicted_class == labels)
+    batch_size = y.shape[0]
+    return y, delta_logp, jnp.zeros((batch_size, 1)), jnp.zeros((batch_size, 1)), jnp.zeros((batch_size, 1))
 
 
 def standard_normal_logprob(z):
@@ -439,11 +488,19 @@ def loss_fn(forward, params, images, key):
     """
     The loss function for training.
     """
-    z, delta_logp, regs = forward(key, params, images)
-    loss_ = _loss_fn(z, delta_logp)
-    reg_ = _reg_loss_fn(regs)
-    weight_ = _weight_fn(params)
-    return loss_ + lam * reg_ + lam_w * weight_
+    if reg_type == "our":
+        z, delta_logp, regs = forward(key, params, images)
+        loss_ = _loss_fn(z, delta_logp)
+        reg_ = _reg_loss_fn(regs)
+        weight_ = _weight_fn(params)
+        return loss_ + lam * reg_ + lam_w * weight_
+    else:
+        z, delta_logp, fro_regs, kin_regs = forward(key, params, images)
+        loss_ = _loss_fn(z, delta_logp)
+        fro_reg_ = _reg_loss_fn(fro_regs)
+        kin_reg_ = _reg_loss_fn(kin_regs)
+        weight_ = _weight_fn(params)
+        return loss_ + lam_fro * fro_reg_ + lam_kin * kin_reg_ + lam_w * weight_
 
 
 def init_data():
@@ -456,9 +513,14 @@ def init_data():
     # num_test = data.trn.N
     num_test = data.val.N
 
-    data.trn.x = jnp.float64(data.trn.x)
-    data.val.x = jnp.float64(data.val.x)
-    data.tst.x = jnp.float64(data.tst.x)
+    if float_64:
+        data.trn.x = jnp.float64(data.trn.x)
+        data.val.x = jnp.float64(data.val.x)
+        data.tst.x = jnp.float64(data.tst.x)
+    else:
+        data.trn.x = jnp.float32(data.trn.x)
+        data.val.x = jnp.float32(data.val.x)
+        data.tst.x = jnp.float32(data.tst.x)
 
     num_batches = num_train // parse_args.batch_size + 1 * (num_train % parse_args.batch_size != 0)
     num_test_batches = num_test // parse_args.test_batch_size + 1 * (num_train % parse_args.test_batch_size != 0)
@@ -558,23 +620,28 @@ def run():
         """
         Convenience function for calculating losses separately.
         """
-        z, delta_logp, regs = model["forward"](_key, get_params(_opt_state), _batch)
+        z, delta_logp, r2_regs, fro_regs, kin_regs = model["forward_all"](_key, get_params(_opt_state), _batch)
         loss_ = _loss_fn(z, delta_logp)
-        reg_ = _reg_loss_fn(regs)
-        total_loss_ = loss_ + lam * reg_
-        return total_loss_, loss_, reg_
+        r2_reg_ = _reg_loss_fn(r2_regs)
+        fro_reg_ = _reg_loss_fn(fro_regs)
+        kin_reg_ = _reg_loss_fn(kin_regs)
+        total_loss_ = loss_ + lam * r2_reg_ + lam_fro * fro_reg_ + lam_kin * kin_reg_
+        return total_loss_, loss_, r2_reg_, fro_reg_, kin_reg_
 
     def evaluate_loss(opt_state, _key, ds_eval):
         """
         Convenience function for evaluating loss over train set in smaller batches.
         """
-        sep_loss_aug_, sep_loss_, sep_loss_reg_, nfe, bs = [], [], [], [], []
+        sep_loss_aug_, sep_loss_, sep_loss_r2_reg_, sep_loss_fro_reg_, sep_loss_kin_reg_, nfe, bs = \
+            [], [], [], [], [], [], []
 
         for test_batch_num in range(num_test_batches):
             _key, = jax.random.split(_key, num=1)
             test_batch = next(ds_eval)
 
-            test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = sep_losses(opt_state, test_batch, _key)
+            test_batch_loss_aug_, test_batch_loss_, \
+            test_batch_loss_r2_reg_, test_batch_loss_fro_reg_, test_batch_loss_kin_reg_ = \
+                sep_losses(opt_state, test_batch, _key)
 
             if count_nfe:
                 nfe.append(model["nfe"](_key, get_params(opt_state), test_batch))
@@ -583,18 +650,24 @@ def run():
 
             sep_loss_aug_.append(test_batch_loss_aug_)
             sep_loss_.append(test_batch_loss_)
-            sep_loss_reg_.append(test_batch_loss_reg_)
+            sep_loss_r2_reg_.append(test_batch_loss_r2_reg_)
+            sep_loss_fro_reg_.append(test_batch_loss_fro_reg_)
+            sep_loss_kin_reg_.append(test_batch_loss_kin_reg_)
             bs.append(len(test_batch))
 
         sep_loss_aug_ = jnp.array(sep_loss_aug_)
         sep_loss_ = jnp.array(sep_loss_)
-        sep_loss_reg_ = jnp.array(sep_loss_reg_)
+        sep_loss_r2_reg_ = jnp.array(sep_loss_r2_reg_)
+        sep_loss_fro_reg_ = jnp.array(sep_loss_fro_reg_)
+        sep_loss_kin_reg_ = jnp.array(sep_loss_kin_reg_)
         nfe = jnp.array(nfe)
         bs = jnp.array(bs)
 
         return jnp.average(sep_loss_aug_, weights=bs), \
                jnp.average(sep_loss_, weights=bs), \
-               jnp.average(sep_loss_reg_, weights=bs), \
+               jnp.average(sep_loss_r2_reg_, weights=bs), \
+               jnp.average(sep_loss_fro_reg_, weights=bs), \
+               jnp.average(sep_loss_kin_reg_, weights=bs), \
                jnp.average(nfe, weights=bs)
 
     itr = 0
@@ -617,35 +690,43 @@ def run():
             tree_flatten(opt_state)[0][0].block_until_ready()
             update_end = time.time()
             time_str = "%d %.18f %d\n" % (itr, update_end - update_start, load_itr)
-            outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_time.txt" % (dirname, reg, lam, num_blocks), "a")
+            outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_time.txt"
+                           % (dirname, reg, reg_type, lam, lam_fro, lam_kin), "a")
             outfile.write(time_str)
             outfile.close()
 
             if itr % parse_args.test_freq == 0:
-                loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, key, ds_test_eval)
+                loss_aug_, loss_, loss_r2_reg_, loss_fro_reg_, loss_kin_reg_, nfe_ = \
+                    evaluate_loss(opt_state, key, ds_test_eval)
 
-                print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | ' \
-                            'Loss {:.6f} | r {:.6f} | NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_reg_, nfe_)
+                print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | Loss {:.6f} | ' \
+                            'r {:.6f} | fro {:.6f} | kin {:.6f} | ' \
+                            'NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_r2_reg_, loss_fro_reg_, loss_kin_reg_, nfe_)
 
                 print(print_str)
 
-                outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
+                outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_info.txt"
+                               % (dirname, reg, reg_type, lam, lam_fro, lam_kin), "a")
                 outfile.write(print_str + "\n")
                 outfile.close()
 
                 info[itr]["loss_aug"] = loss_aug_
                 info[itr]["loss"] = loss_
-                info[itr]["loss_reg"] = loss_reg_
+                info[itr]["loss_r2_reg"] = loss_r2_reg_
+                info[itr]["loss_fro_reg"] = loss_fro_reg_
+                info[itr]["loss_kin_reg"] = loss_kin_reg_
                 info[itr]["nfe"] = nfe_
 
             if itr % parse_args.save_freq == 0:
-                param_filename = "%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr)
+                param_filename = "%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_%d_fargs.pickle" \
+                                 % (dirname, reg, reg_type, lam, lam_fro, lam_kin, itr)
                 fargs = get_params(opt_state)
                 outfile = open(param_filename, "wb")
                 pickle.dump(fargs, outfile)
                 outfile.close()
 
-            outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_iter.txt" % (dirname, reg, lam, num_blocks), "a")
+            outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_iter.txt"
+                           % (dirname, reg, reg_type, lam, lam_fro, lam_kin), "a")
             outfile.write("Iter: {:04d}\n".format(itr))
             outfile.close()
 
@@ -665,7 +746,8 @@ def run():
         "info": info,
         "args": parse_args
     }
-    outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "wb")
+    outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_%d_meta.pickle"
+                   % (dirname, reg, reg_type, lam, lam_fro, lam_kin, itr), "wb")
     pickle.dump(meta, outfile)
     outfile.close()
 
