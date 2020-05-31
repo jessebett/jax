@@ -17,11 +17,13 @@ from jax import lax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint, ravel_first_arg, odeint_grid, odeint_grid_sepaux_one, odeint_grid_aux
+from jax.experimental.ode import \
+    odeint, odeint_aux_one, odeint_sepaux, ravel_first_arg, odeint_grid, odeint_grid_sepaux_one, odeint_grid_aux
 from jax.experimental.jet import jet
 
+float64 = False
 from jax.config import config
-config.update("jax_enable_x64", True)
+config.update("jax_enable_x64", float64)
 
 REGS = ["r2", "r3", "r4", "r5", "r6"]
 
@@ -74,9 +76,22 @@ count_nfe = False if parse_args.no_count_nfe or (not odenet) is True else True
 vmap = False if parse_args.no_vmap is True else True
 vmap = False
 num_blocks = parse_args.num_blocks
-ode_kwargs = {
-    "step_size": 1 / parse_args.num_steps
-}
+grid = False
+if grid:
+    all_odeint = odeint_grid
+    odeint_aux1 = odeint_grid_aux           # finlay trick w/ 1 augmented state
+    odeint_aux2 = odeint_grid_sepaux_one    # odeint_grid_sepaux_onefinlay trick w/ 2 augmented states
+    ode_kwargs = {
+        "step_size": 1 / parse_args.num_steps
+    }
+else:
+    all_odeint = odeint
+    odeint_aux1 = odeint_aux_one
+    odeint_aux2 = odeint_sepaux
+    ode_kwargs = {
+        "atol": parse_args.atol,
+        "rtol": parse_args.rtol
+    }
 
 
 # some primitive functions
@@ -164,7 +179,10 @@ def get_epsilon(key, shape):
     # normal
     # return jax.random.normal(key, shape)
     # rademacher
-    return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float64) * 2 - 1
+    if float64:
+        return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float64) * 2 - 1
+    else:
+        return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float32) * 2 - 1
 
 
 class MLPBlock(hk.Module):
@@ -219,10 +237,16 @@ class PreODE(hk.Module):
         #               stride=2,
         #               padding=lambda _: (1, 1))
         # ])
-        self.model = hk.Sequential([
-            lambda x: x.astype(jnp.float64) / 255.,
-            Flatten()
-        ])
+        if float64:
+            self.model = hk.Sequential([
+                lambda x: x.astype(jnp.float64) / 255.,
+                Flatten()
+            ])
+        else:
+            self.model = hk.Sequential([
+                lambda x: x.astype(jnp.float32) / 255.,
+                Flatten()
+            ])
 
     def __call__(self, x):
         return self.model(x)
@@ -271,7 +295,7 @@ class MLPDynamics(hk.Module):
         self.dim = jnp.prod(input_shape[1:])
         self.hidden_dim = 100
         self.lin1 = hk.Linear(self.hidden_dim)
-        self.lin2 = hk.Linear(self.dim, w_init=jnp.zeros)
+        self.lin2 = hk.Linear(self.dim)
 
     def __call__(self, x, t):
         # vmapping means x will be a single batch element, so need to expand dims at 0
@@ -414,13 +438,13 @@ def init_model(model_reg=None):
             return dy, drdt, dfro, dkin
 
         if reg_type == "our":
-            _odeint = odeint_grid_aux
+            _odeint = odeint_aux1
         else:
-            _odeint = odeint_grid_sepaux_one
+            _odeint = odeint_aux2
         nodeint_aux = lambda y0, ts, eps, params: \
             _odeint(lambda y, t, eps, params: dynamics_wrap(y, t, params),
                     aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
-        all_nodeint = lambda y0, ts, eps, params: odeint_grid(all_aug_dynamics,
+        all_nodeint = lambda y0, ts, eps, params: all_odeint(all_aug_dynamics,
                                                               y0, ts, eps, params, **ode_kwargs)[0]
 
         def ode(params, out_pre_ode, eps):
@@ -439,10 +463,10 @@ def init_model(model_reg=None):
 
         if count_nfe:
             if vmap:
-                unreg_nodeint = jax.vmap(lambda y0, t, params: odeint_grid(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
+                unreg_nodeint = jax.vmap(lambda y0, t, params: all_odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
                                          (0, None, None))
             else:
-                unreg_nodeint = lambda y0, t, params: odeint_grid(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
+                unreg_nodeint = lambda y0, t, params: all_odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
 
             @jax.jit
             def nfe_fn(params, _images, _labels):
