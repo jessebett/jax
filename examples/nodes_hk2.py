@@ -6,16 +6,18 @@ import collections
 import os
 import pickle
 import sys
+import time
 
 import haiku as hk
 import tensorflow_datasets as tfds
+from jax.tree_util import tree_flatten
 
 import jax
 from jax import lax
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint, ravel_first_arg
+from jax.experimental.ode import odeint, ravel_first_arg, odeint_grid, odeint_grid_sepaux_one, odeint_grid_aux
 from jax.experimental.jet import jet
 
 from jax.config import config
@@ -45,6 +47,11 @@ parser.add_argument('--resnet', action="store_true")
 parser.add_argument('--no_count_nfe', action="store_true")
 parser.add_argument('--num_blocks', type=int, default=6)
 parser.add_argument('--load_ckpt', type=str, default=None)
+parser.add_argument('--lam_fro', type=float, default=0)
+parser.add_argument('--lam_kin', type=float, default=0)
+parser.add_argument('--reg_type', type=str, choices=['our', 'fin'], default='our')
+parser.add_argument('--num_steps', type=int, default=2)
+
 parse_args = parser.parse_args()
 
 
@@ -54,6 +61,9 @@ assert os.path.exists(parse_args.dirname)
 
 reg = parse_args.reg
 lam = parse_args.lam
+lam_fro = parse_args.lam_fro
+lam_kin = parse_args.lam_kin
+reg_type = parse_args.reg_type
 lam_w = parse_args.lam_w
 seed = parse_args.seed
 rng = jax.random.PRNGKey(seed)
@@ -64,10 +74,7 @@ vmap = False if parse_args.no_vmap is True else True
 vmap = False
 num_blocks = parse_args.num_blocks
 ode_kwargs = {
-    "atol": parse_args.atol,
-    "rtol": parse_args.rtol,
-    # "method": parse_args.method,
-    # "init_step": parse_args.init_step
+    "step_size": 1 / parse_args.num_steps
 }
 
 
@@ -108,17 +115,17 @@ def sol_recursive(f, z, t):
 
   (y0, [y1h]) = jet(g, (z_t, ), ((jnp.ones_like(z_t), ), ))
   (y0, [y1, y2h]) = jet(g, (z_t, ), ((y0, y1h,), ))
-  (y0, [y1, y2, y3h]) = jet(g, (z_t, ), ((y0, y1, y2h), ))
-  (y0, [y1, y2, y3, y4h]) = jet(g, (z_t, ), ((y0, y1, y2, y3h), ))
-  (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z_t, ), ((y0, y1, y2, y3, y4h), ))
-  (y0, [y1, y2, y3, y4, y5, y6h]) = jet(g, (z_t, ), ((y0, y1, y2, y3, y4, y5h), ))
+  # (y0, [y1, y2, y3h]) = jet(g, (z_t, ), ((y0, y1, y2h), ))
+  # (y0, [y1, y2, y3, y4h]) = jet(g, (z_t, ), ((y0, y1, y2, y3h), ))
+  # (y0, [y1, y2, y3, y4, y5h]) = jet(g, (z_t, ), ((y0, y1, y2, y3, y4h), ))
+  # (y0, [y1, y2, y3, y4, y5, y6h]) = jet(g, (z_t, ), ((y0, y1, y2, y3, y4, y5h), ))
 
   # TODO: shape this correctly! this will fail silently
-  return (jnp.reshape(y0[:-1], z_shape), [jnp.reshape(y1[:-1], z_shape),
-                                          jnp.reshape(y2[:-1], z_shape),
-                                          jnp.reshape(y3[:-1], z_shape),
-                                          jnp.reshape(y4[:-1], z_shape),
-                                          jnp.reshape(y5[:-1], z_shape)])
+  return (jnp.reshape(y0[:-1], z_shape), [jnp.reshape(y1[:-1], z_shape)])
+                                          # jnp.reshape(y2[:-1], z_shape),
+                                          # jnp.reshape(y3[:-1], z_shape),
+                                          # jnp.reshape(y4[:-1], z_shape),
+                                          # jnp.reshape(y5[:-1], z_shape)])
 
 
 # set up modules
@@ -147,6 +154,16 @@ class ConcatConv2D(hk.Module):
         tt = jnp.ones_like(x[:, :, :, :1]) * t
         ttx = jnp.concatenate([tt, x], axis=-1)
         return self._layer(ttx)
+
+
+def get_epsilon(key, shape):
+    """
+    Sample epsilon from the desired distribution.
+    """
+    # normal
+    # return jax.random.normal(key, shape)
+    # rademacher
+    return jax.random.randint(key, shape, minval=0, maxval=2).astype(jnp.float64) * 2 - 1
 
 
 class MLPBlock(hk.Module):
@@ -253,7 +270,7 @@ class MLPDynamics(hk.Module):
         self.dim = jnp.prod(input_shape[1:])
         self.hidden_dim = 100
         self.lin1 = hk.Linear(self.hidden_dim)
-        self.lin2 = hk.Linear(self.dim)
+        self.lin2 = hk.Linear(self.dim, w_init=jnp.zeros)
 
     def __call__(self, x, t):
         # vmapping means x will be a single batch element, so need to expand dims at 0
@@ -345,67 +362,95 @@ def init_model(model_reg=None):
         dynamics = hk.transform(wrap_module(MLPDynamics, ode_shape))
         dynamics_params = dynamics.init(rng, *initialization_data_["ode"])
         dynamics_wrap = lambda x, t, params: dynamics.apply(params, x, t)
-        if reg:
-            def reg_dynamics(y, t, params):
-                """
-                Dynamics of regularization for ODE integration.
-                """
-                if reg == "none":
-                    y = jnp.reshape(y, (-1, ode_dim))
-                    return jnp.zeros(y.shape[0])
+        def reg_dynamics(y, t, params):
+            """
+            Dynamics of regularization for ODE integration.
+            """
+            if reg == "none":
+                y = jnp.reshape(y, (-1, ode_dim))
+                return jnp.zeros(y.shape[0])
+            else:
+                # do r3 regularization
+                y0, y_n = sol_recursive(lambda _y, _t: dynamics_wrap(_y, _t, params), y, t)
+                if model_reg is None:
+                    r = y_n[-1]
                 else:
-                    # do r3 regularization
-                    y0, y_n = sol_recursive(lambda _y, _t: dynamics_wrap(_y, _t, params), y, t)
-                    if model_reg is None:
-                        r = y_n[-1]
-                    else:
-                        r = y_n[REGS.index(model_reg)]
-                    return jnp.mean(jnp.square(r), axis=[axis_ for axis_ in range(1, r.ndim)])
+                    r = y_n[REGS.index(model_reg)]
+                return jnp.mean(jnp.square(r), axis=[axis_ for axis_ in range(1, r.ndim)])
 
-            def aug_dynamics(yr, t, params):
-                """
-                Dynamics augmented with regularization.
-                """
-                y, r = yr
+        def fin_dynamics(y, t, eps, params):
+            """
+            Dynamics of finlay reg.
+            """
+            f = lambda y: dynamics_wrap(y, t, params)
+            dy, eps_dy = jax.jvp(f, (y,), (eps,))
+            return dy, eps_dy
+
+        def aug_dynamics(yr, t, eps, params):
+            """
+            Dynamics augmented with regularization.
+            """
+            y, *_ = yr
+            if reg_type == "our":
                 dydt = dynamics_wrap(y, t, params)
                 drdt = reg_dynamics(y, t, params)
                 return dydt, drdt
-            if vmap:
-                # manually set batch size to be 1 since vmapping
-                nodeint = jax.vmap(lambda y0, t, params: odeint(aug_dynamics, aug_init(y0, 1),
-                                                                t, params, **ode_kwargs)[0],
-                                   (0, None, None), 1)
             else:
-                nodeint = lambda y0, t, params: odeint(aug_dynamics, aug_init(y0), t, params, **ode_kwargs)[0]
-        else:
-            if vmap:
-                nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0],
-                                   (0, None, None), 1)
-            else:
-                nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[0]
+                dy, eps_dy = fin_dynamics(y, t, eps, params)
+                dfro = jnp.mean(jnp.square(eps_dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
+                dkin = jnp.mean(jnp.square(dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
+                return dy, dfro, dkin
 
-        def ode(params, out_pre_ode):
+        def all_aug_dynamics(yr, t, eps, params):
+            """
+            Dynamics augmented with all regularizations for tracking.
+            """
+            y, *_ = yr
+            dy, eps_dy = fin_dynamics(y, t, eps, params)
+            drdt = reg_dynamics(y, t, params)
+            dfro = jnp.mean(jnp.square(eps_dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
+            dkin = jnp.mean(jnp.square(dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
+            return dy, drdt, dfro, dkin
+
+        if reg_type == "our":
+            _odeint = odeint_grid_aux
+        else:
+            _odeint = odeint_grid_sepaux_one
+        nodeint_aux = lambda y0, ts, eps, params: \
+            _odeint(lambda y, t, eps, params: dynamics_wrap(y, t, params),
+                    aug_dynamics, y0, ts, eps, params, **ode_kwargs)[0]
+        all_nodeint = lambda y0, ts, eps, params: odeint_grid(all_aug_dynamics,
+                                                              y0, ts, eps, params, **ode_kwargs)[0]
+
+        def ode(params, out_pre_ode, eps):
             """
             Apply the ODE block.
             """
-            out_ode, out_ode_r = nodeint(out_pre_ode, ts, params)
-            return out_ode[-1], out_ode_r[-1]
+            out_ode, *out_ode_rs = nodeint_aux(aug_init(out_pre_ode), ts, eps, params)
+            return (out_ode[-1], *(out_ode_r[-1] for out_ode_r in out_ode_rs))
+
+        def all_ode(params, out_pre_ode, eps):
+            """
+            Apply ODE block for all regularizations.
+            """
+            out_ode, *out_ode_rs = all_nodeint(all_aug_init(out_pre_ode), ts, eps, params)
+            return (out_ode[-1], *(out_ode_r[-1] for out_ode_r in out_ode_rs))
 
         if count_nfe:
             if vmap:
-                unreg_nodeint = jax.vmap(lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
+                unreg_nodeint = jax.vmap(lambda y0, t, params: odeint_grid(dynamics_wrap, y0, t, params, **ode_kwargs)[1],
                                          (0, None, None))
             else:
-                unreg_nodeint = lambda y0, t, params: odeint(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
+                unreg_nodeint = lambda y0, t, params: odeint_grid(dynamics_wrap, y0, t, params, **ode_kwargs)[1]
 
-            # @jax.jit
-            # def nfe_fn(params, _images, _labels):
-            #     """
-            #     Function to return NFE.
-            #     """
-            #     in_ode = pre_ode_fn(params["pre_ode"], _images)
-            #     f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
-            #     return jnp.mean(f_nfe)
+            @jax.jit
+            def nfe_fn(params, _images, _labels):
+                """
+                Function to return NFE.
+                """
+                in_ode = pre_ode_fn(params["pre_ode"], _images)
+                f_nfe = unreg_nodeint(in_ode, ts, params["ode"])
+                return jnp.mean(f_nfe)
 
             def plot_nfe_fn(_method, params, _images, _labels):
                 """
@@ -421,6 +466,25 @@ def init_model(model_reg=None):
                     return _method(func, rtol, atol, mxstep, y0, t, params)[1]
                 f_nfe = jax.vmap(unreg_nodeint, (0, None, None))(in_ode, ts, params["ode"])
                 return jnp.mean(f_nfe)
+
+            def plot_nfe_per_ex_fn(_method, params, _images, _labels):
+                """
+                Function to return NFE.
+                """
+                rtol = ode_kwargs["rtol"]
+                atol = ode_kwargs["atol"]
+                mxstep = jnp.inf
+                in_ode = pre_ode_fn(params["pre_ode"], _images)
+                def unreg_nodeint(y0, t, params):
+                    y0, unravel = ravel_pytree(y0)
+                    func = ravel_first_arg(dynamics_wrap, unravel)
+                    return _method(func, rtol, atol, mxstep, y0, t, params)
+                out_ode, f_nfe = jax.vmap(unreg_nodeint, (0, None, None))(in_ode, ts, params["ode"])
+                out_ode = out_ode[:, -1]
+                logits = post_ode_fn(params["post_ode"], out_ode)
+                loss_ = jax.vmap(_loss_fn, in_axes=(0, 0))(logits, _labels)
+                acc_ = jax.vmap(_acc_fn, in_axes=(0, 0))(jnp.expand_dims(logits, axis=1), _labels)
+                return loss_, acc_, f_nfe
 
         else:
             nfe_fn = None
@@ -449,14 +513,16 @@ def init_model(model_reg=None):
 
     if odenet:
         model["model"]["ode"] = ode
+        model["model"]["all_ode"] = all_ode
         model["params"]["ode"] = dynamics_params
-        # model["nfe"] = nfe_fn
+        model["nfe"] = nfe_fn
         model["plot_nfe"] = plot_nfe_fn  # TODO: plot or nah?
+        model["plot_nfe_per_ex"] = plot_nfe_per_ex_fn
     else:
         model["model"]["res"] = resnet_fn
         model["params"]["res"] = resnet_params
 
-    def forward(params, _images):
+    def forward(key, params, _images):
         """
         Forward pass of the model.
         """
@@ -464,7 +530,7 @@ def init_model(model_reg=None):
 
         if odenet:
             out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
-            out_ode, regs = model_["ode"](params["ode"], out_pre_ode)
+            out_ode, *regs = model_["ode"](params["ode"], out_pre_ode, get_epsilon(key, out_pre_ode.shape))
             logits = model_["post_ode"](params["post_ode"], out_ode)
         else:
             out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
@@ -472,7 +538,28 @@ def init_model(model_reg=None):
             regs = jnp.zeros(_images.shape[0])
             logits = model_["post_ode"](params["post_ode"], out_ode)
 
-        return logits, regs
+        return (logits, *regs)
+
+    def forward_all(key, params, _images):
+        """
+        Forward pass of the model.
+        """
+        model_ = model["model"]
+
+        if odenet:
+            out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
+            out_ode, *regs = model_["all_ode"](params["ode"], out_pre_ode, get_epsilon(key, out_pre_ode.shape))
+            logits = model_["post_ode"](params["post_ode"], out_ode)
+        else:
+            out_pre_ode = model_["pre_ode"](params["pre_ode"], _images)
+            out_ode = model_["res"](params["res"], out_pre_ode)
+            regs = jnp.zeros(_images.shape[0])
+            logits = model_["post_ode"](params["post_ode"], out_ode)
+
+        return (logits, *regs)
+
+    model["model"]["forward_all"] = forward_all
+    model["model"]["forward"] = forward
 
     return forward, model
 
@@ -485,7 +572,21 @@ def aug_init(y, batch_size=-1):
     """
     if batch_size == -1:
         batch_size = y.shape[0]
-    return y, jnp.zeros(batch_size)
+    if reg_type == "our":
+        return y, jnp.zeros(batch_size)
+    else:
+        return y, jnp.zeros(batch_size), jnp.zeros(batch_size)
+
+
+def all_aug_init(y, batch_size=-1):
+    """
+    Flatten the dynamics and append regularization dynamics.
+    We need to flatten the dynamics first since they may be convolutional
+    (has width, height, and channels).
+    """
+    if batch_size == -1:
+        batch_size = y.shape[0]
+    return y, jnp.zeros(batch_size), jnp.zeros(batch_size), jnp.zeros(batch_size)
 
 
 def _acc_fn(logits, labels):
@@ -509,15 +610,23 @@ def _weight_fn(params):
     return 0.5 * jnp.sum(jnp.square(flat_params))
 
 
-def loss_fn(forward, params, images, labels):
+def loss_fn(forward, params, images, labels, key):
     """
     The loss function for training.
     """
-    logits, regs = forward(params, images)
-    loss_ = _loss_fn(logits, labels)
-    reg_ = _reg_loss_fn(regs)
-    weight_ = _weight_fn(params)
-    return loss_ + lam * reg_ + lam_w * weight_
+    if reg_type == "our":
+        logits, regs = forward(key, params, images)
+        loss_ = _loss_fn(logits, labels)
+        reg_ = _reg_loss_fn(regs)
+        weight_ = _weight_fn(params)
+        return loss_ + lam * reg_ + lam_w * weight_
+    else:
+        logits, fro_regs, kin_regs = forward(key, params, images)
+        loss_ = _loss_fn(logits, labels)
+        fro_reg_ = _reg_loss_fn(fro_regs)
+        kin_reg_ = _reg_loss_fn(kin_regs)
+        weight_ = _weight_fn(params)
+        return loss_ + lam_fro * fro_reg_ + lam_kin * kin_reg_ + lam_w * weight_
 
 
 def init_data():
@@ -573,6 +682,7 @@ def run():
     num_test_batches = meta["num_test_batches"]
 
     forward, model = init_model()
+    forward_all = model["model"]["forward_all"]
     grad_fn = jax.grad(lambda *args: loss_fn(forward, *args))
 
     def lr_schedule(train_itr):
@@ -596,38 +706,43 @@ def run():
     opt_state = opt_init(init_params)
 
     @jax.jit
-    def update(_itr, _opt_state, _batch):
+    def update(_itr, _opt_state, _key, _batch):
         """
         Update the params based on grad for current batch.
         """
         images, labels = _batch
-        return opt_update(_itr, grad_fn(get_params(_opt_state), images, labels), _opt_state)
+        return opt_update(_itr, grad_fn(get_params(_opt_state), images, labels, _key), _opt_state)
 
     @jax.jit
-    def sep_losses(_opt_state, _batch):
+    def sep_losses(_opt_state, _batch, key):
         """
         Convenience function for calculating losses separately.
         """
         params = get_params(_opt_state)
         images, labels = _batch
-        logits, regs = forward(params, images)
+        logits, r2_regs, fro_regs, kin_regs = forward_all(key, params, images)
         loss_ = _loss_fn(logits, labels)
-        reg_ = _reg_loss_fn(regs)
-        total_loss_ = loss_ + lam * reg_
+        r2_reg_ = _reg_loss_fn(r2_regs)
+        fro_reg_ = _reg_loss_fn(fro_regs)
+        kin_reg_ = _reg_loss_fn(kin_regs)
+        total_loss_ = loss_ + lam * r2_reg_ + lam_fro * fro_reg_ + lam_kin * kin_reg_
         acc_ = _acc_fn(logits, labels)
-        return acc_, total_loss_, loss_, reg_
+        return acc_, total_loss_, loss_, r2_reg_, fro_reg_, kin_reg_
 
-    def evaluate_loss(opt_state, ds_train_eval):
+    def evaluate_loss(opt_state, _key, ds_train_eval):
         """
         Convenience function for evaluating loss over train set in smaller batches.
         """
-        sep_acc_, sep_loss_aug_, sep_loss_, sep_loss_reg_, nfe = [], [], [], [], []
+        sep_acc_, sep_loss_aug_, sep_loss_, \
+        sep_loss_r2_reg_, sep_loss_fro_reg_, sep_loss_kin_reg_, nfe = [], [], [], [], [], [], []
 
         for test_batch_num in range(num_test_batches):
             test_batch = next(ds_train_eval)
+            _key, = jax.random.split(_key, num=1)
 
-            test_batch_acc_, test_batch_loss_aug_, test_batch_loss_, test_batch_loss_reg_ = \
-                sep_losses(opt_state, test_batch)
+            test_batch_acc_, test_batch_loss_aug_, test_batch_loss_, \
+            test_batch_loss_r2_reg_, test_batch_loss_fro_reg_, test_batch_loss_kin_reg_ = \
+                sep_losses(opt_state, test_batch, _key)
 
             if count_nfe:
                 nfe.append(model["nfe"](get_params(opt_state), *test_batch))
@@ -637,65 +752,89 @@ def run():
             sep_acc_.append(test_batch_acc_)
             sep_loss_aug_.append(test_batch_loss_aug_)
             sep_loss_.append(test_batch_loss_)
-            sep_loss_reg_.append(test_batch_loss_reg_)
+            sep_loss_r2_reg_.append(test_batch_loss_r2_reg_)
+            sep_loss_fro_reg_.append(test_batch_loss_fro_reg_)
+            sep_loss_kin_reg_.append(test_batch_loss_kin_reg_)
 
         sep_acc_ = jnp.array(sep_acc_)
         sep_loss_aug_ = jnp.array(sep_loss_aug_)
         sep_loss_ = jnp.array(sep_loss_)
-        sep_loss_reg_ = jnp.array(sep_loss_reg_)
+        sep_loss_r2_reg_ = jnp.array(sep_loss_r2_reg_)
+        sep_loss_fro_reg_ = jnp.array(sep_loss_fro_reg_)
+        sep_loss_kin_reg_ = jnp.array(sep_loss_kin_reg_)
         nfe = jnp.array(nfe)
 
-        return jnp.mean(sep_acc_), jnp.mean(sep_loss_aug_), jnp.mean(sep_loss_), jnp.mean(sep_loss_reg_), jnp.mean(nfe)
+        return jnp.mean(sep_acc_), jnp.mean(sep_loss_aug_), jnp.mean(sep_loss_), \
+               jnp.mean(sep_loss_r2_reg_), jnp.mean(sep_loss_fro_reg_), jnp.mean(sep_loss_kin_reg_), jnp.mean(nfe)
 
     itr = 0
     info = collections.defaultdict(dict)
+
+    key = rng
+
     for epoch in range(parse_args.nepochs):
         for i in range(num_batches):
             batch = next(ds_train)
+
+            key, = jax.random.split(key, num=1)
 
             itr += 1
 
             if parse_args.load_ckpt:
                 if itr <= load_itr:
                     continue
-            opt_state = update(itr, opt_state, batch)
+
+            update_start = time.time()
+            opt_state = update(itr, opt_state, key, batch)
+            tree_flatten(opt_state)[0][0].block_until_ready()
+            update_end = time.time()
+            time_str = "%d %.18f %d\n" % (itr, update_end - update_start, load_itr)
+            outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_time.txt"
+                           % (dirname, reg, reg_type, lam, lam_fro, lam_kin), "a")
+            outfile.write(time_str)
+            outfile.close()
 
             if itr % parse_args.test_freq == 0:
-                acc_, loss_aug_, loss_, loss_reg_, nfe_ = evaluate_loss(opt_state, ds_train_eval)
+                acc_, loss_aug_, loss_, \
+                loss_r2_reg_, loss_fro_reg_, loss_kin_reg_, nfe_ = evaluate_loss(opt_state, key, ds_train_eval)
 
-                print_str = 'Iter {:04d} | Accuracy {:.6f} | Total (Regularized) Loss {:.6f} | ' \
-                            'Loss {:.6f} | r {:.6f} | NFE {:.6f}'.format(itr, acc_, loss_aug_, loss_, loss_reg_, nfe_)
+                print_str = 'Iter {:04d} | Total (Regularized) Loss {:.6f} | Loss {:.6f} | ' \
+                            'r {:.6f} | fro {:.6f} | kin {:.6f} | ' \
+                            'NFE {:.6f}'.format(itr, loss_aug_, loss_, loss_r2_reg_, loss_fro_reg_, loss_kin_reg_, nfe_)
 
                 print(print_str)
 
-                outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_info.txt" % (dirname, reg, lam, num_blocks), "a")
+                outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_info.txt"
+                               % (dirname, reg, reg_type, lam, lam_fro, lam_kin), "a")
                 outfile.write(print_str + "\n")
                 outfile.close()
 
                 info[itr]["acc"] = acc_
                 info[itr]["loss_aug"] = loss_aug_
                 info[itr]["loss"] = loss_
-                info[itr]["loss_reg"] = loss_reg_
+                info[itr]["loss_r2_reg"] = loss_r2_reg_
+                info[itr]["loss_fro_reg"] = loss_fro_reg_
+                info[itr]["loss_kin_reg"] = loss_kin_reg_
                 info[itr]["nfe"] = nfe_
 
             if itr % parse_args.save_freq == 0:
-                if odenet:
-                    param_filename = "%s/reg_%s_lam_%.18e_%d_fargs.pickle" % (dirname, reg, lam, itr)
-                else:
-                    param_filename = "%s/reg_%s_lam_%.18e_num_blocks_%d_%d_fargs.pickle" % (dirname, reg, lam, num_blocks, itr)
+                param_filename = "%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_%d_fargs.pickle" \
+                             % (dirname, reg, reg_type, lam, lam_fro, lam_kin, itr)
                 fargs = get_params(opt_state)
                 outfile = open(param_filename, "wb")
                 pickle.dump(fargs, outfile)
                 outfile.close()
 
-            outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_iter.txt" % (dirname, reg, lam, num_blocks), "a")
+            outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_iter.txt"
+                           % (dirname, reg, reg_type, lam, lam_fro, lam_kin), "a")
             outfile.write("Iter: {:04d}\n".format(itr))
             outfile.close()
     meta = {
         "info": info,
         "args": parse_args
     }
-    outfile = open("%s/reg_%s_lam_%.18e_num_blocks_%d_meta.pickle" % (dirname, reg, lam, num_blocks), "wb")
+    outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_%d_meta.pickle"
+                   % (dirname, reg, reg_type, lam, lam_fro, lam_kin, itr), "wb")
     pickle.dump(meta, outfile)
     outfile.close()
 
