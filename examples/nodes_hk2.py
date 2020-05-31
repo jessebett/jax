@@ -368,8 +368,9 @@ def init_model(model_reg=None):
             Dynamics of regularization for ODE integration.
             """
             if reg == "none":
+                dydt = dynamics_wrap(y, t, params)
                 y = jnp.reshape(y, (-1, ode_dim))
-                return jnp.zeros(y.shape[0])
+                return dydt, jnp.zeros(y.shape[0])
             else:
                 # do r3 regularization
                 y0, y_n = sol_recursive(lambda _y, _t: dynamics_wrap(_y, _t, params), y, t)
@@ -377,7 +378,7 @@ def init_model(model_reg=None):
                     r = y_n[-1]
                 else:
                     r = y_n[REGS.index(model_reg)]
-                return jnp.mean(jnp.square(r), axis=[axis_ for axis_ in range(1, r.ndim)])
+                return y0, jnp.mean(jnp.square(r), axis=[axis_ for axis_ in range(1, r.ndim)])
 
         def fin_dynamics(y, t, eps, params):
             """
@@ -393,9 +394,8 @@ def init_model(model_reg=None):
             """
             y, *_ = yr
             if reg_type == "our":
-                dydt = dynamics_wrap(y, t, params)
-                drdt = reg_dynamics(y, t, params)
-                return dydt, drdt
+                res = reg_dynamics(y, t, params)
+                return reg_dynamics(y, t, params)
             else:
                 dy, eps_dy = fin_dynamics(y, t, eps, params)
                 dfro = jnp.mean(jnp.square(eps_dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
@@ -408,7 +408,7 @@ def init_model(model_reg=None):
             """
             y, *_ = yr
             dy, eps_dy = fin_dynamics(y, t, eps, params)
-            drdt = reg_dynamics(y, t, params)
+            _, drdt = reg_dynamics(y, t, params)
             dfro = jnp.mean(jnp.square(eps_dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
             dkin = jnp.mean(jnp.square(dy), axis=[axis_ for axis_ in range(1, dy.ndim)])
             return dy, drdt, dfro, dkin
