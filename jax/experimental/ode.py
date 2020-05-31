@@ -652,6 +652,27 @@ def odeint_aux(func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
   """
   return _odeint_aux_wrapper(func, rtol, atol, mxstep, y0, t, *args)
 
+def odeint_aux_one(fwd_func, rev_func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
+  """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
+
+  Args:
+    func: function to evaluate the time derivative of the solution `y` at time
+      `t` as `func(y, t, *args)`, producing the same shape/structure as `y0`.
+    y0: array or pytree of arrays representing the initial value for the state.
+    t: array of float times for evaluation, like `np.linspace(0., 10., 101)`,
+      in which the values must be strictly increasing.
+    *args: tuple of additional arguments for `func`.
+    rtol: float, relative local error tolerance for solver (optional).
+    atol: float, absolute local error tolerance for solver (optional).
+    mxstep: int, maximum number of steps to take for each timepoint (optional).
+
+  Returns:
+    Values of the solution `y` (i.e. integrated system values) at each time
+    point in `t`, represented as an array (or pytree of arrays) with the same
+    shape/structure as `y0` except with a new leading axis of length `len(t)`.
+  """
+  return _odeint_aux_one_wrapper(fwd_func, rev_func, rtol, atol, mxstep, y0, t, *args)
+
 def odeint_sepaux(fwd_func, rev_func, y0, t, *args, rtol=1.4e-8, atol=1.4e-8, mxstep=np.inf):
   """Adaptive stepsize (Dormand-Prince) Runge-Kutta odeint implementation.
 
@@ -751,6 +772,12 @@ def _odeint_grid_aux_wrapper(fwd_func, rev_func, step_size, y0, ts, *args):
 @partial(jax.jit, static_argnums=(0, 1, 2, 3))
 def _odeint_aux_wrapper(func, rtol, atol, mxstep, y0, ts, *args):
   return _dopri5_odeint_aux(func, rtol, atol, mxstep, y0, ts, *args)
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
+def _odeint_aux_one_wrapper(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args):
+  fwd_func = ravel_first_arg(fwd_func, ravel_pytree(y0[0])[1])
+  rev_func = ravel_first_arg(rev_func, ravel_pytree(y0)[1])
+  return _dopri5_odeint_aux_one(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args)
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3, 4))
 def _odeint_sepaux_wrapper(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args):
@@ -960,6 +987,19 @@ def _dopri5_odeint_aux(func, rtol, atol, mxstep, y0, ts, *args):
   nfe = carry[-1]
   out = np.concatenate((y0[None], ys))
   return jax.vmap(unravel)(out), nfe
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
+def _dopri5_odeint_aux_one(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args):
+  flat_y0, unravel = ravel_pytree(y0[0])
+  flat_out, nfe = _dopri5_odeint(fwd_func, rtol, atol, mxstep, flat_y0, ts, *args)
+  out = jax.vmap(unravel)(flat_out)
+  def aug_init(y):
+    """
+    Initialize dynamics with 0 for reg.
+    """
+    batch_size = y.shape[0]
+    return y, np.zeros((batch_size, 1))
+  return jax.vmap(aug_init)(out), nfe
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 1, 2, 3, 4))
 def _dopri5_odeint_sepaux(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args):
@@ -1433,6 +1473,10 @@ def _odeint_aux_fwd(func, rtol, atol, mxstep, y0, ts, *args):
   aug_ys = (ys, np.zeros((ys.shape[0], *y0[1].shape)), np.zeros((ys.shape[0], *y0[2].shape)))
   return (aug_ys, nfe), (aug_ys, ts, args)
 
+def _odeint_aux_one_fwd(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args):
+  ys, nfe = _dopri5_odeint_aux_one(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args)
+  return (ys, nfe), (ys, ts, args)
+
 def _odeint_sepaux_fwd(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args):
   ys, nfe = _dopri5_odeint_sepaux(fwd_func, rev_func, rtol, atol, mxstep, y0, ts, *args)
   return (ys, nfe), (ys, ts, args)
@@ -1628,6 +1672,15 @@ def _odeint_aux_rev(func, rtol, atol, mxstep, res, g):
   y_bar = unravel(y_bar)
   return (y_bar, ts_bar, *args_bar)
 
+def _odeint_aux_one_rev(fwd_func, rev_func, rtol, atol, mxstep, res, g):
+  flatten_func = jax.vmap(lambda pytree: ravel_pytree(pytree)[0])  # flatten everything but time dim
+  flat_res = flatten_func(res[0])
+  flat_g = flatten_func(g[0])
+  result = _odeint_rev(rev_func, rtol, atol, mxstep, (flat_res, *res[1:]), (flat_g, g[1]))
+
+  unravel = ravel_pytree(tree_map(op.itemgetter(0), res[0]))[1]
+  return (unravel(result[0]), *result[1:])
+
 def _odeint_sepaux_rev(fwd_func, rev_func, rtol, atol, mxstep, res, g):
   flatten_func = jax.vmap(lambda pytree: ravel_pytree(pytree)[0])  # flatten everything but time dim
   flat_res = flatten_func(res[0])
@@ -1655,6 +1708,7 @@ _rk4_odeint.defvjp(_rk4_odeint_fwd, _rk4_odeint_rev)
 _rk4_odeint_sepaux.defvjp(_rk4_odeint_sepaux_fwd, _rk4_odeint_sepaux_rev)
 _rk4_odeint_sepaux_one.defvjp(_rk4_odeint_sepaux_one_fwd, _rk4_odeint_sepaux_one_rev)
 _rk4_odeint_aux.defvjp(_rk4_odeint_aux_fwd, _rk4_odeint_aux_rev)
+_dopri5_odeint_aux_one.defvjp(_odeint_aux_one_fwd, _odeint_aux_one_rev)
 _dopri5_odeint_sepaux.defvjp(_odeint_sepaux_fwd, _odeint_sepaux_rev)
 _dopri5_odeint_fin_sepaux.defvjp(_odeint_fin_sepaux_fwd, _odeint_sepaux_rev)
 _dopri5_odeint_sepaux2.defvjp(_odeint_sepaux2_fwd, _odeint_sepaux2_rev)
