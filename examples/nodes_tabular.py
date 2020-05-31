@@ -650,9 +650,13 @@ def run():
                     "opt_state": ravel_pytree(opt_state)[0],
                     "itr": itr,
                 }
-                outfile = open(parse_args.ckpt_path, 'wb')
-                pickle.dump(state_dict, outfile)
-                outfile.close()
+                # only save ckpts if a directory has been made for them (allow easy switching between v1 and v2)
+                try:
+                    outfile = open(parse_args.ckpt_path, 'wb')
+                    pickle.dump(state_dict, outfile)
+                    outfile.close()
+                except IOError:
+                    print("Unable to save ck.pt %d" % itr, file=sys.stderr)
     meta = {
         "info": info,
         "args": parse_args
