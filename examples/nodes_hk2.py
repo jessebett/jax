@@ -851,7 +851,7 @@ def run():
                 print(print_str)
 
                 if parse_args.eval:
-                    outfile = open("%s/eval_info.txt" % parse_args.eval, "w")
+                    outfile = open("%s/eval_info.txt" % parse_args.eval_dir, "w")
                     outfile.write(print_str + "\n")
                     outfile.close()
                     return
