@@ -705,7 +705,7 @@ def run():
             if itr % parse_args.test_freq == 0:
                 if parse_args.eval:
                     # find params in eval_dir
-                    files = glob("%s/*30000_fargs.pickle" % parse_args.eval_dir)
+                    files = glob("%s/*15000_fargs.pickle" % parse_args.eval_dir)
                     if len(files) != 1:
                         print("Couldn't find param file!!")
                         print("Couldn't find param file!!", file=sys.stderr)
