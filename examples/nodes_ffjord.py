@@ -48,6 +48,8 @@ parser.add_argument('--reg_type', type=str, choices=['our', 'fin'], default='our
 parser.add_argument('--num_steps', type=int, default=2)
 parser.add_argument('--eval', action="store_true")
 parser.add_argument('--eval_dir', type=str)
+parser.add_argument('--fine', action="store_true")
+parser.add_argument('--fine_dir', type=str)
 parse_args = parser.parse_args()
 
 assert os.path.exists(parse_args.dirname)
@@ -581,6 +583,21 @@ def run():
         opt_state = opt_init(init_params)
 
         load_itr = 0
+
+    if parse_args.fine:
+        # fine tune on a model trained w/ fixed step solver
+        # find params in eval_dir
+        files = glob("%s/*30000_fargs.pickle" % parse_args.fine_dir)
+        if len(files) != 1:
+            print("=============Couldn't find param file!!=============")
+            print("=============Couldn't find param file!!=============", file=sys.stderr)
+            return
+        fine_pth = files[0]
+        fine_param_file = open(fine_pth, "rb")
+        fine_params = pickle.load(fine_param_file)
+        fine_param_file.close()
+        # shove them in opt_state
+        opt_state = opt_init(fine_params)
 
     @jax.jit
     def update(_itr, _opt_state, _key, _batch):
