@@ -18,7 +18,7 @@ from jax.tree_util import tree_flatten
 import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 from jax.experimental import optimizers
-from jax.experimental.ode import odeint, odeint_sepaux, odeint_grid, odeint_grid_sepaux, odeint_grid_sepaux_one
+from jax.experimental.ode import odeint, odeint_sepaux, odeint_fin_sepaux, odeint_grid, odeint_grid_sepaux, odeint_grid_sepaux_one
 from jax.experimental.jet import jet
 from jax.scipy.special import expit as sigmoid
 
@@ -79,7 +79,7 @@ if grid:
 else:
     _odeint = odeint
     _odeint_aux2 = odeint_sepaux
-    _odeint_aux3 = odeint_sepaux            # TODO: this will break if we try to do fin here
+    _odeint_aux3 = odeint_fin_sepaux
     ode_kwargs = {
         "atol": parse_args.atol,
         "rtol": parse_args.rtol
