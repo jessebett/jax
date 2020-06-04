@@ -35,12 +35,12 @@ parser.add_argument('--atol', type=float, default=1e-5)
 parser.add_argument('--rtol', type=float, default=1e-5)
 parser.add_argument('--no_vmap', action="store_true")
 parser.add_argument('--reg', type=str, choices=['none', 'r2', 'r3', 'r4'], default='none')
-parser.add_argument('--test_freq', type=int, default=1500)
-parser.add_argument('--save_freq', type=int, default=1500)
+parser.add_argument('--test_freq', type=int, default=30000)  # save time boi
+parser.add_argument('--save_freq', type=int, default=30000)  # save time boi
 parser.add_argument('--dirname', type=str, default='tmp')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--no_count_nfe', action="store_true")
-parser.add_argument('--ckpt_freq', type=int, default=300)  # divide test and save, divisible by num_batches
+parser.add_argument('--ckpt_freq', type=int, default=30000)  # divide test and save, divisible by num_batches
 parser.add_argument('--ckpt_path', type=str, default="./ck.pt")
 parser.add_argument('--lam_fro', type=float, default=0)
 parser.add_argument('--lam_kin', type=float, default=0)
@@ -634,7 +634,7 @@ def run():
         sep_loss_aug_, sep_loss_, sep_loss_r2_reg_, sep_loss_fro_reg_, sep_loss_kin_reg_, nfe = [], [], [], [], [], []
 
         for test_batch_num in range(num_test_batches):
-            print(test_batch_num, num_test_batches)
+            # print(test_batch_num, num_test_batches)
             _key, _key2 = jax.random.split(_key, num=2)
             test_batch = next(ds_eval)[0]
             test_batch = (test_batch.astype(jnp.float32) + jax.random.uniform(_key2,
@@ -748,6 +748,16 @@ def run():
                 fargs = get_params(opt_state)
                 outfile = open(param_filename, "wb")
                 pickle.dump(fargs, outfile)
+                outfile.close()
+
+                state_dict = {
+                    "opt_state": ravel_pytree(opt_state)[0],
+                    "itr": itr,
+                }
+                param_filename = "%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_%d_fargs_ckpt.pickle" \
+                                 % (dirname, reg, reg_type, lam, lam_fro, lam_kin, itr)
+                outfile = open(param_filename, "wb")
+                pickle.dump(state_dict, outfile)
                 outfile.close()
 
             outfile = open("%s/reg_%s_%s_lam_%.18e_lam_fro_%.18e_lam_kin_%.18e_iter.txt"
