@@ -587,17 +587,17 @@ def run():
     if parse_args.fine:
         # fine tune on a model trained w/ fixed step solver
         # find params in eval_dir
-        files = glob("%s/*30000_fargs.pickle" % parse_args.fine_dir)
+        files = glob("%s/*30000_fargs_ckpt.pickle" % parse_args.fine_dir)
         if len(files) != 1:
             print("=============Couldn't find param file!!=============")
             print("=============Couldn't find param file!!=============", file=sys.stderr)
             return
         fine_pth = files[0]
-        fine_param_file = open(fine_pth, "rb")
-        fine_params = pickle.load(fine_param_file)
-        fine_param_file.close()
-        # shove them in opt_state
-        opt_state = opt_init(fine_params)
+        outfile = open(fine_pth, 'rb')
+        state_dict = pickle.load(outfile)
+        outfile.close()
+        opt_state = unravel_opt(state_dict["opt_state"])
+        load_itr = state_dict["itr"]
 
     @jax.jit
     def update(_itr, _opt_state, _key, _batch):
